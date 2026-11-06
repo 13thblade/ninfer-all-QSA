@@ -179,7 +179,7 @@ verified, ticked there and in this table, then committed separately.
 | V3 | qwen3_5: persistent per-layer tail axis planes, `run_qsa` forwarding axis-major `[T,3]`, commit re-pool keeping `tail_axes` in step | done |
 | V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done (`7e9906d`) |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
-| K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text | todo |
+| K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text; verify-width gate | done |
 | K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve`/`evict`; wide-call staging | todo |
 | K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; fixed graph addresses | todo |
 | K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K | todo |

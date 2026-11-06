@@ -5,13 +5,16 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
+#include "core/paged_kv_storage.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -653,6 +656,83 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             state.first_position = plan.persistent.qsa_first_position->bind(backing);
             state.record_width =
                 std::max(plan.draft_window, plan.ngram_draft_window) + 1U;
+        }
+    }
+    if (plan.stream_slots != 0) {
+        // --kv-resident: an authoritative pinned host copy per QSA layer, a
+        // device pool of 4-token pages, and a residency map. The host planes use
+        // an identity block table; the pool's table is the map's `table` pointer,
+        // which kv_stream_resolve requires. Captured graphs keep all addresses.
+        const auto kv = paged_kv_storage_layout(plan.kv_storage, kD256KVCacheHeadDim);
+        const std::array<std::pair<std::int32_t, DType>, 4> planes{{
+            {kv.key.data_leading_extent, kv.key.data_dtype},
+            {kv.value.data_leading_extent, kv.value.data_dtype},
+            {kv.key.has_scale() ? kv.key.scale_leading_extent : 0, kv.key.scale_dtype},
+            {kv.value.has_scale() ? kv.value.scale_leading_extent : 0, kv.value.scale_dtype},
+        }};
+        const auto heads = static_cast<std::int32_t>(plan.stream_heads);
+        const auto pages = static_cast<std::int32_t>(plan.stream_pages);
+        const auto slots = static_cast<std::int32_t>(plan.stream_slots);
+        const auto make_view = [&](void* base, std::int32_t page_tokens, std::int32_t count,
+                                   const Tensor& table) {
+            PagedKVLayerView view{};
+            Tensor* targets[4] = {&view.k_pages, &view.v_pages, &view.k_scale_pages,
+                                  &view.v_scale_pages};
+            auto* cursor = static_cast<std::byte*>(base);
+            for (std::size_t i = 0; i < planes.size(); ++i) {
+                const auto leading = planes[i].first;
+                if (leading == 0) { continue; }
+                const auto bytes = static_cast<std::size_t>(leading) * page_tokens * heads *
+                                   count * dtype_size(planes[i].second);
+                *targets[i] = Tensor(cursor, planes[i].second,
+                                     {leading, page_tokens, heads, count});
+                cursor += bytes;
+            }
+            view.block_table  = table;
+            view.head_dim     = kD256KVCacheHeadDim;
+            view.num_kv_heads = heads;
+            view.storage      = plan.kv_storage;
+            return view;
+        };
+        std::uint64_t host_bytes = 0;
+        for (const auto& [leading, dtype] : planes) {
+            if (leading == 0) { continue; }
+            host_bytes += static_cast<std::uint64_t>(leading) * kPagedKVPageSize * heads * pages *
+                          dtype_size(dtype);
+        }
+        QsaStreamState& stream = qsa_stream_state.emplace();
+        stream.slots  = plan.stream_slots;
+        stream.blocks = plan.stream_blocks;
+        stream.pages  = plan.stream_pages;
+        stream.heads  = plan.stream_heads;
+        stream.width  = plan.stream_width;
+        stream.identity = plan.persistent.qsa_stream_identity->bind(backing);
+        std::vector<std::int32_t> identity_host(static_cast<std::size_t>(pages));
+        std::iota(identity_host.begin(), identity_host.end(), 0);
+        CUDA_CHECK(cudaMemcpy(stream.identity.data, identity_host.data(),
+                              identity_host.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
+        if (plan.persistent.qsa_stream_pool.size() != plan.persistent.qsa_indexer.size() ||
+            plan.persistent.qsa_stream_map.size() != plan.persistent.qsa_indexer.size()) {
+            throw std::logic_error("QSA KV stream planes do not match the layers");
+        }
+        stream.layers.reserve(plan.persistent.qsa_stream_pool.size());
+        for (std::size_t layer = 0; layer < plan.persistent.qsa_stream_pool.size(); ++layer) {
+            qsa_stream_host.push_back(
+                std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(host_bytes)));
+            const Tensor pool_region = plan.persistent.qsa_stream_pool[layer].bind(backing);
+            const Tensor map_region = plan.persistent.qsa_stream_map[layer].bind(backing);
+            const ops::KvStreamMap map = ops::kv_stream_map(
+                map_region.data, static_cast<std::int32_t>(plan.stream_blocks), slots);
+            QsaStreamLayerState state{};
+            state.map  = map;
+            state.host = make_view(qsa_stream_host.back()->data(), kPagedKVPageSize, pages,
+                                   stream.identity);
+            state.pool = make_view(pool_region.data, ops::kKvStreamPageTokens, slots,
+                                   Tensor(map.table, DType::I32,
+                                          {static_cast<std::int32_t>(plan.stream_blocks)}));
+            ops::kv_stream_reset(map, device.stream);
+            stream.layers.push_back(state);
         }
     }
     bind_steering(plan, steering_source, backings);

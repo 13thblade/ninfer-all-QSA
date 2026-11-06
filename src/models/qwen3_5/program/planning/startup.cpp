@@ -13,6 +13,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/paged_kv_storage.h"
 #include "core/tensor_parallel.h"
 #include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -24,6 +25,7 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -267,6 +269,40 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 "QSA indexer verification projections");
             out.qsa_first_position =
                 add_tensor(builder, DType::I32, {1}, "QSA indexer verification first position");
+        }
+        if (plan.stream_slots != 0) {
+            // One device pool of 4-token pages per QSA layer, one KvStreamMap per
+            // layer, and a shared identity block table for the pinned host copy.
+            // The host planes themselves are PinnedHostBuffers owned by ProgramImpl.
+            const auto kv = paged_kv_storage_layout(plan.kv_storage, kD256KVCacheHeadDim);
+            const std::array<std::pair<std::int32_t, DType>, 4> planes{{
+                {kv.key.data_leading_extent, kv.key.data_dtype},
+                {kv.value.data_leading_extent, kv.value.data_dtype},
+                {kv.key.has_scale() ? kv.key.scale_leading_extent : 0, kv.key.scale_dtype},
+                {kv.value.has_scale() ? kv.value.scale_leading_extent : 0, kv.value.scale_dtype},
+            }};
+            std::uint64_t pool_bytes = 0;
+            for (const auto& [leading, dtype] : planes) {
+                if (leading == 0) { continue; }
+                pool_bytes += static_cast<std::uint64_t>(leading) * ops::kKvStreamPageTokens *
+                              plan.stream_heads * plan.stream_slots * dtype_size(dtype);
+            }
+            const std::int32_t pool_words = checked_i32(pool_bytes, "QSA KV stream pool");
+            const std::int32_t map_words = checked_i32(
+                ops::kv_stream_map_bytes(static_cast<std::int32_t>(plan.stream_blocks),
+                                         static_cast<std::int32_t>(plan.stream_slots)),
+                "QSA KV stream map");
+            out.qsa_stream_pool.reserve(config.full_attention_layers);
+            out.qsa_stream_map.reserve(config.full_attention_layers);
+            for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+                out.qsa_stream_pool.push_back(builder.add_tensor(
+                    DType::I8, {pool_words}, 256, "QSA KV stream device pool"));
+                out.qsa_stream_map.push_back(builder.add_tensor(
+                    DType::I8, {map_words}, 256, "QSA KV stream residency map"));
+            }
+            out.qsa_stream_identity = add_tensor(
+                builder, DType::I32, {static_cast<std::int32_t>(plan.stream_pages)},
+                "QSA KV stream identity block table");
         }
     }
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
@@ -1398,6 +1434,22 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                 "qwen38_27b_qsa supports only the model's own MTP speculative backend "
                 "(DFlash/DFlash2/DSpark are not wired to the QSA indexer)");
         }
+        // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns, and
+        // its pool is sized width * 513 blocks. Cap the widest verification when
+        // --kv-resident actually streams (a wider call takes the staging route).
+        if (options.kv_resident_positions.value_or(0) != 0) {
+            const std::uint32_t widest = std::max(options.speculative.draft_tokens,
+                                                  options.speculative.ngram_draft_tokens);
+            if (widest + 1U > static_cast<std::uint32_t>(ops::kKvStreamMaxTokens)) {
+                throw std::invalid_argument(
+                    "QSA streamed KV needs a verification window of at most 15 drafts "
+                    "(--kv-resident with --draft-tokens / --ngram-draft-tokens)");
+            }
+        }
+    } else if (options.kv_resident_positions.value_or(0) != 0) {
+        throw std::invalid_argument(
+            "--kv-resident needs --qwen38-27b-qsa on this model (Qwen3.8-Flash-Next "
+            "uses its own executor)");
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
@@ -1548,6 +1600,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_storage          = inputs.kv_storage;
     impl->steering_adapters   = inputs.steering_adapters;
     impl->steering_vectors    = inputs.steering_vectors;
+    impl->kv_resident_positions = inputs.kv_resident_positions;
+    if (inputs.qsa && inputs.kv_resident_positions != 0) {
+        // Mirror qwen4_exp's stream sizing: a resolve needs width * 513 slots,
+        // and streaming only pays off while the pool is smaller than the context.
+        const std::uint32_t width = widest_verify_window(*impl) + 1U;
+        const std::uint32_t slots = std::max(
+            (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
+                ops::kKvStreamPageTokens,
+            static_cast<std::uint32_t>(
+                ops::kv_stream_minimum_slots(static_cast<std::int32_t>(width))));
+        const std::uint32_t pages = page_count(inputs.capacity);
+        if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
+            impl->stream_slots  = slots;
+            impl->stream_width  = width;
+            impl->stream_pages  = pages;
+            impl->stream_blocks = pages * (kPagedKVPageSize / ops::kKvStreamPageTokens);
+            impl->stream_heads  = inputs.parameters->model.config().text.attention
+                                      ? inputs.parameters->model.config()
+                                            .text.attention->num_key_value_heads
+                                      : 0;
+        }
+    }
     impl->persistent          = persistent_layout(*impl);
     if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
         // The whole Host budget is the hybrid slab pool that KV blocks and state snapshots share
@@ -1870,6 +1944,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .invariant_attention        = options.invariant_attention,
         .qsa                        = options.qwen38_27b_qsa,
+        .kv_resident_positions      = options.kv_resident_positions.value_or(0),
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,

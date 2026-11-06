@@ -64,6 +64,13 @@ struct PersistentLayout {
     // positions of the incomplete block's three tail slots, needed when a
     // completed block starts inside the previous call's tail.
     std::vector<TensorLayout> qsa_tail_axes;
+    // --kv-resident under QSA: one device region per full-attention layer holding
+    // the four-token-page KV pool (all K/V and scale planes concatenated), plus
+    // the layer's KvStreamMap words and a shared identity block table for the
+    // pinned host copy. Empty when streaming is off.
+    std::vector<TensorLayout> qsa_stream_pool;
+    std::vector<TensorLayout> qsa_stream_map;
+    std::optional<TensorLayout> qsa_stream_identity;
     // The verification's indexer projections (BF16 [640, layers * record_width]) and its
     // first position (I32 [1]), both at stable addresses for captured decode graphs.
     std::optional<TensorLayout> qsa_index_records;
@@ -135,6 +142,10 @@ struct SequencePlanningInputs {
     // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
     // (ops::qsa_indexer, ops::sparse_softmax_attention) instead of dense attention.
     bool qsa                               = false;
+    // --kv-resident: positions of each QSA full-attention layer's KV kept on the
+    // device; a longer context streams the rest from pinned host memory. Zero
+    // keeps every layer fully resident. Only meaningful with `qsa`.
+    std::uint32_t kv_resident_positions     = 0;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -181,6 +192,15 @@ struct SequencePlanImpl {
     // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
     // instead of dense attention; its rank-0 pooled-key and tail state below.
     bool qsa                               = false;
+    std::uint32_t kv_resident_positions     = 0;
+    // Derived stream geometry: device pool slots (4 tokens each), the widest
+    // call that may resolve from the pool, total 4-token blocks and 64-token
+    // pages of the host copy. All zero when streaming is off.
+    std::uint32_t stream_slots              = 0;
+    std::uint32_t stream_width              = 0;
+    std::uint32_t stream_blocks             = 0;
+    std::uint32_t stream_pages              = 0;
+    std::uint32_t stream_heads              = 0;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;

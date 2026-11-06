@@ -1024,6 +1024,10 @@ public:
     Tensor prefill_hidden;
     // --qwen38-27b-qsa: each full-attention layer's indexer pooled keys and tail, rank 0.
     std::optional<qwen3_5::QsaIndexerState> qsa_indexer_state;
+    // --kv-resident: the pinned host KV copies (owned here) and the per-layer
+    // pool / residency map views. Empty when streaming is off.
+    std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;

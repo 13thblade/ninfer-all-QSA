@@ -515,11 +515,11 @@ struct EngineOptions {
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
     NgramTableOptions ngram_table;
-    // Qwen3.8-Flash-Next only: positions of each sparse-attention layer's KV a sequence keeps in
-    // device memory. A longer context streams those layers: their KV lives in pinned host memory
-    // and the device keeps the blocks the indexer selected most recently, which leaves the rest
-    // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
-    // disk experts, every position with device experts; 0 keeps every position.
+    // Qwen3.8-Flash-Next, and Qwen3.8-27B under --qwen38-27b-qsa: positions of each
+    // sparse-attention layer's KV a sequence keeps in device memory. A longer context
+    // streams those layers: their KV lives in pinned host memory and the device keeps
+    // the blocks the indexer selected most recently. Unset / 0 keeps every position
+    // resident on the device; under QSA the widest verification must be <= 15 drafts.
     std::optional<std::uint32_t> kv_resident_positions;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run

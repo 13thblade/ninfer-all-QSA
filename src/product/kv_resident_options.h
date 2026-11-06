@@ -15,12 +15,12 @@ namespace ninfer::product {
 
 // The help lines, in the 32-column layout of ninfer's and ninfer-serve's help.
 inline constexpr const char* kKvResidentHelp =
-    "  --kv-resident N|all|auto      Qwen3.8-Flash-Next: positions of each sparse-\n"
+    "  --kv-resident N|all|auto      Qwen3.8-Flash-Next, or Qwen3.8-27B with\n"
+    "                                --qwen38-27b-qsa: positions of each sparse-\n"
     "                                attention layer's KV a sequence keeps on the GPU;\n"
     "                                a longer context keeps that KV in pinned RAM and\n"
-    "                                the GPU the blocks it reads, freeing memory for\n"
-    "                                experts (auto: 32768 with host or disk experts,\n"
-    "                                all with device experts)\n";
+    "                                the GPU the blocks it reads. Under QSA it needs\n"
+    "                                one device and a verification window <= 15 drafts\n";
 
 // Applies `option` when it is --kv-resident, taking its argument from `value()`; false leaves it
 // to the caller.

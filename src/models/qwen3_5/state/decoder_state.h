@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "ninfer/ops/kv_stream.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,28 @@ struct QsaIndexerState {
     Tensor first_position;
     // One per full-attention layer, in the compact layer order attn_mix receives.
     std::vector<QsaIndexerLayerState> layers;
+};
+
+// --kv-resident under QSA: one streamed sparse-attention layer. `host` is the
+// authoritative paged KV in pinned host memory (64-position pages, identity
+// block table); `pool` is the device cache of 4-position pages whose block
+// table is `map.table`. A narrow call resolves its selected blocks from host
+// into pool and reads pool; a wide call reads the ordinary 64-position device
+// layer instead and evicts the blocks it wrote.
+struct QsaStreamLayerState {
+    PagedKVLayerView host;
+    PagedKVLayerView pool;
+    ops::KvStreamMap map{};
+};
+
+struct QsaStreamState {
+    std::uint32_t slots  = 0;
+    std::uint32_t blocks = 0;
+    std::uint32_t pages  = 0;
+    std::uint32_t heads  = 0;
+    std::uint32_t width  = 0;
+    Tensor identity; // device I32 [pages], 0..pages-1
+    std::vector<QsaStreamLayerState> layers;
 };
 
 struct DecoderStateSpec {
