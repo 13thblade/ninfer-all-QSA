@@ -186,10 +186,10 @@ verified, ticked there and in this table, then committed separately.
 | V3 | qwen3_5: persistent per-layer tail axis planes, `run_qsa` forwarding axis-major `[T,3]`, commit re-pool keeping `tail_axes` in step | done |
 | V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done (`7e9906d`) |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
-| K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text; verify-width gate | done |
+| K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text; verify-width gate | done (`d7fdefd`) |
 | K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve` for narrow calls, wide-call evict | done (`a07fc30`) |
-| K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; reset per request; fixed graph addresses | done |
-| K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K with YaRN | done |
+| K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; reset per request; fixed graph addresses | done (`0fefb8a`) |
+| K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K with YaRN | done (`0fefb8a`) |
 
 Constraints worth keeping in view: `kv_stream_resolve` accepts at most 16 query
 columns with exactly `[512, tokens]` selected blocks (`kv_stream.cu:364-375`),
