@@ -25,6 +25,7 @@
 #include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -1775,6 +1776,16 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     // dense branch's fused append does.
     PagedKVLayerView layer = kv_.layer_view(static_cast<std::uint32_t>(full_attention_index));
     ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
+    // --kv-resident: the pinned host copy is authoritative. Keep it in step with
+    // the ordinary device layer on every call; a narrow call then resolves its
+    // selected blocks into the 4-token device pool and reads that pool.
+    const qwen3_5::QsaStreamState* qsa_stream = qsa_indexer_->stream;
+    const qwen3_5::QsaStreamLayerState* stream_layer = nullptr;
+    if (qsa_stream != nullptr) {
+        stream_layer =
+            &qsa_stream->layers[static_cast<std::size_t>(full_attention_index)];
+        ops::kv_cache_append(k_span, v_span, call_positions, stream_layer->host, stream);
+    }
     const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
     ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
                             state.pooled, *append_tail, stream, indexer_positions);
@@ -1784,10 +1795,36 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     Tensor counts = workspace::vector(work_, DType::I32, T);
     ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_, state.pooled,
                             work_, selected, counts, stream, indexer_positions);
+    PagedKVLayerView read = layer;
+    bool wide_stream_call = false;
+    if (stream_layer != nullptr) {
+        if (T <= static_cast<std::int32_t>(qsa_stream->width)) {
+            ops::kv_stream_resolve(stream_layer->map, first, selected, counts,
+                                   stream_layer->host, stream_layer->pool, stream);
+            read = stream_layer->pool;
+        } else {
+            // A wide prefill chunk exceeds kv_stream_resolve's 16-column limit.
+            // It reads the ordinary 64-position device layer instead, then drops
+            // the pool's copies of the blocks it just wrote so a later narrow
+            // call cannot reuse stale bytes. Prefills are not captured graphs,
+            // so reading the first position back to the host is safe here.
+            wide_stream_call = true;
+        }
+    }
     ops::sparse_softmax_attention(
-        q_span, first, selected, counts, layer,
+        q_span, first, selected, counts, read,
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
         work_, a_span, stream);
+    if (wide_stream_call) {
+        std::int32_t first_host = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::int32_t first_block = first_host / ops::kKvStreamPageTokens;
+        const std::int32_t end_block =
+            (first_host + T - 1) / ops::kKvStreamPageTokens + 1;
+        ops::kv_stream_evict(stream_layer->map, first_block, end_block, stream);
+    }
 }
 
 void TextContext::attn_merge_output(const BlockParameters& w, Tensor& x,

@@ -734,6 +734,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             ops::kv_stream_reset(map, device.stream);
             stream.layers.push_back(state);
         }
+        if (qsa_indexer_state.has_value()) {
+            qsa_indexer_state->stream = &*qsa_stream_state;
+        }
     }
     bind_steering(plan, steering_source, backings);
     if (plan.persistent.score_hidden) {

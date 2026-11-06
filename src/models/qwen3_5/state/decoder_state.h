@@ -35,6 +35,8 @@ struct QsaIndexerLayerState {
     Tensor tail_axes;
 };
 
+struct QsaStreamState;
+
 struct QsaIndexerState {
     std::uint32_t indexer_head_dim = 0;
     std::uint32_t compress_ratio   = 0;
@@ -50,6 +52,10 @@ struct QsaIndexerState {
     Tensor first_position;
     // One per full-attention layer, in the compact layer order attn_mix receives.
     std::vector<QsaIndexerLayerState> layers;
+    // Non-owning: the Program's streamed-KV state, null when --kv-resident is
+    // off. Hanging it off the indexer state lets run_qsa reach both without
+    // threading a second pointer through every TextContext construction site.
+    QsaStreamState* stream = nullptr;
 };
 
 // --kv-resident under QSA: one streamed sparse-attention layer. `host` is the
