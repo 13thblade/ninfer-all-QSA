@@ -23,8 +23,8 @@ and teaches the converter about the QSA GGUF.
 | `3187448` | `docs: add QSA-27B port status and continuation guide` | first revision of this document |
 | `722567d` | `ops: pool QSA-27B indexer keys through the pre-key RMSNorm` | done, op test green |
 | `47a9c7f` | `ops: score sparse attention with the QSA-27B 24-over-4 geometry` | done, op test green |
-| (this commit) | `engine: run the QSA sparse branch of qwen3_5 behind --qwen38-27b-qsa` (+ docs) | done: full build, op tests, conversion, offline artifact inspection |
-| (sibling commit) | `convert: register the late-constructed QSA indexer parameters on the recipe` | done, 301 converter tests |
+| `cf3053d` | `convert: register the late-constructed QSA indexer parameters on the recipe` | done, 301 converter tests |
+| `75d30b9` | `engine: run the QSA sparse branch of qwen3_5 behind --qwen38-27b-qsa` (+ docs) | done: full build, op tests, conversion, offline artifact inspection |
 
 ## What works now
 
