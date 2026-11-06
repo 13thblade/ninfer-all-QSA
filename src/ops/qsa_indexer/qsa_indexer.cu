@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {
@@ -89,13 +90,43 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     __syncthreads();
 }
 
+// Zero-centred RMSNorm of one raw indexer key, a 128-vector held one value per thread, before the
+// 4-token mean. `key_pre_norm` supplies the stored 1 + w weight of the QSA-27B adaptation; the
+// reduction is the same four-warp sum `norm_rope_row` uses.
+template <bool PreNorm>
+__device__ __forceinline__ float pre_norm_key(float value, int d,
+                                              const __nv_bfloat16* __restrict__ key_pre_norm,
+                                              float eps, float* reduce) {
+    if constexpr (!PreNorm) {
+        return value;
+    } else {
+        float square = value * value;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            square += __shfl_xor_sync(0xffffffffu, square, offset);
+        }
+        const int warp = d >> 5;
+        if ((d & 31) == 0) reduce[warp] = square;
+        __syncwarp();
+        __syncthreads();
+        const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
+        const float normed =
+            value * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(key_pre_norm[d]));
+        __syncthreads();
+        return normed;
+    }
+}
+
 // One 128-thread CTA per block completing in the call: mean of its four raw keys (from the tail
 // or the projection), norm, rope at the block's first position. The grid covers every block a call
-// of `tokens` can complete; a CTA past the call's completed blocks has nothing to do.
-template <bool Yarn>
+// of `tokens` can complete; a CTA past the call's completed blocks has nothing to do. With
+// `PreNorm` every projection key is first normalized by `key_pre_norm`; the tail already holds
+// keys normalized by the call that wrote it.
+template <bool Yarn, bool PreNorm>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                    int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
+                    int tokens, const __nv_bfloat16* __restrict__ key_norm,
+                    const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
                     const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
                     const QsaRope rope) {
     __shared__ float row[kHeadDim];
@@ -108,11 +139,14 @@ __global__ void __launch_bounds__(kHeadDim)
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) {
         const int position = block * kBlock + i;
-        sum += position < first_position
-                   ? tail[(position % kBlock) * kHeadDim + d]
-                   : __bfloat162float(projection[static_cast<std::int64_t>(position - first_position) *
-                                                     kProjection +
-                                                 kHeads * kHeadDim + d]);
+        if (position < first_position) {
+            sum += tail[(position % kBlock) * kHeadDim + d];
+        } else {
+            float value = __bfloat162float(
+                projection[static_cast<std::int64_t>(position - first_position) * kProjection +
+                           kHeads * kHeadDim + d]);
+            sum += pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+        }
     }
     row[d] = sum * 0.25f;
     __syncthreads();
@@ -121,18 +155,24 @@ __global__ void __launch_bounds__(kHeadDim)
 }
 
 // The raw keys of the incomplete block after the call, at slot position mod 4. Positions of that
-// block before the call are already in place.
+// block before the call are already in place. With `PreNorm` each key is normalized by
+// `key_pre_norm` before it enters the tail, matching the pooled path.
+template <bool PreNorm>
 __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
                                 const int* __restrict__ first, int tokens,
+                                const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
                                 float* __restrict__ tail) {
+    __shared__ float reduce[4];
     const int first_position = *first;
     const int last      = first_position + tokens - 1;
     const int start     = (last + 1) / kBlock * kBlock; // first position of the incomplete block
     const int d         = threadIdx.x;
     for (int position = max(start, first_position); position <= last; ++position) {
-        tail[(position % kBlock) * kHeadDim + d] = __bfloat162float(
+        float value = __bfloat162float(
             projection[static_cast<std::int64_t>(position - first_position) * kProjection +
                        kHeads * kHeadDim + d]);
+        value = pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+        tail[(position % kBlock) * kHeadDim + d] = value;
     }
 }
 
@@ -462,6 +502,9 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.key_norm, "key_norm must be BF16 [128]");
+    if (weights.key_pre_norm != nullptr) {
+        require_norm(weights.key_pre_norm, "key_pre_norm must be BF16 [128]");
+    }
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
@@ -469,17 +512,38 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
             "tail must be contiguous FP32 [128, 3]");
     const QsaRope rope        = make_rope(yarn);
     const std::int32_t tokens = projection.ne[1];
+    const auto* key_pre_norm =
+        weights.key_pre_norm != nullptr
+            ? static_cast<const __nv_bfloat16*>(weights.key_pre_norm->data)
+            : nullptr;
     // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
-    auto* const pool_kernel = rope.scaled ? qsa_pool_kernel<true> : qsa_pool_kernel<false>;
-    pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
-        static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
-        rope);
-    CUDA_CHECK(cudaGetLastError());
-    qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
-                                                first, tokens, static_cast<float*>(tail.data));
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch_pool = [&](auto yarn_tag, auto pre_norm_tag) {
+        constexpr bool kYarn    = decltype(yarn_tag)::value;
+        constexpr bool kPreNorm = decltype(pre_norm_tag)::value;
+        qsa_pool_kernel<kYarn, kPreNorm><<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
+            static_cast<const __nv_bfloat16*>(weights.key_norm->data), key_pre_norm, eps,
+            static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
+            rope);
+        CUDA_CHECK(cudaGetLastError());
+        qsa_tail_kernel<kPreNorm><<<1, kHeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projection.data), first, tokens, key_pre_norm, eps,
+            static_cast<float*>(tail.data));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (rope.scaled) {
+        if (key_pre_norm != nullptr) {
+            launch_pool(std::true_type{}, std::true_type{});
+        } else {
+            launch_pool(std::true_type{}, std::false_type{});
+        }
+    } else {
+        if (key_pre_norm != nullptr) {
+            launch_pool(std::false_type{}, std::true_type{});
+        } else {
+            launch_pool(std::false_type{}, std::false_type{});
+        }
+    }
 }
 
 std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t capacity) {

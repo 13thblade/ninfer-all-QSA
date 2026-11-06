@@ -77,14 +77,25 @@ struct Sequence {
     int length;
     std::vector<float> projection; // [length][640]
     std::vector<float> query_norm, key_norm;
+    // QSA-27B's index_k_pre_norm: applied to each raw key before the 4-token mean. Empty selects
+    // Flash-Next's path, which pools the raw projection keys.
+    std::vector<float> key_pre_norm;
 };
 
 std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& yarn) {
     std::vector<double> mean(kDim, 0.0);
     for (int i = 0; i < 4; ++i) {
+        std::vector<double> key(kDim);
         for (int d = 0; d < kDim; ++d) {
-            mean[d] += seq.projection[static_cast<std::size_t>(block * 4 + i) * kProjection + kHeads * kDim + d];
+            key[d] = seq.projection[static_cast<std::size_t>(block * 4 + i) * kProjection + kHeads * kDim + d];
         }
+        if (!seq.key_pre_norm.empty()) {
+            double sum = 0;
+            for (double v : key) sum += v * v;
+            const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
+            for (int d = 0; d < kDim; ++d) key[d] = key[d] * scale * (1.0 + seq.key_pre_norm[d]);
+        }
+        for (int d = 0; d < kDim; ++d) mean[d] += key[d];
     }
     for (double& v : mean) v /= 4.0;
     return norm_rope(mean, seq.key_norm, block * 4, yarn);
@@ -148,34 +159,44 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
     return 0;
 }
 
-int run(std::uint32_t seed, const Yarn& yarn = {}) {
-    Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim)};
+int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false) {
+    Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim),
+                 pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
     fill_uniform(seq.projection, seed, -2.0f, 2.0f);
     fill_uniform(seq.query_norm, seed + 1, -0.5f, 0.5f);
     fill_uniform(seq.key_norm, seed + 2, -0.5f, 0.5f);
     round_to_bf16(seq.projection);
     round_to_bf16(seq.query_norm);
     round_to_bf16(seq.key_norm);
+    // Only a non-empty key_pre_norm selects the QSA-27B path; the Flash-Next runs must leave it
+    // empty so the oracle pools the raw keys, as the op does when the weight is null.
+    if (pre_norm) {
+        fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
+        round_to_bf16(seq.key_pre_norm);
+    }
     std::vector<std::vector<double>> pooled(seq.length / 4);
     for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn);
 
     const int capacity = 700;
     GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
-        d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
+        d_kpn(kDim * 2), d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
         d_selected(kProjection * 2 + static_cast<std::size_t>(kTop) * 64 * 4), d_counts(64 * 4);
     const auto bits = encode_bf16(seq.projection);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
-    const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm);
-    d_qn.copy_from_host(qn.data(), d_qn.bytes());
-    d_kn.copy_from_host(kn.data(), d_kn.bytes());
+    const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm),
+               kpn = encode_bf16(seq.key_pre_norm);
+    d_qn.copy_from_host(qn.data(), qn.size() * sizeof(std::uint16_t));
+    d_kn.copy_from_host(kn.data(), kn.size() * sizeof(std::uint16_t));
+    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), kpn.size() * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemset(d_pooled.data(), 0, d_pooled.bytes()));
     CUDA_CHECK(cudaMemset(d_tail.data(), 0, d_tail.bytes()));
-    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim});
+    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
+        t_kpn(d_kpn.data(), DType::BF16, {kDim});
     Tensor t_pooled(d_pooled.data(), DType::FP32, {kDim, capacity});
     Tensor t_tail(d_tail.data(), DType::FP32, {kDim, 3});
     GuardedDeviceBuffer d_first(4);
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    const ops::QsaIndexerWeights weights{&t_qn, &t_kn};
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
     WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -236,9 +257,10 @@ int run(std::uint32_t seed, const Yarn& yarn = {}) {
     const auto got = from_device<float>(d_pooled.data(), static_cast<std::size_t>(complete) * kDim);
     std::vector<double> expected;
     for (int b = 0; b < complete; ++b) expected.insert(expected.end(), pooled[b].begin(), pooled[b].end());
-    failures += verify_pointwise(yarn.factor > 1.0 ? "qsa pooled keys yarn" : "qsa pooled keys",
+    failures += verify_pointwise(std::string("qsa pooled keys") + (pre_norm ? " pre-norm" : "") +
+                                     (yarn.factor > 1.0 ? " yarn" : ""),
                                  std::vector<double>(got.begin(), got.end()), expected, {2e-5, 2e-5});
-    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_pooled, &d_tail, &d_selected, &d_counts, &d_first}) {
+    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_kpn, &d_pooled, &d_tail, &d_selected, &d_counts, &d_first}) {
         failures += buffer->verify_guards("qsa_indexer");
     }
     return failures;
@@ -352,6 +374,7 @@ int main() {
         return 77;
     }
     int failures = run(8100u);
+    failures += run(8300u, {}, true);
     for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 127, 128, 129, 512}) {
         failures += selection_case(tokens, 700, 2050);
     }
@@ -366,6 +389,7 @@ int main() {
     // flow, both scoring routes, and queries near that window's end.
     const Yarn yarn{2.25, 262144.0};
     failures += run(8200u, yarn);
+    failures += run(8400u, yarn, true);
     failures += selection_case(5, 700, 2050, false, yarn);
     failures += selection_case(129, 32768, 130970, false, yarn);
     failures += selection_case(5, 147500, 589000, false, yarn);
