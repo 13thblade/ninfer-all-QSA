@@ -1820,6 +1820,10 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // QSA keeps one indexer/stream copy with the context cache off, so a
+        // prefill starting at position zero begins a fresh sequence: drop every
+        // pool residency from the previous request before any resolve runs.
+        if (first_host == 0) { ops::kv_stream_reset(stream_layer->map, stream); }
         const std::int32_t first_block = first_host / ops::kKvStreamPageTokens;
         const std::int32_t end_block =
             (first_host + T - 1) / ops::kKvStreamPageTokens + 1;

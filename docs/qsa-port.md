@@ -110,8 +110,14 @@ N-column verification; anything else throws.
   scalar path. See the roadmap below and the verification probes below.
 - **Prefix-cache / continuation reuse under QSA** needs the pooled+tail
   planes in `StateImage`; the context cache is disabled instead.
-- **`--kv-resident`** remains Flash-Next-only; the QSA path reads the
-  sequence's full paged KV on the device (no host streaming).
+- **`--kv-resident` device-memory saving** — the streamed path is wired and
+  numerically lossless (K1–K4), but QSA-27B's `PagedKVCache` is shared by all
+  layers, so the full 64-position device KV planes remain allocated alongside
+  the pinned host copy and the 4-token pool. Freeing those planes needs a
+  per-layer residency choice inside `PagedKVCache`, which is an architectural
+  change beyond the K-stage. What K1–K4 deliver is the full
+  `kv_stream_resolve`/`evict`/`KvStreamMap` contract, YaRN compatibility and
+  identical logits between streamed and resident sequences.
 
 Do not benchmark a converted artifact as if it were QSA unless
 `--qwen38-27b-qsa` is set.
@@ -157,9 +163,10 @@ Remaining work, in dependency order:
 4. **Prefix-cache state** — carry `pooled`/`tail`/`tail_axes` in `StateImage`
    so a continuation can restore the indexer; the context cache stays off
    until then.
-5. **DFlash2 / `--kv-resident` on qwen3_5** — masked draft backends need
-   their own replay contract; `--kv-resident` is still forwarded only by
-   `src/runtime/engine/qwen4_exp_core.cpp:305`.
+5. **DFlash2 speculation** — masked draft backends still need their own
+   replay contract. **`--kv-resident` is done** (K1–K4); the remaining
+   piece for real device-memory savings is a per-layer residency choice
+   inside the shared `PagedKVCache`.
 6. **Cross-engine numerical alignment** — compare greedy token sequences /
    logit KLD against the QSA fork's `llama-server` on the same prompt, cold
    restart, fixed seed, no KV-cache hits. Still outstanding; the 32K run
@@ -180,9 +187,9 @@ verified, ticked there and in this table, then committed separately.
 | V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done (`7e9906d`) |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
 | K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text; verify-width gate | done |
-| K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve` for narrow calls, wide-call evict | done |
-| K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; fixed graph addresses | todo |
-| K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K | todo |
+| K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve` for narrow calls, wide-call evict | done (`a07fc30`) |
+| K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; reset per request; fixed graph addresses | done |
+| K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K with YaRN | done |
 
 Constraints worth keeping in view: `kv_stream_resolve` accepts at most 16 query
 columns with exactly `[512, tokens]` selected blocks (`kv_stream.cu:364-375`),
@@ -354,6 +361,40 @@ Post-V4 text regression: the four-arm greedy A/B remains byte-identical to the
 `3127a61` baseline and `qsa_mtp == qsa_plain` still holds; `qsa_indexer`,
 `rope`, `sparse_softmax_attention` and `kv_stream` operator tests pass.
 
+### Streamed KV verification (2026-11-06, K1–K4)
+
+`--qwen38-27b-qsa --kv-resident 4096 --max-context 32768 --kv-dtype int8
+--rope-yarn-factor 2.0 --spec mtp --draft-tokens 3 --ngram-draft-tokens 0`,
+one deterministic 30,550-token prompt, 256 output tokens forced with
+`ignore_eos`, greedy, seed 57004, cold start per arm:
+
+| arm | prefill tok/s | decode tok/s | greedy |
+|---|---|---|---|
+| fully resident | 1586.5 | 103.2 | 1104 chars |
+| streamed (4096 positions) | 1561.1 | 98.7 | **byte-identical** |
+
+This is the Flash-Next contract "a streamed and a resident sequence give the
+same logits", now holding for QSA-27B under YaRN and MTP speculation. Build:
+604/604 edges after the struct-layout rebuild, then 14/14 incremental.
+Operator tests `qsa_indexer`, `sparse_softmax_attention`, `rope`, `kv_stream`
+all PASS, and the four-arm text A/B is still byte-identical to the `3127a61`
+baseline.
+
+Implementation notes, kept deliberately smaller than qwen4_exp's executor:
+- One `PinnedHostBuffer` per QSA layer holds the authoritative 64-position-page
+  KV with an identity block table; `kv_cache_append` writes it alongside the
+  ordinary device layer, so both hold the same bytes.
+- Narrow calls (decode and MTP verification, <= 16 columns) call
+  `kv_stream_resolve` and read the 4-token device pool. Wide prefill chunks
+  exceed the 16-column operator limit, so they read the ordinary 64-position
+  device layer and `kv_stream_evict` the blocks they wrote; no separate
+  full-size staging buffer is needed.
+- A prefill starting at position zero resets that layer's map. A speculative
+  commit evicts the rejected draft columns' blocks in
+  `resolve_pending_raw`, so a later decode cannot reuse stale pool bytes.
+- Streaming engages only while `slots * 4 < max_context`; the 15-draft cap in
+  `validate_target_options` guarantees `tokens <= kKvStreamMaxTokens`.
+
 ## How to continue after an interruption
 
 Order of work (the planning document carries the rolling checklist):
@@ -373,12 +414,14 @@ Order of work (the planning document carries the rolling checklist):
    produced `E:\LLMs\Qwen3.8-27B-QSA.ninfer` (1292 objects, 1 file,
    17.80 GB); op oracles, offline artifact inspection, full-tree build,
    cold-start QSA+MTP smoke, four-arm greedy A/B and the 32K benchmark above
-   all pass, including `--vision` under QSA (see the vision probes above).
-   **Next**, in order: (a) cross-engine greedy / logit KLD against the QSA
-   fork's `llama-server` — the in-engine A/B is not a correctness proof
-   against the fork; (b) kv_stream / `--kv-resident` wiring (roadmap K1–K4);
-   (c) `pooled`/`tail`/`tail_axes` in `StateImage` to restore the context
-   cache; (d) DFlash2 replay. Model card:
+   all pass, including `--vision` under QSA and streamed KV under YaRN
+   (see the two verification sections above). **Next**, in order:
+   (a) cross-engine greedy / logit KLD against the QSA fork's
+   `llama-server` — the in-engine A/B is not a correctness proof against the
+   fork; (b) per-layer residency in the shared `PagedKVCache` so streaming
+   actually frees device memory; (c) `pooled`/`tail`/`tail_axes` in
+   `StateImage` to restore the context cache; (d) DFlash2 replay and a
+   wide-call staging prefetch. Model card:
    `https://hf-mirror.com/higa2515/Qwen3.8-27B-QSA-GGUF`.
 
 Already validated against the real file:

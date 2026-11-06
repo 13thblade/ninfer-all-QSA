@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
@@ -939,12 +940,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 throw std::logic_error("QSA speculative commit admits one lane");
             }
             qwen3_5::QsaIndexerState& qsa = *qsa_indexer_state;
+            const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
             const std::uint32_t committed = cancelled[0] ? 0U : accepted_tokens[0];
             if (committed > qsa.record_width) {
                 throw std::logic_error("QSA speculative commit exceeds its record width");
             }
             if (committed != 0) {
-                const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
                 const float eps = parameters.model.config().text.rms_norm_eps;
                 std::uint32_t full = 0;
                 for (const auto& block : parameters.text.layers) {
@@ -968,6 +969,31 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 }
                 if (full != qsa.layers.size()) {
                     throw std::logic_error("QSA speculative commit found an unexpected layer count");
+                }
+            }
+            // --kv-resident: the verification already wrote its N columns into
+            // the pinned host copy and resolved them into the device pool. The
+            // rejected tail must not stay resident in KvStreamMap, or a later
+            // narrow call could read stale bytes instead of re-copying from the
+            // host copy. Commit is not a captured graph, so reading the staged
+            // first position back to the host is safe here.
+            if (qsa.stream != nullptr && committed < qsa.record_width) {
+                std::int32_t first_host = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&first_host, qsa.first_position.data,
+                                           sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                           stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const std::int32_t first_block =
+                    (first_host + static_cast<std::int32_t>(committed)) /
+                    ops::kKvStreamPageTokens;
+                const std::int32_t end_block =
+                    (first_host + static_cast<std::int32_t>(qsa.record_width) - 1) /
+                        ops::kKvStreamPageTokens +
+                    1;
+                if (end_block > first_block) {
+                    for (const auto& layer : qsa.stream->layers) {
+                        ops::kv_stream_evict(layer.map, first_block, end_block, stream);
+                    }
                 }
             }
         }
