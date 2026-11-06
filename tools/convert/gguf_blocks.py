@@ -33,6 +33,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
+from . import qsa_gguf
 from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
@@ -105,9 +106,12 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
     }
 
 
-def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
+def expected_tensors(
+    mtp: bool, qsa: bool = False
+) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
     """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
-    ggml type names it may have."""
+    ggml type names it may have. ``qsa`` adds the 16 x 5 F32 indexer tensors of the QSA-27B
+    adaptation (see ``qsa_gguf.py``)."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
@@ -140,6 +144,8 @@ def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[
             p + "nextn.hnorm.weight": ((HIDDEN,), "F32"),
             p + "nextn.shared_head_norm.weight": ((HIDDEN,), "F32"),
         }
+    if qsa:
+        out |= qsa_gguf.expected_tensors()
     return out
 
 
@@ -147,24 +153,34 @@ def has_mtp(gguf: GGUFFile) -> bool:
     return f"blk.{MTP_BLOCK}.nextn.eh_proj.weight" in gguf.tensors
 
 
-def validate(gguf: GGUFFile) -> None:
-    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types."""
+def validate(gguf: GGUFFile, qsa: bool = False) -> None:
+    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types.
+
+    ``qsa`` additionally requires the QSA-27B indexer metadata and its 80 F32 tensors;
+    leaving it False keeps the stock recipe's behaviour byte for byte.
+    """
 
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
             raise ValueError(
                 f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}"
             )
+    if qsa:
+        qsa_gguf.check_header(gguf)
     mtp = has_mtp(gguf)
     blocks = gguf.kv.get("qwen35.block_count")
     if blocks != LAYERS + (1 if mtp else 0):
         raise ValueError(f"{gguf.path}: {blocks} blocks, expected {LAYERS} (+1 for MTP)")
-    expected = expected_tensors(mtp)
+    expected = expected_tensors(mtp, qsa=qsa)
     if set(gguf.tensors) != set(expected):
         missing = sorted(set(expected) - set(gguf.tensors))[:5]
         extra = sorted(set(gguf.tensors) - set(expected))[:5]
+        hint = (
+            "" if qsa else
+            " (a QSA-27B GGUF needs the qwen3_8_27b_qsa_gguf recipe)"
+        )
         raise ValueError(
-            f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra})"
+            f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra}){hint}"
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
@@ -645,7 +661,85 @@ def qwen3_8_27b_gguf(model, recipe, sources):
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
 
 
-RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
+def qwen3_8_27b_qsa_gguf(model, recipe, sources):
+    """A Qwen3.8-27B-QSA GGUF: the dense 27B block recipe plus its 80 F32 indexer tensors.
+
+    The text tower, MTP block, vision and DFlash2 companions are imported exactly as
+    ``qwen3_8_27b_gguf`` does.  On top of that, each of the 16 full-attention layers
+    gains ``attention/indexer/{query,key,query_norm,key_norm,key_pre_norm}``.
+    """
+
+    config = model.config
+    if (
+        "num_experts" in config
+        or config["hidden_size"] != HIDDEN
+        or config["num_hidden_layers"] != LAYERS
+    ):
+        raise ValueError("the QSA GGUF block recipe requires the Qwen3.8-27B Dense geometry")
+    gguf = sources["gguf"]
+    if not isinstance(gguf, GGUFFile):
+        raise ValueError("--source gguf must name the model's .gguf file")
+    validate(gguf, qsa=True)
+    mtp = "mtp" in model.components
+    if mtp and not has_mtp(gguf):
+        raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
+
+    # Recipe.assign resolves selectors against model.parameters, so register the
+    # indexer logical parameters (and their config) before assigning anything.
+    qsa_gguf.register_parameters(model)
+    model.config.update(qsa_gguf.artifact_config())
+
+    _companions(model, recipe, sources)
+    encoded, direct = text_sources(gguf, mtp=mtp)
+    formats = {}
+    for name, source in encoded.items():
+        format = source.read_encoded(0, 1).format
+        formats[name] = format
+        recipe.assign(
+            name, format=format, method=import_encoded, source=source, activation_policy="AllowA8"
+        )
+    for name, source in direct.items():
+        recipe.assign(
+            name,
+            format=model.parameters[name].direct_format,
+            method=cast_direct,
+            source=source,
+        )
+    prefixes = [f"text/layers/{layer}/" for layer in range(LAYERS)]
+    if mtp:
+        prefixes.append("mtp/layers/0/")
+    for p in prefixes:
+        if p.startswith("text/") and not full_attention(int(p.split("/")[2])):
+            n = p + "gdn/"
+            qkv = [n + "query", n + "key", n + "value"]
+            recipe.group(qkv + [n + "z"] if formats[n + "z"] == formats[n + "query"] else qkv)
+            recipe.separate([n + "a_projection", n + "b_projection"])
+        else:
+            a = p + "attention/"
+            _group_same_format(
+                recipe, [a + "query", a + "key", a + "gate", a + "value"], formats
+            )
+        _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
+
+    # The indexer parameters are direct BF16; the fork stores them as F32 with the
+    # zero-centred norms folded as 1 + w (qsa_gguf.sources undoes the fold).
+    for name, source in qsa_gguf.sources(gguf).items():
+        recipe.assign(
+            name,
+            format=model.parameters[name].direct_format,
+            method=cast_direct,
+            source=source,
+        )
+        formats[name] = model.parameters[name].direct_format
+    for layer in qsa_gguf.qsa_layers():
+        p = f"text/layers/{layer}/attention/indexer/"
+        _group_same_format(recipe, [p + "query", p + "key"], formats)
+
+
+RECIPES = {
+    "qwen3_8_27b_gguf": qwen3_8_27b_gguf,
+    "qwen3_8_27b_qsa_gguf": qwen3_8_27b_qsa_gguf,
+}
 
 __all__ = [
     "EXPECTED_HEADER",
