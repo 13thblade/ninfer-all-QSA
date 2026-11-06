@@ -90,8 +90,15 @@ struct RopeYarnFrequencies {
 };
 
 // Requires an even dim, 1 <= pairs <= dim/2 <= 128, a positive finite theta, a finite YaRN factor
-// of at least one over a nonzero native context, and no linear position interpolation.
+// of at least one over a nonzero native context, and (by default) no linear position
+// interpolation. `allow_interpolation` lets a caller that applies the interpolation itself
+// (the QSA indexer) share this exact frequency table; interpolation does not change frequencies.
 [[nodiscard]] RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta,
                                                         const RopeYarn& yarn);
+// Same table, but allows linear position interpolation (which does not change
+// frequencies). The QSA indexer applies that interpolation itself, per axis.
+[[nodiscard]] RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta,
+                                                        const RopeYarn& yarn,
+                                                        bool allow_interpolation);
 
 } // namespace ninfer::ops

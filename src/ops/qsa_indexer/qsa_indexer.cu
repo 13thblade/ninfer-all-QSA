@@ -602,7 +602,7 @@ QsaRope make_rope(const RopeYarn& yarn, const std::uint8_t* pair_axes) {
     // with the same frequency table, attention factor and per-axis interpolation.
     if (yarn.active()) {
         const RopeYarnFrequencies f =
-            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn);
+            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn, true);
         for (int i = 0; i < kRotaryPairs; ++i) rope.inverse_frequency[i] = f.inverse_frequency[i];
         rope.attention_factor = f.attention_factor;
         rope.active           = 1;

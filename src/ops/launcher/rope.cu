@@ -305,10 +305,12 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, co
 
 namespace ninfer::ops {
 
-RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta, const RopeYarn& yarn) {
+RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta, const RopeYarn& yarn,
+                                          bool allow_interpolation) {
     if (dim < 2 || dim % 2 != 0 || pairs < 1 || pairs > dim / 2 || pairs > 128 ||
         !std::isfinite(theta) || !(theta > 0.0F) || !std::isfinite(yarn.factor) ||
-        yarn.factor < 1.0F || yarn.native_context == 0 || yarn.interpolation_factor > 1.0F) {
+        yarn.factor < 1.0F || yarn.native_context == 0 ||
+        (!allow_interpolation && yarn.interpolation_factor > 1.0F)) {
         throw std::invalid_argument("rope_yarn_frequencies: needs an even dim with 1..dim/2 pairs "
                                     "(at most 128), a positive theta and a YaRN factor of at "
                                     "least one over a native window, without position "
@@ -318,6 +320,10 @@ RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta, const
     out.pairs            = pairs;
     out.attention_factor = detail::yarn_schedule(dim, pairs, theta, yarn, out.inverse_frequency);
     return out;
+}
+
+RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta, const RopeYarn& yarn) {
+    return rope_yarn_frequencies(dim, pairs, theta, yarn, false);
 }
 
 } // namespace ninfer::ops
