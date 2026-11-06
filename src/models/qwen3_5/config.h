@@ -63,6 +63,20 @@ struct DenseConfig {
     std::uint32_t intermediate_size = 0;
 };
 
+/// The learned QSA block indexer of the Qwen3.8-27B-QSA adaptation. Absent on stock
+/// Qwen3.5/3.8-27B artifacts, which then keep their dense full attention. The values
+/// match ninfer::ops::qsa_indexer (4-token blocks, 512 selected blocks).
+struct QsaConfig {
+    std::uint32_t indexer_n_heads        = 0;
+    std::uint32_t indexer_head_dim       = 0;
+    std::uint32_t indexer_compress_ratio = 0;
+    std::uint32_t indexer_budget         = 0;
+
+    [[nodiscard]] std::uint32_t block_budget() const noexcept {
+        return indexer_budget / indexer_compress_ratio;
+    }
+};
+
 struct MoeConfig {
     std::uint32_t num_experts                     = 0;
     std::uint32_t num_experts_per_tok             = 0;
@@ -85,6 +99,7 @@ struct TextConfig {
     std::optional<AttentionConfig> attention;
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
+    std::optional<QsaConfig> qsa;
     std::variant<DenseConfig, MoeConfig> ffn;
 };
 

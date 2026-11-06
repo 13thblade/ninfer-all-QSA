@@ -109,7 +109,8 @@ TextConfig text(const Json& value, bool mtp) {
         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
+         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
+         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
@@ -156,6 +157,33 @@ TextConfig text(const Json& value, bool mtp) {
         }
         (void)gdn.conv_channels();
         out.gdn = gdn;
+    }
+    // QSA-27B carries a learned block indexer on its full-attention layers. Stock
+    // artifacts have none of these fields and keep dense full attention. The four
+    // values are the geometry ninfer::ops::qsa_indexer implements (4-token blocks,
+    // a 2048-token budget = 512 selected blocks).
+    static constexpr const char* qsa_fields[] = {
+        "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"};
+    bool has_qsa = false;
+    for (const char* key : qsa_fields) { has_qsa = has_qsa || value.contains(key); }
+    if (has_qsa) {
+        for (const char* key : qsa_fields) {
+            if (!value.contains(key)) {
+                throw ArtifactError(std::string("text config: QSA requires ") + key);
+            }
+        }
+        QsaConfig qsa{dimension(value, "indexer_n_heads"), dimension(value, "indexer_head_dim"),
+                      dimension(value, "indexer_compress_ratio"), dimension(value, "indexer_budget")};
+        if (qsa.indexer_n_heads != 4 || qsa.indexer_head_dim != 128 ||
+            qsa.indexer_compress_ratio != 4 || qsa.indexer_budget != 2048 ||
+            qsa.indexer_budget % qsa.indexer_compress_ratio != 0) {
+            throw ArtifactError(
+                "QSA indexer geometry must be 4 heads x 128, ratio 4, budget 2048");
+        }
+        if (out.full_attention_layers == 0) {
+            throw ArtifactError("QSA indexer needs full-attention layers");
+        }
+        out.qsa = qsa;
     }
     if (out.architecture == Architecture::Qwen3_5Moe) {
         if (value.contains("intermediate_size")) {

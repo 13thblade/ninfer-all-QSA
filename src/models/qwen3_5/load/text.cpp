@@ -13,6 +13,31 @@
 
 namespace ninfer::models::qwen3_5::loading {
 
+// QSA-27B binds its learned indexer on text full-attention layers only. The MTP
+// block shares the text config but carries no trained indexer (the QSA fork's
+// qwen35.cpp explicitly retains every MTP key), so its prefix must not bind one.
+bool qsa_text_layer(const TextConfig& config, const std::string& p) {
+    return config.qsa.has_value() && p.rfind("text/layers/", 0) == 0;
+}
+
+QsaIndexerWeights bind_qsa_indexer(Bindings& b, const TextConfig& config,
+                                   const std::string& p) {
+    const auto& q = *config.qsa;
+    const std::string i = p + "attention/indexer/";
+    const std::vector<std::string> input{p + "mixer_input"};
+    QsaIndexerWeights out;
+    out.query = b.parameter(i + "query",
+                            {std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim,
+                             config.hidden_size},
+                            input, QType::BF16);
+    out.key = b.parameter(i + "key", {q.indexer_head_dim, config.hidden_size}, input,
+                          QType::BF16);
+    out.query_norm   = b.direct(i + "query_norm", {q.indexer_head_dim});
+    out.key_norm     = b.direct(i + "key_norm", {q.indexer_head_dim});
+    out.key_pre_norm = b.direct(i + "key_pre_norm", {q.indexer_head_dim});
+    return out;
+}
+
 AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p) {
     const auto& a = config.attention.value();
     const auto h  = config.hidden_size;
@@ -26,6 +51,7 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std
     out.query_norm = b.direct(p + "attention/query_norm", {a.head_dim});
     out.key_norm   = b.direct(p + "attention/key_norm", {a.head_dim});
     out.output     = b.parameter(p + "attention/output", {h, q}, {p + "attention/gated_output"});
+    if (qsa_text_layer(config, p)) { out.qsa = bind_qsa_indexer(b, config, p); }
     return out;
 }
 
@@ -92,6 +118,26 @@ WeightId bind_replica(Bindings& b, const std::string& name, const artifact::Shap
 WeightId bind_norm_replica(Bindings& b, const std::string& name, std::uint64_t width,
                            std::size_t rank) {
     return bind_replica(b, name, {width}, {}, QType::BF16, rank);
+}
+
+// Under tensor parallelism every rank that runs attention holds the whole
+// indexer, exactly as qwen4_exp does for its indexer projections and norms.
+QsaIndexerWeights bind_qsa_indexer_share(Bindings& b, const TextConfig& config,
+                                         const std::string& p, std::size_t rank) {
+    const auto& q = *config.qsa;
+    const std::string i = p + "attention/indexer/";
+    const std::vector<std::string> input{p + "mixer_input"};
+    QsaIndexerWeights out;
+    out.query = bind_replica(b, i + "query",
+                             {std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim,
+                              config.hidden_size},
+                             input, QType::BF16, rank);
+    out.key = bind_replica(b, i + "key", {q.indexer_head_dim, config.hidden_size}, input,
+                           QType::BF16, rank);
+    out.query_norm   = bind_norm_replica(b, i + "query_norm", q.indexer_head_dim, rank);
+    out.key_norm     = bind_norm_replica(b, i + "key_norm", q.indexer_head_dim, rank);
+    out.key_pre_norm = bind_norm_replica(b, i + "key_pre_norm", q.indexer_head_dim, rank);
+    return out;
 }
 
 namespace {
@@ -174,6 +220,9 @@ AttentionWeights bind_attention_share(Bindings& b, const TextConfig& config, con
     out.key_norm   = bind_norm_replica(b, p + "attention/key_norm", a.head_dim, rank);
     out.output = b.piece(p + "attention/output", {h, q}, {p + "attention/gated_output"}, {}, rank,
                          columns({output_query}));
+    if (qsa_text_layer(config, p)) {
+        out.qsa = bind_qsa_indexer_share(b, config, p, rank);
+    }
     return out;
 }
 
@@ -367,8 +416,13 @@ std::vector<AttentionWeights> bind_attention_shares(Bindings& b, const TextConfi
 std::vector<WeightId> layer_weights(const BlockWeights& block) {
     std::vector<WeightId> out{block.input_norm, block.post_attention_norm};
     if (const auto* attention = std::get_if<AttentionWeights>(&block.mixer)) {
-        out.insert(out.end(), {attention->query, attention->key, attention->gate, attention->value,
-                               attention->query_norm, attention->key_norm, attention->output});
+        out.insert(out.end(), {attention->query, attention->key, attention->gate,
+                               attention->value, attention->query_norm, attention->key_norm,
+                               attention->output});
+        if (attention->qsa) {
+            const auto& q = *attention->qsa;
+            out.insert(out.end(), {q.query, q.key, q.query_norm, q.key_norm, q.key_pre_norm});
+        }
     } else {
         const auto& gdn = std::get<GdnWeights>(block.mixer);
         out.insert(out.end(), {gdn.query, gdn.key, gdn.value, gdn.z, gdn.a_projection,
