@@ -177,7 +177,7 @@ verified, ticked there and in this table, then committed separately.
 | V1 | `qsa_indexer` append/select gain optional axis-major `[T,3]` positions; scalar path unchanged | done (`567f2ca`) |
 | V2 | Operator test: 3D cases + "three equal axes == scalar" bit-for-bit regression, YaRN x 3D, interpolation x 3D | done |
 | V3 | qwen3_5: persistent per-layer tail axis planes, `run_qsa` forwarding axis-major `[T,3]`, commit re-pool keeping `tail_axes` in step | done |
-| V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done |
+| V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done (`7e9906d`) |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
 | K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text | todo |
 | K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve`/`evict`; wide-call staging | todo |
