@@ -195,6 +195,22 @@ full-attention layers against Flash-Next's 12, so the `verify_width * 513` slot
 pool is larger; and `HostKVExtentStore` in `program_impl.h` is a context-cache
 replica, not the identity-layout pinned host copy that kv_stream requires.
 
+**Hard constraint: YaRN.** Every QSA/KV addition must stay compatible with the
+model's YaRN. Verified: the indexer's `inverse_frequency[pair]` and
+`attention_factor` come from the same `yarn_schedule()` as dense
+(`launcher/rope.cu:192-225`), the same `RopeYarn` value reaches dense, MTP,
+the indexer and the speculative commit re-pool, dense YaRN permits `axes == 3`
+(`wrapper/rope.cpp:99-110`), and `kv_stream` does no rotation and has no
+`kv_resident × rope_yarn` gate. "Model-supplied YaRN" here means the native
+262,144-position window plus Qwen's YaRN extension resolved by the CLI
+(`--rope-yarn` / `--rope-yarn-factor`, up to 4x); there is no `rope_scaling`
+object in the artifact. V1 additionally removes the indexer's old rejection of
+`--rope-scaling-factor`: linear interpolation now runs per axis with the same
+threshold/scale as `rope.cuh`'s YaRN kernel, so the indexer no longer diverges
+from dense. Stage acceptance (Y4–Y9 in the planning document §9.7) requires
+YaRN x 3D operator cases, a bit-for-bit "three equal axes == scalar"
+regression, and a streamed-vs-resident A/B with YaRN enabled.
+
 ## Verification performed
 
 ```
