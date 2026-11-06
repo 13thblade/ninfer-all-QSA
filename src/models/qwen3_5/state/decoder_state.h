@@ -27,6 +27,11 @@ struct QsaIndexerLayerState {
     // complete a block that straddles the call boundary. The verification pools into a
     // scratch copy and commit() replays only the accepted columns into `tail`.
     Tensor tail_scratch; // FP32 [indexer_head_dim, compress_ratio - 1]
+    // Interleaved M-RoPE axis positions of the three tail slots, I32 [3, 3]
+    // (slot, axis). An image/video prompt writes distinct t/h/w here; the next
+    // call reads them when a completed block starts inside this tail. Text-only
+    // calls write three equal axes, which is exactly the scalar rotation.
+    Tensor tail_axes;
 };
 
 struct QsaIndexerState {

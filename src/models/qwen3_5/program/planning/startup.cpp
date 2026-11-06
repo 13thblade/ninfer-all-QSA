@@ -245,9 +245,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const std::int32_t tail   = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
         const std::int32_t cols   = static_cast<std::int32_t>(blocks) + 2 * tail;
         out.qsa_indexer.reserve(config.full_attention_layers);
+        out.qsa_tail_axes.reserve(config.full_attention_layers);
         for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
             out.qsa_indexer.push_back(add_tensor(
                 builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys, tail and scratch"));
+            out.qsa_tail_axes.push_back(add_tensor(
+                builder, DType::I32, {3, 3}, "QSA indexer tail M-RoPE axes"));
         }
         // A speculative verification writes its indexer projection at a stable address so
         // the captured decode graph can replay it, and commit() re-pools only the accepted

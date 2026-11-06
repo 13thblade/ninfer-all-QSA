@@ -958,8 +958,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                         static_cast<std::int32_t>(committed));
                     const ops::QsaIndexerWeights weights{&index.query_norm, &index.key_norm,
                                                          &index.key_pre_norm};
+                    // The accepted verification columns are text tokens, so their
+                    // three axes are equal: leave rope_positions null but keep the
+                    // persistent tail axis plane in step with the live tail.
+                    const ops::QsaIndexerPositions positions{nullptr, &state.tail_axes, nullptr};
                     ops::qsa_indexer_append(projection, qsa.first_position, weights, eps, rope_yarn,
-                                            state.pooled, state.tail, stream);
+                                            state.pooled, state.tail, stream, positions);
                     ++full;
                 }
                 if (full != qsa.layers.size()) {

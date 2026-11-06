@@ -60,6 +60,10 @@ struct PersistentLayout {
     // pooled block keys, the incomplete block's tail, and a scratch tail for speculative
     // verification. Empty without the flag.
     std::vector<TensorLayout> qsa_indexer;
+    // One I32 [3, 3] plane per full-attention layer: interleaved M-RoPE axis
+    // positions of the incomplete block's three tail slots, needed when a
+    // completed block starts inside the previous call's tail.
+    std::vector<TensorLayout> qsa_tail_axes;
     // The verification's indexer projections (BF16 [640, layers * record_width]) and its
     // first position (I32 [1]), both at stable addresses for captured decode graphs.
     std::optional<TensorLayout> qsa_index_records;

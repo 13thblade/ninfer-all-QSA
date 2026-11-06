@@ -1578,7 +1578,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (qsa_layer) {
         // The sparse branch leaves `a` ungated; the dense branch's in-Op gate is absent.
-        run_qsa(*p.qsa, h, input_basis, qn, kn, v, a, cache_positions, fidx, T, s);
+        run_qsa(*p.qsa, h, input_basis, qn, kn, v, a, cache_positions, rope_for_op, fidx, T, s);
     } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1677,7 +1677,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden, InputBasis basis,
                           const Tensor& qn, const Tensor& kn, const Tensor& value,
                           const Tensor& attention, const Tensor& positions,
-                          int full_attention_index, std::int32_t total, cudaStream_t stream) {
+                          const Tensor& rope_positions, int full_attention_index,
+                          std::int32_t total, cudaStream_t stream) {
     // The flag's gate admits one sequence per program. An MTP verification is one row of
     // N consecutive columns of that sequence, which the indexer's N-token Ops already
     // score column by column; a multi-sequence batch would need a state copy per row.
@@ -1706,6 +1707,23 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     // the pre-verification frontier until commit() replays the accepted prefix.
     const bool verifying = active_sequence_width_ > 1;
     qwen3_5::QsaIndexerLayerState& state = qsa_indexer_->layers[full_attention_index];
+    // A verification's columns are text tokens (three equal axes) and its tail is a
+    // scratch copy, so it must not touch the persistent tail axis plane. Every other
+    // call maintains tail_axes: text writes three equal axes (exactly the scalar
+    // rotation), while an image/video prompt writes distinct t/h/w. Blocks that
+    // start inside the previous call's tail read those axes back.
+    ops::QsaIndexerPositions indexer_positions{};
+    if (!verifying) {
+        if (rope_positions.ne[1] == 3) {
+            if (rope_positions.ne[0] != T || rope_positions.ne[2] != 1 ||
+                rope_positions.ne[3] != 1) {
+                throw std::logic_error(
+                    "QSA sparse attention 3-D RoPE positions do not match the call width");
+            }
+            indexer_positions.rope_positions = &rope_positions;
+        }
+        indexer_positions.tail_axes = &state.tail_axes;
+    }
     // `view` requires the element count to stay put; the Op needs a one-element I32
     // device word pointing at the first position, not a reshape of the whole span.
     const Tensor first(call_positions.data, DType::I32, {1});
@@ -1759,13 +1777,13 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
     const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
     ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
-                            state.pooled, *append_tail, stream);
+                            state.pooled, *append_tail, stream, indexer_positions);
     auto scope = work_.scope();
     Tensor selected =
         workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);
     Tensor counts = workspace::vector(work_, DType::I32, T);
     ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_, state.pooled,
-                            work_, selected, counts, stream);
+                            work_, selected, counts, stream, indexer_positions);
     ops::sparse_softmax_attention(
         q_span, first, selected, counts, layer,
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),

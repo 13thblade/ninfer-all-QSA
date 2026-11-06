@@ -180,7 +180,7 @@ verified, ticked there and in this table, then committed separately.
 | V0 | Source survey: IMROPE == `pair_axes`; locate the 3D position path | done |
 | V1 | `qsa_indexer` append/select gain optional axis-major `[T,3]` positions; scalar path unchanged | done (`567f2ca`) |
 | V2 | Operator test: 3D cases + "three equal axes == scalar" bit-for-bit regression, YaRN x 3D, interpolation x 3D | done |
-| V3 | qwen3_5: persistent per-block/tail axis planes, `run_qsa` forwarding, commit re-pool with 3D | todo |
+| V3 | qwen3_5: persistent per-layer tail axis planes, `run_qsa` forwarding axis-major `[T,3]`, commit re-pool keeping `tail_axes` in step | done |
 | V4 | Remove the `--vision` gate; real multimodal smoke | todo |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
 | K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text | todo |

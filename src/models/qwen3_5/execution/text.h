@@ -265,8 +265,8 @@ private:
     // incomplete block, writing its ungated output into `attention`.
     void run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden, InputBasis basis,
                  const Tensor& qn, const Tensor& kn, const Tensor& value, const Tensor& attention,
-                 const Tensor& positions, int full_attention_index, std::int32_t total,
-                 cudaStream_t stream);
+                 const Tensor& positions, const Tensor& rope_positions, int full_attention_index,
+                 std::int32_t total, cudaStream_t stream);
     // Position-split attention's second half on a rank: the merge of every rank's partial for its
     // query heads, gated by the gates attn_mix kept, and its share of the output projection.
     void attn_merge_output(const BlockParameters& weights, Tensor& x,

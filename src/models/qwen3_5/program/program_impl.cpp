@@ -637,12 +637,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         state.compress_ratio   = qsa.indexer_compress_ratio;
         state.blocks           = blocks;
         state.layers.reserve(plan.persistent.qsa_indexer.size());
-        for (const TensorLayout& layer : plan.persistent.qsa_indexer) {
-            const Tensor region = layer.bind(backing);
+        if (plan.persistent.qsa_tail_axes.size() != plan.persistent.qsa_indexer.size()) {
+            throw std::logic_error("QSA indexer tail axis planes do not match the layers");
+        }
+        for (std::size_t layer = 0; layer < plan.persistent.qsa_indexer.size(); ++layer) {
+            const Tensor region = plan.persistent.qsa_indexer[layer].bind(backing);
             state.layers.push_back(QsaIndexerLayerState{
                 region.slice(1, 0, static_cast<std::int32_t>(blocks)),
                 region.slice(1, static_cast<std::int32_t>(blocks), tail),
-                region.slice(1, static_cast<std::int32_t>(blocks) + tail, tail)});
+                region.slice(1, static_cast<std::int32_t>(blocks) + tail, tail),
+                plan.persistent.qsa_tail_axes[layer].bind(backing)});
         }
         if (plan.persistent.qsa_index_records) {
             state.records        = plan.persistent.qsa_index_records->bind(backing);
