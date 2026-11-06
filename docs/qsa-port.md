@@ -25,6 +25,8 @@ and teaches the converter about the QSA GGUF.
 | `47a9c7f` | `ops: score sparse attention with the QSA-27B 24-over-4 geometry` | done, op test green |
 | `cf3053d` | `convert: register the late-constructed QSA indexer parameters on the recipe` | done, 301 converter tests |
 | `75d30b9` | `engine: run the QSA sparse branch of qwen3_5 behind --qwen38-27b-qsa` (+ docs) | done: full build, op tests, conversion, offline artifact inspection |
+| `08e539c` | `docs: record the landed QSA executor and converter commits` | done |
+| `3127a61` | `engine: run QSA-27B with the artifact's own MTP speculative drafts` | done: full build, op tests, cold-start smoke, greedy A/B, 32K benchmark |
 
 ## What works now
 
@@ -61,27 +63,50 @@ indexer query/key linears of the normalized residual (Hadamard basis handled)
 ```
 
 The gates at startup (`validate_target_options`) require, with the flag: the
-artifact's `config().text.qsa`, one device, no tensor parallelism,
-`max_concurrency == 1`, no speculative backend or draft/ngram draft tokens;
-the context cache is auto-disabled. The indexer state is one rank-0 FP32 copy
-per full-attention layer (`pooled [128, capacity/4 + 1]` + `tail [128, 3]`
-in one plane each); a new prefill repools from block zero, so no
-initialization is needed while the context cache is off. Decode reads the
-sequence through its row-bound execution view (`text_kv_view`); the CUDA
+artifact's `config().text.qsa`, one device, no tensor parallelism and
+`max_concurrency == 1`. The only admitted speculative backend is the
+artifact's own MTP head; DFlash/DFlash2/DSpark are rejected. `--vision` is
+rejected (see below). The context cache stays off because the indexer state
+is not in `StateImage` yet. The indexer state is one rank-0 FP32 copy per
+full-attention layer (`pooled [128, capacity/4 + 1]` + `tail [128, 3]` +
+`tail_scratch [128, 3]` in one plane); a new prefill repools from block zero,
+so no initialization is needed while the context cache is off. Decode reads
+the sequence through its row-bound execution view (`text_kv_view`); the CUDA
 Graph decode is captured with the capture row bound, so replay reads the
-row's published block table. The branch admits a prefill chunk, an ordinary
-one-column decode, or one whole-pass segment of a batched prefill; anything
-else throws.
+row's published block table.
+
+**MTP speculation** (`--spec mtp --draft-tokens N`, best with
+`--ngram-draft-tokens 0`) is supported. A verification is one N-column target
+pass: `qsa_indexer_append`, `qsa_indexer_select` and
+`sparse_softmax_attention` are already N-token operators, so no kernel
+changes were needed. `run_qsa` stages the verification's projection into a
+persistent per-layer record plane (a stable address for the captured decode
+graph) and pools into a per-layer scratch tail, leaving the live pooled/tail
+planes at the pre-verification frontier. `resolve_pending_raw` re-runs
+`qsa_indexer_append` over exactly the accepted columns of those records at
+commit, so rejected drafts never enter the persistent state — this is the
+same tail-replay contract as `qwen4_exp`'s executor and the fork's
+`seq_rm`/`blk_rebuild` state machine. The branch admits a prefill chunk, an
+ordinary one-column decode, one whole-pass batched-prefill segment, or one
+N-column verification; anything else throws.
 
 ## What does NOT work yet
 
+- **DFlash / DFlash2 speculation under QSA**: the masked draft backends keep
+  their own KV pool and replay contract; only the artifact's own MTP head is
+  wired to the QSA indexer. Deliberately deferred — the conflict surface is
+  large and MTP is the model's native drafter.
+- **Vision / M-RoPE under QSA**: the artifact does carry the Vision tower and
+  the dense path fully supports `--vision` with 3-axis M-RoPE, but
+  `qsa_indexer.cu` rotates with a scalar position + YaRN. An image/video
+  prompt would make the indexer select the wrong blocks *silently*, so
+  `--qwen38-27b-qsa --vision` is now refused at startup. Wiring this needs
+  section-aware 3D positions per completed 4-token block, a
+  `pair_axes`/`sections` input to the append/select kernels, and a
+  multimodal logit reference to check against (ninfer uses interleaved
+  3-axis `pair_axes`, the fork uses 4 contiguous `sections`).
 - **Prefix-cache / continuation reuse under QSA** needs the pooled+tail
   planes in `StateImage`; the context cache is disabled instead.
-- **Speculative decoding (MTP/DFlash2) under QSA** needs the indexer tail to
-  replay on verify/commit; the gates reject speculative decoding instead.
-- **M-RoPE (image/video) indexer positions**: the QSA fork rotates the
-  indexer with 3D sections; this port uses the scalar position + YaRN,
-  equivalent for text only.
 - **`--kv-resident`** remains Flash-Next-only; the QSA path reads the
   sequence's full paged KV on the device (no host streaming).
 
@@ -111,26 +136,32 @@ Both QSA-27B operator adaptations are committed and their op tests pass:
 
 Remaining work, in dependency order:
 
-1. **M-RoPE** — the QSA fork rotates the indexer with `ggml_rope_multi`'s 3D
-   sections; `qsa_indexer.cu` uses a scalar position + YaRN. Text-only is
-   equivalent; image/video needs section-aware positions.
-2. **Executor wiring** — done (this revision): `QsaIndexerParameters` bound in
+1. **Executor wiring** — DONE (`75d30b9`). `QsaIndexerParameters` bound in
    `execution/parameters.*`; per-layer `pooled`/`tail` planes in
    `state/decoder_state.*` and the startup plan; the QSA branch of
    `execution/text.cpp::attn_mix` (`run_qsa`) with the explicit
    `kv_cache_append`; startup gates, context-cache auto-disable, CLI/serve
    flag plumbing. The Flash-Next `kv_stream` (host-resident KV) is not used:
    QSA-27B reads its sequence's paged KV on the device.
-3. **Prefix-cache state and speculative replay** — carry `pooled`/`tail` in
-   `StateImage` and replay the indexer tail on a speculative commit; both are
-   gated off for now (context cache disabled, speculative rejected).
-4. **`--kv-resident` on qwen3_5** — `src/runtime/engine/qwen4_exp_core.cpp:305`
-   is currently the only place that forwards `kv_resident_positions` to an
-   executor. Generalise `src/product/kv_resident_options.h` help text and the
-   qwen3_5 core.
-5. **End-to-end** — convert the downloaded Q4_K_M GGUF, build sm_86, and compare
-   greedy token sequences / logit KLD against the QSA fork's `llama-server` on
-   the same prompt, cold restart, fixed seed, no KV-cache hits.
+2. **MTP speculative replay** — DONE (`3127a61`). Persistent verification
+   records, a scratch tail, and the accepted-prefix re-pool in
+   `resolve_pending_raw`. Verified by a 512-token greedy A/B at 32K context:
+   `qsa_mtp` output is byte-identical to `qsa_plain`.
+3. **M-RoPE / Vision under QSA** — the QSA fork rotates the indexer with
+   `ggml_rope_multi`'s 3D sections; `qsa_indexer.cu` uses a scalar position +
+   YaRN. Text-only is equivalent; image/video needs section-aware per-block
+   positions. The combination is refused at startup rather than silently
+   computing wrong selections.
+4. **Prefix-cache state** — carry `pooled`/`tail` in `StateImage` so a
+   continuation can restore the indexer; the context cache stays off until
+   then.
+5. **DFlash2 / `--kv-resident` on qwen3_5** — masked draft backends need
+   their own replay contract; `--kv-resident` is still forwarded only by
+   `src/runtime/engine/qwen4_exp_core.cpp:305`.
+6. **Cross-engine numerical alignment** — compare greedy token sequences /
+   logit KLD against the QSA fork's `llama-server` on the same prompt, cold
+   restart, fixed seed, no KV-cache hits. Still outstanding; the 32K run
+   below is an *in-engine* A/B, not a correctness proof against the fork.
 
 ## Verification performed
 
@@ -193,27 +224,89 @@ norms — every object's encoding validated against its declared shape/format;
 each indexer projection's use reads the layer's `mixer_input`; the MTP block
 carries no indexer (as the fork's MTP block has none).
 
+### Real model load (2026-11-06, VRAM freed)
+
+The 3090 Ti was idle (24,309 MiB free), so the converted artifact was finally
+loaded. **This was the first execution of the QSA branch on real weights** and
+it exposed two latent `Tensor::view` bugs (a reshape that changed the element
+count): `call_positions.view({1})` and `index.view({query_rows, T})` both
+threw `view element count mismatch` during CUDA Graph preparation. `3127a61`
+fixes them — the first position is now a one-word Tensor over the same device
+address, and the two indexer linears write contiguous planes that a 2D copy
+assembles into the Op's `[640, tokens]` layout.
+
+Full-tree rebuild after `3127a61`: 92/92 edges, all apps and `ninfer_tests`
+link. Operator tests: `ninfer_qsa_indexer_test` -> `PASS qsa_indexer`,
+`ninfer_sparse_attention_test` -> `PASS sparse_softmax_attention`.
+
+Cold-start smoke, QSA + native MTP (`--spec mtp --draft-tokens 2
+--ngram-draft-tokens 0 --qwen38-27b-qsa`, 2048 ctx, int8 KV, greedy):
+`engine ready` in 8.4 s, CUDA graphs captured in 550 ms, 15 verification
+rounds, 30 drafted / 20 accepted tokens, `prefix_cache_hit_tokens=0`, coherent
+text. The request log confirms `speculative_backend=mtp`, `draft_window=2`,
+`ngram_draft_window=0`, `context_cache.enabled=false`.
+
+Four-arm greedy A/B (one cold server per arm, same prompt/seed, 12-token
+prompt, 256 output tokens, `--no-prefix-reuse`, `cache_prompt:false`):
+
+| arm | prefill tok/s | decode tok/s | MTP accepted |
+|---|---|---|---|
+| dense, no spec | 789.0 | 52.2 | - |
+| dense + MTP | 847.7 | 94.0 | 148/213 |
+| QSA, no spec | 735.4 | 50.9 | - |
+| QSA + MTP | 739.9 | 89.1 | 146/216 |
+
+`qsa_mtp` and `qsa_plain` produced **identical 256-token greedy text**, and the
+same equality holds at 32K context with 512 output tokens: the accepted-prefix
+re-pool keeps speculation from changing QSA's greedy stream.
+
+32K benchmark (`tools/bench/run_qsa27b_32k_ab.py`; `--max-context 32768`,
+`--kv-capacity 32768`, int8 KV, one 30,550-token deterministic prompt, 512
+output tokens forced with `ignore_eos`, seed 57004, greedy, no prefix reuse,
+`--draft-tokens 3 --ngram-draft-tokens 0`):
+
+| arm | prefill tok/s | decode tok/s | TTFT | MTP accepted |
+|---|---|---|---|---|
+| dense, no spec | 1908.0 | 49.4 | 16014 ms | - |
+| dense + MTP | 1891.7 | 106.4 | 16168 ms | 349/485 |
+| QSA, no spec | 1568.9 | 49.5 | 19490 ms | - |
+| QSA + MTP | 1564.4 | 97.6 | 19546 ms | 339/516 |
+
+MTP more than doubles decode in both branches (dense 2.15x, QSA 1.98x). QSA
+is 0.82x dense on prefill and parity on decode at this length: the two
+indexer linears, pooling and radix selection still cost more than the KV reads
+they save. First things to try next are a larger `--prefill-chunk` with
+`--prefill-cublas`, the fork's dense fallback below 2,051 positions, and a
+longer context where the 512-block budget actually binds. Note also that
+`dense_plain != dense_mtp` on this engine (greedy diverges after ~172
+characters); that is pre-existing dense/verify numerics, not introduced by the
+QSA port, and needs its own logit comparison.
+
 ## How to continue after an interruption
 
 Order of work (the planning document carries the rolling checklist):
 
-1. **Executor wiring** (`src/models/qwen3_5/`) — DONE. `QsaIndexerParameters`
-   bound in `execution/parameters.*`; per-layer `pooled`/`tail` indexer state
-   planned in `state/decoder_state.*` and the startup plan; the QSA branch in
+1. **Executor wiring + native MTP** — DONE (`75d30b9`, `3127a61`).
+   `QsaIndexerParameters` bound in `execution/parameters.*`; per-layer
+   `pooled`/`tail`/`tail_scratch` planes plus verification records in
+   `state/decoder_state.*` and the startup plan; the QSA branch in
    `execution/text.cpp::attn_mix` (`run_qsa`: indexer linears ->
    `kv_cache_append` -> `qsa_indexer_append` -> `qsa_indexer_select` ->
-   `sparse_softmax_attention`); gated behind `EngineOptions::qwen38_27b_qsa`
-   (single device, `max_concurrency == 1`, no speculative, context cache
-   auto-disabled) and wired through `ninfer`, `ninfer-perplexity` and
-   `ninfer-serve` as `--qwen38-27b-qsa`.
-2. **Convert + validate** — DONE (2026-11-06). The conversion above produced
-   `E:\LLMs\Qwen3.8-27B-QSA.ninfer` (1292 objects, 1 file, 17.80 GB); the op
-   oracles pass in the `ninfer_tests` bundle and the offline artifact
-   inspection passes. What remains is end-to-end: start the 27B model once
-   the RTX 3090 Ti's VRAM is free, run a prompt with `--qwen38-27b-qsa` and
-   compare greedy output / logit KLD against the QSA fork's `llama-server`
-   (cold restart, fixed seed, no KV-cache hits). Until then do not benchmark
-   the artifact as if it were QSA. Model card:
+   `sparse_softmax_attention`); accepted-prefix re-pool in
+   `program/prefill.cpp::resolve_pending_raw`. Gated behind
+   `EngineOptions::qwen38_27b_qsa` (single device, `max_concurrency == 1`,
+   MTP only, `--vision` refused, context cache auto-disabled) and wired
+   through `ninfer`, `ninfer-perplexity` and `ninfer-serve`.
+2. **Convert + validate + real load** — DONE (2026-11-06). The conversion
+   produced `E:\LLMs\Qwen3.8-27B-QSA.ninfer` (1292 objects, 1 file,
+   17.80 GB); op oracles, offline artifact inspection, full-tree build,
+   cold-start QSA+MTP smoke, four-arm greedy A/B and the 32K benchmark above
+   all pass. **Next**, in order: (a) cross-engine greedy / logit KLD against
+   the QSA fork's `llama-server` — the in-engine A/B above is not a
+   correctness proof against the fork; (b) M-RoPE section-aware indexer
+   positions so `--vision` can be enabled under QSA; (c) `pooled`/`tail` in
+   `StateImage` to restore the context cache; (d) DFlash2 replay and
+   `--kv-resident`. Model card:
    `https://hf-mirror.com/higa2515/Qwen3.8-27B-QSA-GGUF`.
 
 Already validated against the real file:
@@ -232,3 +325,11 @@ them as BF16 direct parameters (`tools/convert/qsa_gguf.py:DIRECT_FORMAT`) to
 match the existing `qsa_pool_kernel` BF16 norm reads and the Flash-Next path.
 If the selection proves sensitive near tied radix scores, switch both the
 recipe's `direct_format` and the engine's binding to `fp32` together.
+
+QSA and dense greedy streams diverge on long prompts in this port (the 32K A/B
+above). Expected contributors: BF16 indexer norms, the sparse softmax
+reduction, and the missing dense fallback below 2,051 positions. Speculation
+itself is clean under QSA (`qsa_mtp == qsa_plain`), but on the *dense* path
+`dense_mtp` diverges from `dense_plain` after ~172 characters — a pre-existing
+verify-width numerics issue in the engine, unrelated to this port. Both need a
+logit-level comparison against the fork before any quality claim.
