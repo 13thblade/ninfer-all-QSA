@@ -159,10 +159,11 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
     }
 }
 
-// `kv_heads` 2 is the layer; 1 a tensor-parallel share of one KV head and its 12 query heads.
+// `kv_heads` 2 with 12 queries each is Flash-Next's layer; `kv_heads` 4 with 6 each is QSA-27B's;
+// `kv_heads` 1 is a tensor-parallel share of one KV head and its group of query heads.
 int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed,
-        int kv_heads = kKvHeads) {
-    const int q_heads = 12 * kv_heads;
+        int kv_heads = kKvHeads, int group = 12) {
+    const int q_heads = group * kv_heads;
     const bool quantized      = storage != KvCacheStorage::BFloat16;
     const bool rotated_values = storage == KvCacheStorage::Nvfp4Group16 ||
                                 storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -312,7 +313,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
             for (int j = 0; j < 4; ++j) positions.push_back(selected[static_cast<std::size_t>(t) * kTop + i] * 4 + j);
         for (int j = tail; j <= p; ++j) positions.push_back(j);
         for (int h = 0; h < q_heads; ++h) {
-            const int kv = h / 12;
+            const int kv = h / group;
             std::array<double, kDim> query{};
             for (int d = 0; d < kDim; ++d) query[d] = q[(static_cast<std::size_t>(t) * q_heads + h) * kDim + d];
             if (quantized) hadamard(query.data());
@@ -383,6 +384,19 @@ int main() {
         // A tensor-parallel share of one KV head: an unsplit and a split call.
         failures += run(storage, 2047, 9, 9106u, 1);
         failures += run(storage, 6001, 8, 9107u, 1);
+    }
+    // QSA-27B's geometry: 24 queries over 4 KV heads, six per head, and a tensor-parallel share of
+    // one KV head and its six queries. Three storages cover the BF16, INT8 and rotated-value paths.
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Nvfp4Group16,
+          KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+        failures += run(storage, 0, 1, 9200u, 4, 6);
+        failures += run(storage, 5, 4, 9201u, 4, 6);
+        failures += run(storage, 2047, 9, 9202u, 4, 6);
+        failures += run(storage, 4096, 3, 9203u, 4, 6);
+        failures += run(storage, 6001, 8, 9204u, 4, 6);
+        failures += run(storage, 2047, 9, 9205u, 1, 6);
+        failures += run(storage, 6001, 8, 9206u, 1, 6);
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sparse_softmax_attention\n";
     return failures == 0 ? 0 : 1;
