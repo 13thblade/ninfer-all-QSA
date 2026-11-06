@@ -688,6 +688,11 @@ def qwen3_8_27b_qsa_gguf(model, recipe, sources):
     # indexer logical parameters (and their config) before assigning anything.
     qsa_gguf.register_parameters(model)
     model.config.update(qsa_gguf.artifact_config())
+    # The Recipe snapshotted its selections at construction, before these parameters
+    # existed; register each so its assign below can override the placeholder.
+    for layer in qsa_gguf.qsa_layers():
+        for role in qsa_gguf.ROLES:
+            recipe.add_parameter(qsa_gguf.parameter_name(layer, role))
 
     _companions(model, recipe, sources)
     encoded, direct = text_sources(gguf, mtp=mtp)
