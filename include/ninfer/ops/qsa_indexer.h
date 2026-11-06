@@ -48,6 +48,13 @@ namespace ninfer::ops {
 struct QsaIndexerWeights {
     const Tensor* query_norm = nullptr; // BF16 [128]
     const Tensor* key_norm   = nullptr; // BF16 [128]
+    // QSA-27B runs a zero-centred RMSNorm on each raw indexer key before the
+    // 4-token pooling (the fork's blk.N.indexer.k_norm.pre_weight). Flash-Next
+    // has no such norm, so nullptr selects its existing path unchanged.
+    // Interface only: qsa_pool_kernel does not consume this input yet. Wiring it
+    // changes the pooling arithmetic and needs a numerical A/B against the
+    // QSA-27B reference; see docs/qsa-port.md.
+    const Tensor* key_pre_norm = nullptr;
 };
 
 // Pools every block that completes in [first_position, first_position + tokens) into `pooled`
