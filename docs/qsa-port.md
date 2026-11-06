@@ -20,7 +20,10 @@ and teaches the converter about the QSA GGUF.
 | `e1947ba` | `engine: bind the QSA-27B indexer config and weights in qwen3_5` | done, MSVC syntax-checked |
 | `71b8aeb` | `ops: declare the QSA-27B key_pre_norm indexer input (interface only)` | done, behaviour unchanged |
 | `0e9ca66` | `scripts: preflight a downloaded QSA-27B GGUF` | done |
-| (this commit) | `docs: add QSA-27B port status and continuation guide` | this document |
+| `3187448` | `docs: add QSA-27B port status and continuation guide` | first revision of this document |
+| `722567d` | `ops: pool QSA-27B indexer keys through the pre-key RMSNorm` | done, op test green |
+| `47a9c7f` | `ops: score sparse attention with the QSA-27B 24-over-4 geometry` | done, op test green |
+| (this commit) | `docs: record the verified QSA-27B operator stage` | this document |
 
 ## What works now
 
@@ -45,35 +48,45 @@ succeed at the parameter layer, but no QSA indexer or sparse attention is
 executed, and `--kv-resident` is still Flash-Next-only. Do not benchmark a
 converted artifact as if it were QSA.
 
+## Operator work (committed, verified)
+
+Both QSA-27B operator adaptations are committed and their op tests pass:
+
+- `src/ops/qsa_indexer/qsa_indexer.cu` (`722567d`): a `pre_norm_key<PreNorm>`
+  helper; `qsa_pool_kernel<Yarn, PreNorm>` applies a zero-centred RMSNorm with
+  `key_pre_norm` to every raw key *before* the 4-token mean (matching the fork's
+  `qwen35.cpp:864-877`), and `qsa_tail_kernel<PreNorm>` does the same for the
+  incomplete block's tail keys. The launcher dispatches over the four (yarn,
+  pre_norm) variants; a null `key_pre_norm` keeps the Flash-Next raw-key path
+  unchanged.
+- `src/ops/sparse_attention/sparse_attention.cu` (`47a9c7f`): the geometry is a
+  kernel template parameter `Group` (query heads per KV head): 12 for
+  Flash-Next (24 q / 2 kv) and 6 for QSA-27B (24 q / 4 kv). `kThreads =
+  Group * 32`, the merge dispatch covers query-head totals 6/12/24, and
+  validation accepts group 6 or 12 with 1-24 KV heads. Storage dispatch runs
+  over both groups.
+- The op tests run in the `ninfer_tests` bundle as always
+  (`ninfer_qsa_indexer_test`, `ninfer_sparse_attention_test`); the temporary
+  STANDALONE targets used for local iteration are removed.
+
 Remaining work, in dependency order:
 
-1. **Pooling arithmetic** — `src/ops/qsa_indexer/qsa_indexer.cu`: apply
-   `key_pre_norm` to each raw key before the 4-token mean in `qsa_pool_kernel`
-   and to the keys written by `qsa_tail_kernel`. `QsaIndexerWeights::key_pre_norm`
-   is declared but unused. This changes the numeric path; verify with
-   `tests/ops/test_qsa_indexer.cpp` against the FP64 oracle plus an A/B against
-   the QSA fork's BF16 reference.
-2. **KV-head geometry** — `src/ops/sparse_attention/sparse_attention.cu:41-46`
-   hardcodes `kQueryHeads=24, kKvHeads=2, kGroup=12`. QSA-27B has 4 KV heads
-   (`kGroup=6`), which changes `kThreads`, the shared-memory query tile and the
-   merge kernel. Parameterise as a template argument and re-run the operator
-   tests on an sm_86 card.
-3. **M-RoPE** — the QSA fork rotates the indexer with `ggml_rope_multi`'s 3D
+1. **M-RoPE** — the QSA fork rotates the indexer with `ggml_rope_multi`'s 3D
    sections; `qsa_indexer.cu` uses a scalar position + YaRN. Text-only is
    equivalent; image/video needs section-aware positions.
-4. **Executor wiring** — in `src/models/qwen3_5/program/` and
+2. **Executor wiring** — in `src/models/qwen3_5/program/` and
    `execution/attention.*`, follow `src/models/qwen4_exp/executor.cpp:3419-3442`:
    `qsa_indexer_append` -> `qsa_indexer_select` -> `kv_stream_resolve` ->
    `sparse_softmax_attention` -> `kv_stream_evict`. Also add `pooled` / `tail`
    state to `decoder_state` and the prefix-cache snapshot, and replay the
    indexer tail on a speculative commit. Dense fallback below
    `2048 + 3 = 2051` positions.
-5. **`--kv-resident` on qwen3_5** — `src/runtime/engine/qwen4_exp_core.cpp:305`
+3. **`--kv-resident` on qwen3_5** — `src/runtime/engine/qwen4_exp_core.cpp:305`
    is currently the only place that forwards `kv_resident_positions` to an
    executor. Generalise `src/product/kv_resident_options.h` help text and the
    qwen3_5 core. Note `--tensor-parallel` and streaming are mutually exclusive
    on Flash-Next (executor.cpp:1043-1046).
-6. **End-to-end** — convert the downloaded Q4_K_M GGUF, build sm_86, and compare
+4. **End-to-end** — convert the downloaded Q4_K_M GGUF, build sm_86, and compare
    greedy token sequences / logit KLD against the QSA fork's `llama-server` on
    the same prompt, cold restart, fixed seed, no KV-cache hits.
 
@@ -90,22 +103,65 @@ PYTHONPATH=F:/ninfer-all-QSA \
 
 C++ syntax (MSVC 19.44, CUDA 13.4 headers, `cl /Zs /std:c++20 /DNINFER_TIER_AMPERE`):
 `src/models/qwen3_5/config.cpp` and `src/models/qwen3_5/load/text.cpp` compile
-clean. A full CMake build is **not** available here: Windows configure requires a
-vcpkg toolchain for FFmpeg/curl (`cmake/Dependencies.cmake:27`) and CMake's
-registry probe calls `reg.exe`, which the sandbox blocks.
+clean.
+
+A full CMake build **is** now available. The earlier blocker (vcpkg toolchain
+for FFmpeg/curl) is resolved by naming the prebuilt triplet tree, per
+`cmake/Dependencies.cmake` and `scripts/build-native.bat`:
+
+```bat
+:: from a shell with the BuildTools vcvars64.bat environment
+E:\dev\tools\cmake-4.4.3-windows-x86_64\bin\cmake -G Ninja -S F:\ninfer-all-QSA ^
+  -B F:\ninfer-all-QSA\build-msvc -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON ^
+  -DCMAKE_CUDA_ARCHITECTURES=86 -DNINFER_VCPKG_TREE=E:/deps/vcpkg/installed/x64-windows
+cmake --build F:\ninfer-all-QSA\build-msvc --parallel 12
+```
+
+Configure succeeded (FFmpeg + CURL found from `E:/deps/vcpkg/installed/x64-windows`).
+
+Operator tests (sm_86, under the BuildTools `vcvars64.bat` environment). The
+scoped build of both test targets finished 2026-11-06 13:39 (588/588 edges of
+their dependency closure); both tests were verified as standalone executables
+before the temporary targets were dropped, and both compile in the
+`ninfer_tests` bundle:
+
+```
+tests\ninfer_qsa_indexer_standalone_test.exe
+# -> PASS qsa_indexer
+tests\ninfer_sparse_attention_standalone_test.exe
+# -> PASS sparse_softmax_attention
+```
+
+The remaining ~602 edges of the full tree are the other tests, benchmarks and
+apps; none of them blocks the operator work. Resume the full build with
+`cmake --build F:\ninfer-all-QSA\build-msvc --parallel 12`.
 
 ## How to continue after an interruption
 
-```
-cd F:\ninfer-all-QSA
-git log --oneline c1d98a6..HEAD          # what has landed
-python scripts/verify_qsa_gguf.py <downloaded.gguf>   # real-file preflight
-python -m tools.convert --model E:/LLMs/ninfer-base/Qwen3.8-27B \
-  --recipe qwen3_8_27b_qsa_gguf --components text,vision,mtp \
-  --source gguf=<downloaded.gguf> \
-  --source vision=E:/LLMs/mmproj-BF16.gguf \
-  --out E:/LLMs/QSA27B-Q4KM.ninfer
-```
+Order of work (the planning document carries the rolling checklist):
+
+1. **Executor wiring** (`src/models/qwen3_5/`): bind `QsaIndexerParameters`
+   in `execution/parameters.*`; plan per-layer `pooled`/`tail` indexer state
+   in `state/decoder_state.*`; add the QSA branch in
+   `execution/text.cpp::attn_mix` (`qsa_indexer_append` ->
+   `qsa_indexer_select` -> `kv_cache_append` -> `sparse_softmax_attention`);
+   gate QSA to single-device, `max_concurrency == 1`, non-batched, no
+   speculative decoding, and auto-disable the context cache (the indexer
+   state is not yet in `StateImage`).
+2. **Build, convert, validate.** Full-tree build; convert with
+   `python -m tools.convert --model E:/LLMs/ninfer-base/Qwen3.8-27B
+   --recipe qwen3_8_27b_qsa_gguf --components text,vision,mtp,dflash2
+   --source gguf=E:/LLMs/Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf
+   --source vision=E:/LLMs/mmproj-BF16.gguf` (dflash2 source:
+   `E:\LLMs\ninfer-dflash2\official`); run the engine with 12 CPU threads on
+   the sm_86 card and compare greedy output against the published
+   reference. Model card: `https://hf-mirror.com/higa2515/Qwen3.8-27B-QSA-GGUF`.
+
+Already validated against the real file:
+`E:\LLMs\Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf` (16,674,185,792 bytes) passes
+`scripts/verify_qsa_gguf.py` — 946 tensors, 80 F32 indexer, MTP present, 65
+blocks, `indexer_budget=2048`, heads=4, key_length=128, compress_ratio=4,
+selected_blocks=512, status `accepted`.
 
 The matching planning document with a rolling checklist is
 `D:\WorkBuddy\2026-11-06-10-13-06\QSA27B_ninfer_移植方案.md`.
