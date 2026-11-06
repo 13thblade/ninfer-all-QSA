@@ -22,12 +22,26 @@ inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
 struct QsaIndexerLayerState {
     Tensor pooled; // FP32 [indexer_head_dim, blocks]
     Tensor tail;   // FP32 [indexer_head_dim, compress_ratio - 1]
+    // A speculative verification must not advance the live tail: the draft columns it
+    // writes may be rejected, and the next append reads the pre-verification slots to
+    // complete a block that straddles the call boundary. The verification pools into a
+    // scratch copy and commit() replays only the accepted columns into `tail`.
+    Tensor tail_scratch; // FP32 [indexer_head_dim, compress_ratio - 1]
 };
 
 struct QsaIndexerState {
     std::uint32_t indexer_head_dim = 0;
     std::uint32_t compress_ratio   = 0;
     std::uint32_t blocks           = 0; // pooled slots: capacity / compress_ratio + 1
+    // The widest speculative verification, in columns. Zero without speculation. One
+    // full-attention layer owns `record_width` columns of `records` at a fixed stride,
+    // so a captured graph writes its projection at a stable address.
+    std::uint32_t record_width = 0;
+    // BF16 [query_rows + key_rows, layers * record_width]: the verification's indexer
+    // projection of every column, kept for commit() to replay the accepted prefix.
+    Tensor records;
+    // I32 [1]: the verification's first position, staged for the same replay.
+    Tensor first_position;
     // One per full-attention layer, in the compact layer order attn_mix receives.
     std::vector<QsaIndexerLayerState> layers;
 };

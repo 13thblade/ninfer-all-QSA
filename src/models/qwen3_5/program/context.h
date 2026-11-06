@@ -123,6 +123,9 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // --qwen38-27b-qsa: the one sequence's row-bound execution view, for the sparse
+    // branch's explicit KV append and attention during target verification.
+    qwen3_5::PagedKVCacheView qsa_kv;
 };
 
 struct DFlashBatchContext {

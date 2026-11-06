@@ -631,6 +631,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // block zero and overwrites the state, so the planes need no initialization.
         const auto& qsa        = parameters.model.config().text.qsa.value();
         const std::uint32_t blocks = capacity / qsa.indexer_compress_ratio + 1U;
+        const auto tail = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
         QsaIndexerState& state = qsa_indexer_state.emplace();
         state.indexer_head_dim = qsa.indexer_head_dim;
         state.compress_ratio   = qsa.indexer_compress_ratio;
@@ -638,11 +639,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         state.layers.reserve(plan.persistent.qsa_indexer.size());
         for (const TensorLayout& layer : plan.persistent.qsa_indexer) {
             const Tensor region = layer.bind(backing);
-            state.layers.push_back(
-                QsaIndexerLayerState{region.slice(1, 0, static_cast<std::int32_t>(blocks)),
-                                     region.slice(
-                                         1, static_cast<std::int32_t>(blocks),
-                                         static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1))});
+            state.layers.push_back(QsaIndexerLayerState{
+                region.slice(1, 0, static_cast<std::int32_t>(blocks)),
+                region.slice(1, static_cast<std::int32_t>(blocks), tail),
+                region.slice(1, static_cast<std::int32_t>(blocks) + tail, tail)});
+        }
+        if (plan.persistent.qsa_index_records) {
+            state.records        = plan.persistent.qsa_index_records->bind(backing);
+            state.first_position = plan.persistent.qsa_first_position->bind(backing);
+            state.record_width =
+                std::max(plan.draft_window, plan.ngram_draft_window) + 1U;
         }
     }
     bind_steering(plan, steering_source, backings);

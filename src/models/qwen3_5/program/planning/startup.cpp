@@ -236,18 +236,34 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .invariant_attention       = plan.invariant_attention,
                           });
     // The QSA block indexer's per-layer state, on rank 0: the pooled block keys by block
-    // (one slot per block the capacity can complete, plus one) followed by the incomplete
-    // block's tail, in one FP32 plane per full-attention layer.
+    // (one slot per block the capacity can complete, plus one), the incomplete block's
+    // tail, and a scratch tail for speculative verification, in one FP32 plane per layer.
     if (plan.qsa) {
         const auto& qsa        = config.qsa.value();
         const std::uint32_t blocks = plan.capacity / qsa.indexer_compress_ratio + 1U;
         const std::int32_t rows   = dimension(qsa.indexer_head_dim);
-        const std::int32_t cols   = static_cast<std::int32_t>(blocks) +
-                                    static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        const std::int32_t tail   = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        const std::int32_t cols   = static_cast<std::int32_t>(blocks) + 2 * tail;
         out.qsa_indexer.reserve(config.full_attention_layers);
         for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
-            out.qsa_indexer.push_back(
-                add_tensor(builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys and tail"));
+            out.qsa_indexer.push_back(add_tensor(
+                builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys, tail and scratch"));
+        }
+        // A speculative verification writes its indexer projection at a stable address so
+        // the captured decode graph can replay it, and commit() re-pools only the accepted
+        // columns into the live state. The stride is the widest verification width.
+        if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+            const std::uint32_t record_width = widest_verify_window(plan) + 1U;
+            const std::int32_t projection_rows = dimension(
+                (qsa.indexer_n_heads + 1U) * qsa.indexer_head_dim);
+            const std::int32_t record_columns = checked_i32(
+                static_cast<std::uint64_t>(config.full_attention_layers) * record_width,
+                "QSA indexer record columns");
+            out.qsa_index_records = add_tensor(
+                builder, DType::BF16, {projection_rows, record_columns},
+                "QSA indexer verification projections");
+            out.qsa_first_position =
+                add_tensor(builder, DType::I32, {1}, "QSA indexer verification first position");
         }
     }
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
@@ -608,6 +624,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         // its selection, and the sparse attention over the selected blocks.
                         const auto& qsa = *attention->qsa;
                         const std::uint32_t blocks = plan.capacity / qsa.compress_ratio + 1U;
+                        // The assembled [query + key, tokens] projection, plus the two
+                        // contiguous destinations ops::linear writes before staging it.
+                        (void)workspace::matrix(layout, DType::BF16,
+                                                static_cast<std::int32_t>(qsa.query_rows +
+                                                                          qsa.key_rows),
+                                                last);
                         (void)workspace::matrix(layout, DType::BF16,
                                                 static_cast<std::int32_t>(qsa.query_rows +
                                                                           qsa.key_rows),
@@ -1359,10 +1381,24 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.max_concurrency != 1) {
             throw std::invalid_argument("qwen38_27b_qsa serves one concurrent request");
         }
-        if (options.speculative.backend != SpeculativeBackend::None ||
-            options.speculative.draft_tokens != 0 ||
-            options.speculative.ngram_draft_tokens != 0) {
-            throw std::invalid_argument("qwen38_27b_qsa rejects speculative decoding");
+        // The artifact does carry a Vision tower and the dense path runs its 3-axis
+        // M-RoPE, but the block indexer still rotates with a scalar position. Running
+        // QSA on an image/video prompt would select the wrong blocks silently. Refuse
+        // the combination instead; --vision without the flag stays fully supported.
+        if (options.enable_vision) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa does not support --vision yet: the QSA indexer needs "
+                "section-aware M-RoPE positions for image/video prompts");
+        }
+        // The artifact's own MTP head is the one speculative backend the sparse branch
+        // supports: a verification is one N-column target pass, the verification pools
+        // into a scratch tail and commit() re-pools the accepted columns. Masked draft
+        // backends keep their own KV and replay contract, which is not wired up yet.
+        if (options.speculative.backend != SpeculativeBackend::None &&
+            options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa supports only the model's own MTP speculative backend "
+                "(DFlash/DFlash2/DSpark are not wired to the QSA indexer)");
         }
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one

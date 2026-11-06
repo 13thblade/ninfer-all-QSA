@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
@@ -927,6 +928,44 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             extra_replay_fold[shard - 1]->execute(fold_span,
                                                   static_cast<std::int32_t>(record_width),
                                                   compute_streams[state_images->shard(shard).rank]);
+        }
+
+        // --qwen38-27b-qsa: a verification pooled into a scratch tail, so the live
+        // indexer state is still at the pre-verification frontier. Re-pool exactly
+        // the accepted columns: rejected drafts never enter pooled/tail, and the
+        // blocks they completed are overwritten with the accepted prefix here.
+        if (qsa_indexer_state && qsa_indexer_state->record_width != 0) {
+            if (lanes.size() != 1) {
+                throw std::logic_error("QSA speculative commit admits one lane");
+            }
+            qwen3_5::QsaIndexerState& qsa = *qsa_indexer_state;
+            const std::uint32_t committed = cancelled[0] ? 0U : accepted_tokens[0];
+            if (committed > qsa.record_width) {
+                throw std::logic_error("QSA speculative commit exceeds its record width");
+            }
+            if (committed != 0) {
+                const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
+                const float eps = parameters.model.config().text.rms_norm_eps;
+                std::uint32_t full = 0;
+                for (const auto& block : parameters.text.layers) {
+                    const auto* attention =
+                        std::get_if<execution::AttentionParameters>(&block.mixer);
+                    if (attention == nullptr || !attention->qsa) { continue; }
+                    const execution::QsaIndexerParameters& index = *attention->qsa;
+                    qwen3_5::QsaIndexerLayerState& state = qsa.layers.at(full);
+                    const Tensor projection = qsa.records.slice(
+                        1, static_cast<std::int32_t>(full * qsa.record_width),
+                        static_cast<std::int32_t>(committed));
+                    const ops::QsaIndexerWeights weights{&index.query_norm, &index.key_norm,
+                                                         &index.key_pre_norm};
+                    ops::qsa_indexer_append(projection, qsa.first_position, weights, eps, rope_yarn,
+                                            state.pooled, state.tail, stream);
+                    ++full;
+                }
+                if (full != qsa.layers.size()) {
+                    throw std::logic_error("QSA speculative commit found an unexpected layer count");
+                }
+            }
         }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.

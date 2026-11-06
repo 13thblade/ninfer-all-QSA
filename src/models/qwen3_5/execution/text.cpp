@@ -1678,50 +1678,88 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                           const Tensor& qn, const Tensor& kn, const Tensor& value,
                           const Tensor& attention, const Tensor& positions,
                           int full_attention_index, std::int32_t total, cudaStream_t stream) {
-    // The flag's gate admits one sequence per program: this runs the whole call, or one
-    // whole-pass segment of a batched prefill; anything else is unreachable under it.
+    // The flag's gate admits one sequence per program. An MTP verification is one row of
+    // N consecutive columns of that sequence, which the indexer's N-token Ops already
+    // score column by column; a multi-sequence batch would need a state copy per row.
     if (attention_partial_ != nullptr) {
         throw std::logic_error("QSA sparse attention has no position-split route");
     }
-    if (active_sequence_batch_ != 0 &&
-        (active_sequence_batch_ != 1 || active_sequence_width_ != 1)) {
-        throw std::logic_error("QSA sparse attention admits one sequence column at a time");
+    if (active_sequence_batch_ > 1) {
+        throw std::logic_error("QSA sparse attention serves one sequence at a time");
     }
     Tensor q_span = qn, k_span = kn, v_span = value, a_span = attention;
-    Tensor call_positions = positions;
+    const std::int32_t T = q_span.ne[2];
+    if (T <= 0 || T > total) {
+        throw std::logic_error("QSA sparse attention received an inconsistent width");
+    }
+    Tensor call_positions = positions.view({T});
     if (!active_segments_.empty()) {
         const SegmentBinding& segment = active_segments_.front();
         if (active_segments_.size() != 1 || segment.column != 0 || segment.columns != total) {
             throw std::logic_error("QSA sparse attention admits one whole-pass prefill segment");
         }
-        call_positions = segment.positions;
+        call_positions = segment.positions.view({T});
     }
-    const std::int32_t T = q_span.ne[2];
-    if (T <= 0 || T > total) {
-        throw std::logic_error("QSA sparse attention received an inconsistent width");
-    }
-
+    // A width above one is a speculative verification. Its projection is staged in a
+    // persistent plane at a stable address for the captured graph, and its tail in a
+    // scratch copy: the draft columns may be rejected, so the live tail must stay at
+    // the pre-verification frontier until commit() replays the accepted prefix.
+    const bool verifying = active_sequence_width_ > 1;
     qwen3_5::QsaIndexerLayerState& state = qsa_indexer_->layers[full_attention_index];
-    const Tensor first = call_positions.view({1});
+    // `view` requires the element count to stay put; the Op needs a one-element I32
+    // device word pointing at the first position, not a reshape of the whole span.
+    const Tensor first(call_positions.data, DType::I32, {1});
     // The indexer's query and key rows of the normalized residual, one buffer, query first:
     // each projection rotates its input when its matrix is stored in the rotated basis, as the
     // layer's own attention projection does from the same `hidden`.
-    Tensor index = workspace::matrix(work_, DType::BF16,
-                                     static_cast<std::int32_t>(qsa.query_rows + qsa.key_rows), T);
-    Tensor index_query = index.view({static_cast<std::int32_t>(qsa.query_rows), T});
-    Tensor index_key = index.slice(0, static_cast<std::int32_t>(qsa.query_rows),
-                                   static_cast<std::int32_t>(qsa.key_rows));
+    Tensor index;
+    Tensor* append_tail = &state.tail;
+    if (verifying) {
+        if (qsa_indexer_->record_width < static_cast<std::uint32_t>(T)) {
+            throw std::logic_error("QSA sparse attention verification exceeds its record width");
+        }
+        index = qsa_indexer_->records.slice(
+            1,
+            static_cast<std::int32_t>(full_attention_index) *
+                static_cast<std::int32_t>(qsa_indexer_->record_width),
+            T);
+        CUDA_CHECK(cudaMemcpyAsync(qsa_indexer_->first_position.data, first.data,
+                                   sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state.tail_scratch.data, state.tail.data, state.tail.bytes(),
+                                   cudaMemcpyDeviceToDevice, stream));
+        append_tail = &state.tail_scratch;
+    } else {
+        index = workspace::matrix(work_, DType::BF16,
+                                  static_cast<std::int32_t>(qsa.query_rows + qsa.key_rows), T);
+    }
+    const auto query_rows = static_cast<std::int32_t>(qsa.query_rows);
+    const auto key_rows   = static_cast<std::int32_t>(qsa.key_rows);
+    // ops::linear requires a contiguous destination, so the two projections land in
+    // their own planes before being staged into the indexer's column-major
+    // [query_rows + key_rows, tokens] layout, query rows first.
+    Tensor index_query = workspace::matrix(work_, DType::BF16, query_rows, T);
+    Tensor index_key = workspace::matrix(work_, DType::BF16, key_rows, T);
     ops::linear(rotated_input(hidden, qsa.query.hadamard_signs, work_, stream, basis),
                 qsa.query.weight, index_query, qsa.query.policy, work_, stream);
     ops::linear(rotated_input(hidden, qsa.key.hadamard_signs, work_, stream, basis),
                 qsa.key.weight, index_key, qsa.key.policy, work_, stream);
+    constexpr std::size_t kElement = 2; // BF16
+    const std::size_t pitch = static_cast<std::size_t>(query_rows + key_rows) * kElement;
+    const std::size_t query_bytes = static_cast<std::size_t>(query_rows) * kElement;
+    const std::size_t key_bytes = static_cast<std::size_t>(key_rows) * kElement;
+    CUDA_CHECK(cudaMemcpy2DAsync(index.data, pitch, index_query.data, query_bytes,
+                                 query_bytes, static_cast<std::size_t>(T),
+                                 cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(index.data) + query_bytes, pitch,
+                                 index_key.data, key_bytes, key_bytes, static_cast<std::size_t>(T),
+                                 cudaMemcpyDeviceToDevice, stream));
     // The call's K/V rows enter the layer's cache before the sparse attention reads them, as the
     // dense branch's fused append does.
     PagedKVLayerView layer = kv_.layer_view(static_cast<std::uint32_t>(full_attention_index));
     ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
     const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
     ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
-                            state.pooled, state.tail, stream);
+                            state.pooled, *append_tail, stream);
     auto scope = work_.scope();
     Tensor selected =
         workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);

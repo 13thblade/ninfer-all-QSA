@@ -876,17 +876,25 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         arm_logprobs(logprobs);
         qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
+        // --qwen38-27b-qsa: the target verification of the one lane reads and appends
+        // the sequence's row through its bound execution view.
+        qwen3_5::PagedKVCacheView qsa_kv;
+        if (qsa_indexer_state.has_value()) {
+            qsa_kv = text_kv_view(active_sequence(lanes.front()));
+        }
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-             mtp_attention_window, experts.get(), steering.get()},
+             mtp_attention_window, experts.get(), steering.get(),
+             qsa_indexer_state ? &*qsa_indexer_state : nullptr},
             decoder->text_kv,
             *decoder->mtp_cache(),
             frame,
             *mtp_host_ingress,
             *mtp_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            qsa_kv};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

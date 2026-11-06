@@ -56,10 +56,14 @@ struct SteeringRankLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
-    // --qwen38-27b-qsa: one FP32 [indexer_head_dim, blocks + compress_ratio - 1] per
-    // full-attention layer on rank 0, the pooled block keys by block followed by the
-    // incomplete block's tail. Empty without the flag.
+    // --qwen38-27b-qsa: one FP32 plane per full-attention layer on rank 0, holding the
+    // pooled block keys, the incomplete block's tail, and a scratch tail for speculative
+    // verification. Empty without the flag.
     std::vector<TensorLayout> qsa_indexer;
+    // The verification's indexer projections (BF16 [640, layers * record_width]) and its
+    // first position (I32 [1]), both at stable addresses for captured decode graphs.
+    std::optional<TensorLayout> qsa_index_records;
+    std::optional<TensorLayout> qsa_first_position;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.
     std::optional<GdnReplayRecordLayout> replay_records;
     std::vector<GdnReplayRecordLayout> extra_replay_records;

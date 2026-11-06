@@ -501,8 +501,9 @@ struct EngineOptions {
     // artifact's learned block indexer (ops::qsa_indexer, ops::sparse_softmax_attention)
     // instead of the model's native dense attention. Unset keeps the native dense path for
     // every model. Refused for an artifact without the indexer, for several devices, tensor
-    // parallelism, more than one concurrent request, and a speculative backend, and turns
-    // the context cache off (the indexer state is not snapshot-able yet).
+    // parallelism, more than one concurrent request, and for a speculative backend other
+    // than the artifact's own MTP head. Turns the context cache off (the indexer state is
+    // not snapshot-able yet). MTP verification replays the indexer tail on commit.
     bool qwen38_27b_qsa              = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
