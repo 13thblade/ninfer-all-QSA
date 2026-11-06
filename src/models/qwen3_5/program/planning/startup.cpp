@@ -1384,15 +1384,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.max_concurrency != 1) {
             throw std::invalid_argument("qwen38_27b_qsa serves one concurrent request");
         }
-        // The artifact does carry a Vision tower and the dense path runs its 3-axis
-        // M-RoPE, but the block indexer still rotates with a scalar position. Running
-        // QSA on an image/video prompt would select the wrong blocks silently. Refuse
-        // the combination instead; --vision without the flag stays fully supported.
-        if (options.enable_vision) {
-            throw std::invalid_argument(
-                "qwen38_27b_qsa does not support --vision yet: the QSA indexer needs "
-                "section-aware M-RoPE positions for image/video prompts");
-        }
+        // --vision is supported: a multimodal prefill supplies axis-major [T,3]
+        // M-RoPE positions, which run_qsa forwards to the indexer's append/select
+        // so pooled keys rotate at their block's first-token t/h/w. Text and
+        // speculative-verification columns still have three equal axes.
         // The artifact's own MTP head is the one speculative backend the sparse branch
         // supports: a verification is one N-column target pass, the verification pools
         // into a scratch tail and commit() re-pools the accepted columns. Masked draft

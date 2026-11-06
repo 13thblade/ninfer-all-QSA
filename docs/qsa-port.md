@@ -96,21 +96,18 @@ N-column verification; anything else throws.
   their own KV pool and replay contract; only the artifact's own MTP head is
   wired to the QSA indexer. Deliberately deferred — the conflict surface is
   large and MTP is the model's native drafter.
-- **Vision / M-RoPE under QSA**: the artifact does carry the Vision tower and
-  the dense path fully supports `--vision` with 3-axis M-RoPE, but
-  `qsa_indexer.cu` rotates with a scalar position + YaRN. An image/video
-  prompt would make the indexer select the wrong blocks *silently*, so
-  `--qwen38-27b-qsa --vision` is currently refused at startup.
-  **Correction to an earlier note**: the fork does *not* use 4 contiguous
-  `sections`. `LLM_ARCH_QWEN35` maps to `LLAMA_ROPE_TYPE_IMROPE`
+- **Vision / M-RoPE under QSA** — DONE (`567f2ca`, `d49f7f4`, `d78fe1e`).
+  `--qwen38-27b-qsa --vision` is supported: a multimodal prefill passes its
+  axis-major `[T,3]` positions to the indexer, which rotates a completed
+  block's pooled key at the first token's t/h/w. **Correction to an earlier
+  note**: the fork does *not* use 4 contiguous `sections`.
+  `LLM_ARCH_QWEN35` maps to `LLAMA_ROPE_TYPE_IMROPE`
   (`llama-model.cpp:3211-3217`), whose `sector % 3` interleaving is
   numerically identical to ninfer's `pair_axes`/`pair % 3`
-  (`config.cpp:91-100`) for `sections = [11,11,10,0]`. So the fix is to push
-  the engine's existing axis-major `[T,3]` positions down into the indexer
-  kernels, not to add a second RoPE semantics. Pure text has three equal axes,
-  which must reduce exactly to the current scalar path — a self-contained
-  regression test that needs no external multimodal reference. See the
-  roadmap below.
+  (`config.cpp:91-100`) for `sections = [11,11,10,0]`. So the fix pushes the
+  engine's existing axis-major positions into the indexer kernels rather than
+  adding a second RoPE semantics. Three equal axes reduce exactly to the
+  scalar path. See the roadmap below and the verification probes below.
 - **Prefix-cache / continuation reuse under QSA** needs the pooled+tail
   planes in `StateImage`; the context cache is disabled instead.
 - **`--kv-resident`** remains Flash-Next-only; the QSA path reads the
@@ -153,14 +150,13 @@ Remaining work, in dependency order:
    records, a scratch tail, and the accepted-prefix re-pool in
    `resolve_pending_raw`. Verified by a 512-token greedy A/B at 32K context:
    `qsa_mtp` output is byte-identical to `qsa_plain`.
-3. **M-RoPE / Vision under QSA** — the QSA fork rotates the indexer with
-   `ggml_rope_multi`'s 3D sections; `qsa_indexer.cu` uses a scalar position +
-   YaRN. Text-only is equivalent; image/video needs section-aware per-block
-   positions. The combination is refused at startup rather than silently
-   computing wrong selections.
-4. **Prefix-cache state** — carry `pooled`/`tail` in `StateImage` so a
-   continuation can restore the indexer; the context cache stays off until
-   then.
+3. **M-RoPE / Vision under QSA** — DONE (`567f2ca`, `d49f7f4`, `d78fe1e`,
+   plus the gate removal in V4). Interleaved 3-axis positions, per-layer tail
+   axes, `--vision` enabled. Verified by logprob and long-context divergence
+   probes above.
+4. **Prefix-cache state** — carry `pooled`/`tail`/`tail_axes` in `StateImage`
+   so a continuation can restore the indexer; the context cache stays off
+   until then.
 5. **DFlash2 / `--kv-resident` on qwen3_5** — masked draft backends need
    their own replay contract; `--kv-resident` is still forwarded only by
    `src/runtime/engine/qwen4_exp_core.cpp:305`.
@@ -181,7 +177,7 @@ verified, ticked there and in this table, then committed separately.
 | V1 | `qsa_indexer` append/select gain optional axis-major `[T,3]` positions; scalar path unchanged | done (`567f2ca`) |
 | V2 | Operator test: 3D cases + "three equal axes == scalar" bit-for-bit regression, YaRN x 3D, interpolation x 3D | done |
 | V3 | qwen3_5: persistent per-layer tail axis planes, `run_qsa` forwarding axis-major `[T,3]`, commit re-pool keeping `tail_axes` in step | done |
-| V4 | Remove the `--vision` gate; real multimodal smoke | todo |
+| V4 | Remove the `--vision` gate; real multimodal smoke and QSA-liveness probes | done |
 | K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
 | K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text | todo |
 | K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve`/`evict`; wide-call staging | todo |
@@ -330,6 +326,34 @@ longer context where the 512-block budget actually binds. Note also that
 characters); that is pre-existing dense/verify numerics, not introduced by the
 QSA port, and needs its own logit comparison.
 
+### Vision / M-RoPE verification (2026-11-06)
+
+Cold-start `--qwen38-27b-qsa --vision --spec mtp --draft-tokens 2
+--ngram-draft-tokens 0`, one real PNG through `/v1/chat/completions`
+(`examples/cli/media/natural_scene.png`, 409 prompt tokens, greedy, seed
+57004, thinking off): the request ran to completion with a correct image
+description, vision preprocessing ~47 ms, 31 MTP rounds, 62 drafted / 50
+accepted, no 3-D position errors. The dense arm produced the **same text**.
+
+That equality is expected, not evidence that QSA was bypassed: 409 tokens is
+~102 blocks, below the 512-block budget, so `qsa_select_kernel` selects every
+block and sparse attention reads the same K/V as dense. Two probes confirm the
+sparse branch really executes:
+
+| probe | dense vs QSA greedy | logprobs |
+|---|---|---|
+| short image (102 blocks) | identical (277 chars) | 248/256 values differ, max abs 0.508, mean 0.091 |
+| long text + image (>512 blocks) | diverges at char 39 | 184/184 values differ, max abs 13.13, mean 1.84 |
+
+The first shows distinct kernels with different numerics; the second shows the
+512-block selection actually binding. `prefill_multimodal_chunk` calls
+`configure_text_card` (`prefill.cpp:140`), which binds the QSA indexer state,
+and `qsa_layer` (`text.cpp:1482`) does not depend on vision.
+
+Post-V4 text regression: the four-arm greedy A/B remains byte-identical to the
+`3127a61` baseline and `qsa_mtp == qsa_plain` still holds; `qsa_indexer`,
+`rope`, `sparse_softmax_attention` and `kv_stream` operator tests pass.
+
 ## How to continue after an interruption
 
 Order of work (the planning document carries the rolling checklist):
@@ -349,12 +373,12 @@ Order of work (the planning document carries the rolling checklist):
    produced `E:\LLMs\Qwen3.8-27B-QSA.ninfer` (1292 objects, 1 file,
    17.80 GB); op oracles, offline artifact inspection, full-tree build,
    cold-start QSA+MTP smoke, four-arm greedy A/B and the 32K benchmark above
-   all pass. **Next**, in order: (a) cross-engine greedy / logit KLD against
-   the QSA fork's `llama-server` — the in-engine A/B above is not a
-   correctness proof against the fork; (b) M-RoPE section-aware indexer
-   positions so `--vision` can be enabled under QSA; (c) `pooled`/`tail` in
-   `StateImage` to restore the context cache; (d) DFlash2 replay and
-   `--kv-resident`. Model card:
+   all pass, including `--vision` under QSA (see the vision probes above).
+   **Next**, in order: (a) cross-engine greedy / logit KLD against the QSA
+   fork's `llama-server` — the in-engine A/B is not a correctness proof
+   against the fork; (b) kv_stream / `--kv-resident` wiring (roadmap K1–K4);
+   (c) `pooled`/`tail`/`tail_axes` in `StateImage` to restore the context
+   cache; (d) DFlash2 replay. Model card:
    `https://hf-mirror.com/higa2515/Qwen3.8-27B-QSA-GGUF`.
 
 Already validated against the real file:
