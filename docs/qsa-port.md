@@ -100,11 +100,17 @@ N-column verification; anything else throws.
   the dense path fully supports `--vision` with 3-axis M-RoPE, but
   `qsa_indexer.cu` rotates with a scalar position + YaRN. An image/video
   prompt would make the indexer select the wrong blocks *silently*, so
-  `--qwen38-27b-qsa --vision` is now refused at startup. Wiring this needs
-  section-aware 3D positions per completed 4-token block, a
-  `pair_axes`/`sections` input to the append/select kernels, and a
-  multimodal logit reference to check against (ninfer uses interleaved
-  3-axis `pair_axes`, the fork uses 4 contiguous `sections`).
+  `--qwen38-27b-qsa --vision` is currently refused at startup.
+  **Correction to an earlier note**: the fork does *not* use 4 contiguous
+  `sections`. `LLM_ARCH_QWEN35` maps to `LLAMA_ROPE_TYPE_IMROPE`
+  (`llama-model.cpp:3211-3217`), whose `sector % 3` interleaving is
+  numerically identical to ninfer's `pair_axes`/`pair % 3`
+  (`config.cpp:91-100`) for `sections = [11,11,10,0]`. So the fix is to push
+  the engine's existing axis-major `[T,3]` positions down into the indexer
+  kernels, not to add a second RoPE semantics. Pure text has three equal axes,
+  which must reduce exactly to the current scalar path — a self-contained
+  regression test that needs no external multimodal reference. See the
+  roadmap below.
 - **Prefix-cache / continuation reuse under QSA** needs the pooled+tail
   planes in `StateImage`; the context cache is disabled instead.
 - **`--kv-resident`** remains Flash-Next-only; the QSA path reads the
@@ -162,6 +168,32 @@ Remaining work, in dependency order:
    logit KLD against the QSA fork's `llama-server` on the same prompt, cold
    restart, fixed seed, no KV-cache hits. Still outstanding; the 32K run
    below is an *in-engine* A/B, not a correctness proof against the fork.
+
+## Roadmap: Vision and streamed KV (rolling checklist)
+
+The detailed, interruptible plan lives in
+`D:\WorkBuddy\2026-11-06-10-13-06\QSA27B_ninfer_移植方案.md` §9. Each stage is
+verified, ticked there and in this table, then committed separately.
+
+| Stage | Work | State |
+|---|---|---|
+| V0 | Source survey: IMROPE == `pair_axes`; locate the 3D position path | done |
+| V1 | `qsa_indexer` append/select gain optional axis-major `[T,3]` positions; scalar path unchanged | todo |
+| V2 | Operator test: 3D cases + "three equal axes == scalar" bit-for-bit regression | todo |
+| V3 | qwen3_5: persistent per-block/tail axis planes, `run_qsa` forwarding, commit re-pool with 3D | todo |
+| V4 | Remove the `--vision` gate; real multimodal smoke | todo |
+| K0 | Survey: qwen3_5 has no kv_stream wiring; `--kv-resident` silently ignored | done |
+| K1 | Forward `kv_resident_positions`; plan per-layer host/pool/map planes; help text | todo |
+| K2 | Split host identity / pool views in `run_qsa`; `kv_stream_resolve`/`evict`; wide-call staging | todo |
+| K3 | Cap verify width at 16 when streaming; evict rejected draft blocks at commit; fixed graph addresses | todo |
+| K4 | Full build, op regression, streamed-vs-resident greedy A/B at 32K | todo |
+
+Constraints worth keeping in view: `kv_stream_resolve` accepts at most 16 query
+columns with exactly `[512, tokens]` selected blocks (`kv_stream.cu:364-375`),
+while qwen3_5 allows a 64-column verification window; the QSA-27B model has 16
+full-attention layers against Flash-Next's 12, so the `verify_width * 513` slot
+pool is larger; and `HostKVExtentStore` in `program_impl.h` is a context-cache
+replica, not the identity-layout pinned host copy that kv_stream requires.
 
 ## Verification performed
 
