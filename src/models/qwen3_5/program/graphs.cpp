@@ -314,7 +314,7 @@ void ProgramImpl::prepare_graphs() {
             }
         }
     };
-    const auto execution_core = [&] {
+    const auto execution_core = [&](bool with_qsa = false) {
         return execution::ExecutionCore{device,
                                         parameters,
                                         work,
@@ -327,7 +327,8 @@ void ProgramImpl::prepare_graphs() {
                                         stage_runtime.get(),
                                         rope_yarn,
                                         fast_prefill_kernel,
-                                        mtp_attention_window, experts.get(), steering.get()};
+                                        mtp_attention_window, experts.get(), steering.get(),
+                                        with_qsa && qsa_indexer_state ? &*qsa_indexer_state : nullptr};
     };
 
     const auto& text_attention = *parameters.model.config().text.attention;
@@ -341,10 +342,18 @@ void ProgramImpl::prepare_graphs() {
             ordinary_graph_profiles(capacity, attention_geometry, kv_storage);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // --qwen38-27b-qsa: the sparse branch's row-bound view, from the capture's own bound
+        // row; the gate pins row 0, so every replay reads that row's published table.
+        qwen3_5::PagedKVCacheView qsa_kv;
+        if (qsa_indexer_state.has_value()) {
+            qsa_kv = decoder->text_kv.execution_view(
+                text_kv_addresses->execution_row(text_capture_allocations.front()));
+        }
         execution::OrdinaryBatchContext ordinary_state{
-            execution_core(),      decoder->text_kv,
+            execution_core(true),  decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
-            *ordinary_host_egress, state_images->continuation_hidden_store()};
+            *ordinary_host_egress, state_images->continuation_hidden_store(),
+            qsa_kv};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1, 0);
         device.synchronize();

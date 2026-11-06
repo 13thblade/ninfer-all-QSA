@@ -321,6 +321,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.tensor_parallel_transport = options.tensor_parallel_transport;
     engine_options.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     engine_options.invariant_attention      = options.invariant_attention;
+    engine_options.qwen38_27b_qsa           = options.qwen38_27b_qsa;
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;
     engine_options.kv_resident_positions      = options.kv_resident_positions;

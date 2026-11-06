@@ -36,6 +36,8 @@
 #include "ninfer/ops/paged_kv_window.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "ninfer/ops/qsa_indexer.h"
+#include "ninfer/ops/sparse_attention.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
@@ -1474,6 +1476,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     // A tensor-parallel rank runs its KV heads and the query heads that read them, over its own
     // planes of the layer's KV cache.
     const TextConfig& config = layer_config();
+    // --qwen38-27b-qsa: a layer runs the sparse branch only when the Program bound the
+    // indexer state; without it every layer keeps the model's native dense attention,
+    // a QSA artifact included.
+    const bool qsa_layer = qsa_indexer_ != nullptr && p.qsa.has_value();
     const std::size_t kv_rank =
         stage_runtime_ != nullptr && stage_runtime_->tensor_parallel ? tensor_rank_ : 0;
     if (active_causal_attention_envelope_ == nullptr) {
@@ -1504,13 +1510,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     // The NVFP4 W4A4 route can normalize while it quantizes, which skips the BF16 round trip of
     // the normalized hidden state, so only the other routes stage it.
     const auto* single     = std::get_if<LinearParameters>(&p.projection);
-    const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
+    // The sparse branch projects the indexer from the normalized residual, which the fused
+    // routes never stage, so it forces the unfused path.
+    const bool fused_nvfp4 = !qsa_layer && input_basis == InputBasis::Primal &&
+                             single != nullptr &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
     // The integer route carries the same edge: one pass over the residual row produces the s8 codes
     // and per-32 scales the grouped or narrow mainloop reads, so the rmsnorm below is skipped
     // rather than run and then re-read. The policies are disjoint, and the band decides the width.
-    const bool fused_int8 = !fused_nvfp4 && input_basis == InputBasis::Primal && single != nullptr &&
+    const bool fused_int8 = !qsa_layer && !fused_nvfp4 &&
+                            input_basis == InputBasis::Primal && single != nullptr &&
                             ops::attn_input_proj_fused_rmsnorm_int8_eligible(
                                 single->weight, single->policy, T);
     Tensor h;
@@ -1566,7 +1576,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool rotated_output = rotated(p.output.hadamard_signs);
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
+    if (qsa_layer) {
+        // The sparse branch leaves `a` ungated; the dense branch's in-Op gate is absent.
+        run_qsa(*p.qsa, h, input_basis, qn, kn, v, a, cache_positions, fidx, T, s);
+    } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
@@ -1648,12 +1661,77 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
     Tensor gated    = a.view({dimension(config.attention->query_width()), T});
+    // The sparse attention applies no gate: in the primal basis it is the in-place multiply
+    // here, in the rotated one the hadamard form below, as the dense branch's own tail.
+    if (qsa_layer && !rotated_output) {
+        ops::sigmoid_mul(gate, a, s);
+    }
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
         project_residual(gated, p.output, x, InputBasis::Rotated, wide);
         return;
     }
     project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden, InputBasis basis,
+                          const Tensor& qn, const Tensor& kn, const Tensor& value,
+                          const Tensor& attention, const Tensor& positions,
+                          int full_attention_index, std::int32_t total, cudaStream_t stream) {
+    // The flag's gate admits one sequence per program: this runs the whole call, or one
+    // whole-pass segment of a batched prefill; anything else is unreachable under it.
+    if (attention_partial_ != nullptr) {
+        throw std::logic_error("QSA sparse attention has no position-split route");
+    }
+    if (active_sequence_batch_ != 0 &&
+        (active_sequence_batch_ != 1 || active_sequence_width_ != 1)) {
+        throw std::logic_error("QSA sparse attention admits one sequence column at a time");
+    }
+    Tensor q_span = qn, k_span = kn, v_span = value, a_span = attention;
+    Tensor call_positions = positions;
+    if (!active_segments_.empty()) {
+        const SegmentBinding& segment = active_segments_.front();
+        if (active_segments_.size() != 1 || segment.column != 0 || segment.columns != total) {
+            throw std::logic_error("QSA sparse attention admits one whole-pass prefill segment");
+        }
+        call_positions = segment.positions;
+    }
+    const std::int32_t T = q_span.ne[2];
+    if (T <= 0 || T > total) {
+        throw std::logic_error("QSA sparse attention received an inconsistent width");
+    }
+
+    qwen3_5::QsaIndexerLayerState& state = qsa_indexer_->layers[full_attention_index];
+    const Tensor first = call_positions.view({1});
+    // The indexer's query and key rows of the normalized residual, one buffer, query first:
+    // each projection rotates its input when its matrix is stored in the rotated basis, as the
+    // layer's own attention projection does from the same `hidden`.
+    Tensor index = workspace::matrix(work_, DType::BF16,
+                                     static_cast<std::int32_t>(qsa.query_rows + qsa.key_rows), T);
+    Tensor index_query = index.view({static_cast<std::int32_t>(qsa.query_rows), T});
+    Tensor index_key = index.slice(0, static_cast<std::int32_t>(qsa.query_rows),
+                                   static_cast<std::int32_t>(qsa.key_rows));
+    ops::linear(rotated_input(hidden, qsa.query.hadamard_signs, work_, stream, basis),
+                qsa.query.weight, index_query, qsa.query.policy, work_, stream);
+    ops::linear(rotated_input(hidden, qsa.key.hadamard_signs, work_, stream, basis),
+                qsa.key.weight, index_key, qsa.key.policy, work_, stream);
+    // The call's K/V rows enter the layer's cache before the sparse attention reads them, as the
+    // dense branch's fused append does.
+    PagedKVLayerView layer = kv_.layer_view(static_cast<std::uint32_t>(full_attention_index));
+    ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
+    const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
+    ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
+                            state.pooled, state.tail, stream);
+    auto scope = work_.scope();
+    Tensor selected =
+        workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);
+    Tensor counts = workspace::vector(work_, DType::I32, T);
+    ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_, state.pooled,
+                            work_, selected, counts, stream);
+    ops::sparse_softmax_attention(
+        q_span, first, selected, counts, layer,
+        static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+        work_, a_span, stream);
 }
 
 void TextContext::attn_merge_output(const BlockParameters& w, Tensor& x,

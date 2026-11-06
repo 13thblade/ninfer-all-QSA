@@ -14,6 +14,24 @@ namespace ninfer::models::qwen3_5 {
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
 
+// The QSA-27B block indexer state of one full-attention layer, one copy on rank 0: the
+// sequence's pooled block keys by block, and the raw keys of the incomplete block before
+// a call's first position. Under QSA one Program runs one sequence at a time with the
+// context cache off, so a single copy per layer serves every request: a new prefill
+// repools from block zero and overwrites the whole state.
+struct QsaIndexerLayerState {
+    Tensor pooled; // FP32 [indexer_head_dim, blocks]
+    Tensor tail;   // FP32 [indexer_head_dim, compress_ratio - 1]
+};
+
+struct QsaIndexerState {
+    std::uint32_t indexer_head_dim = 0;
+    std::uint32_t compress_ratio   = 0;
+    std::uint32_t blocks           = 0; // pooled slots: capacity / compress_ratio + 1
+    // One per full-attention layer, in the compact layer order attn_mix receives.
+    std::vector<QsaIndexerLayerState> layers;
+};
+
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
     std::uint32_t mtp_layers                = 0;

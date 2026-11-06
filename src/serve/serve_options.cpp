@@ -1200,6 +1200,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.invariant_attention = true;
             continue;
         }
+        if (arg == "--qwen38-27b-qsa") {
+            options.qwen38_27b_qsa = true;
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;

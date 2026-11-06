@@ -1022,6 +1022,8 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
+    // --qwen38-27b-qsa: each full-attention layer's indexer pooled keys and tail, rank 0.
+    std::optional<qwen3_5::QsaIndexerState> qsa_indexer_state;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;

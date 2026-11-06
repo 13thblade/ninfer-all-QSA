@@ -626,6 +626,25 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    if (!plan.persistent.qsa_indexer.empty()) {
+        // One sequence at a time with the context cache off: a new prefill repools from
+        // block zero and overwrites the state, so the planes need no initialization.
+        const auto& qsa        = parameters.model.config().text.qsa.value();
+        const std::uint32_t blocks = capacity / qsa.indexer_compress_ratio + 1U;
+        QsaIndexerState& state = qsa_indexer_state.emplace();
+        state.indexer_head_dim = qsa.indexer_head_dim;
+        state.compress_ratio   = qsa.indexer_compress_ratio;
+        state.blocks           = blocks;
+        state.layers.reserve(plan.persistent.qsa_indexer.size());
+        for (const TensorLayout& layer : plan.persistent.qsa_indexer) {
+            const Tensor region = layer.bind(backing);
+            state.layers.push_back(
+                QsaIndexerLayerState{region.slice(1, 0, static_cast<std::int32_t>(blocks)),
+                                     region.slice(
+                                         1, static_cast<std::int32_t>(blocks),
+                                         static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1))});
+        }
+    }
     bind_steering(plan, steering_source, backings);
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
@@ -954,7 +973,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-                 mtp_attention_window, experts.get(), steering.get()},
+                 mtp_attention_window, experts.get(), steering.get(),
+                 qsa_indexer_state ? &*qsa_indexer_state : nullptr},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,

@@ -83,6 +83,8 @@ struct ServeOptions {
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
     TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
     bool invariant_attention         = false;
+    // Qwen3.8-27B: run the QSA sparse attention branch of every full-attention layer.
+    bool qwen38_27b_qsa              = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;

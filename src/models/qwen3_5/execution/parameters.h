@@ -59,10 +59,29 @@ struct MoeShareParameters {
 using FfnParameters =
     std::variant<DenseParameters, ops::SparseMoeWeights, StreamedMoeParameters, MoeShareParameters>;
 
+// The QSA-27B block indexer of a full-attention layer: its query and key projections of
+// the normalized residual (the Op's BF16 [640, tokens] rows, query first) and the BF16
+// norms of its pooled keys. Absent on stock artifacts, which keep their dense attention.
+struct QsaIndexerParameters {
+    LinearParameters query;
+    LinearParameters key;
+    Tensor query_norm;
+    Tensor key_norm;
+    // The zero-centred RMSNorm the raw indexer keys take before the 4-token pool.
+    Tensor key_pre_norm;
+    // The indexer's geometry, as the artifact's QsaConfig: its query and key rows, its
+    // block width, and its selection budget in blocks.
+    std::uint32_t query_rows     = 0;
+    std::uint32_t key_rows       = 0;
+    std::uint32_t compress_ratio = 0;
+    std::uint32_t block_budget   = 0;
+};
+
 struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    std::optional<QsaIndexerParameters> qsa;
 };
 
 struct GdnParameters {

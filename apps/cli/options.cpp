@@ -295,7 +295,11 @@ std::string usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
-           "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
+           "  --qwen38-27b-qsa              Qwen3.8-27B: run the QSA sparse attention branch\n"
+            "                                of every full-attention layer; needs the\n"
+            "                                artifact's block indexer, one concurrent\n"
+            "                                request, and no speculative decoding\n"
+            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
            "SAMPLING\n"
@@ -438,6 +442,8 @@ Options parse_options(int argc, char** argv) {
                 ninfer::product::parse_tensor_parallel_partials(value(arg));
         } else if (arg == "--invariant-attention") {
             options.invariant_attention = true;
+        } else if (arg == "--qwen38-27b-qsa") {
+            options.qwen38_27b_qsa = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {

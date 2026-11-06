@@ -69,6 +69,8 @@ struct Options {
     ninfer::TensorParallelPartials tensor_parallel_prompt_partials =
         ninfer::TensorParallelPartials::Fp32;
     bool invariant_attention                 = false;
+    // Qwen3.8-27B: run the QSA sparse attention branch of every full-attention layer.
+    bool qwen38_27b_qsa                      = false;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
@@ -115,6 +117,7 @@ std::string usage_text() {
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--tensor-attention heads|positions] [--invariant-attention]\n"
+            "       [--qwen38-27b-qsa]\n"
            "       [--tensor-parallel-transport auto|host|peer-read|peer-write]\n"
            "       [--tensor-parallel-prompt-partials fp32|bf16]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
@@ -272,6 +275,8 @@ Options parse_options(int argc, char** argv) {
                 value("--tensor-parallel-prompt-partials"));
         } else if (option == "--invariant-attention") {
             out.invariant_attention = true;
+        } else if (option == "--qwen38-27b-qsa") {
+            out.qwen38_27b_qsa = true;
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
             if (residency == "device") {
@@ -450,6 +455,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.tensor_parallel_transport     = options.tensor_parallel_transport;
     engine_options.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     engine_options.invariant_attention           = options.invariant_attention;
+    engine_options.qwen38_27b_qsa                = options.qwen38_27b_qsa;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;

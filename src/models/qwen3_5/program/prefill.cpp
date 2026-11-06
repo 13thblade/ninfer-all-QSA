@@ -57,6 +57,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    card.set_qsa_indexer(execution.qsa_indexer);
     card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
@@ -1214,7 +1215,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-             mtp_attention_window, experts.get(), steering.get()},
+             mtp_attention_window, experts.get(), steering.get(),
+             qsa_indexer_state ? &*qsa_indexer_state : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1798,6 +1800,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
         card.set_expert_runtime(experts.get());
         card.set_steering(steering.get());
         card.set_rope_yarn(rope_yarn);
+        card.set_qsa_indexer(qsa_indexer_state ? &*qsa_indexer_state : nullptr);
         card.set_fast_prefill_kernel(fast_prefill_kernel);
         card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);
         timing.pause();

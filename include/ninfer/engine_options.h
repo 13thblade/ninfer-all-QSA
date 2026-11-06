@@ -497,6 +497,13 @@ struct EngineOptions {
     // bytes whether it is decoded alone, verified in a draft window or batched with others. The
     // other kernels (projections, experts, Gated DeltaNet) keep their own schedules.
     bool invariant_attention = false;
+    // Qwen3.8-27B-QSA artifacts only: route the text's full-attention layers through the
+    // artifact's learned block indexer (ops::qsa_indexer, ops::sparse_softmax_attention)
+    // instead of the model's native dense attention. Unset keeps the native dense path for
+    // every model. Refused for an artifact without the indexer, for several devices, tensor
+    // parallelism, more than one concurrent request, and a speculative backend, and turns
+    // the context cache off (the indexer state is not snapshot-able yet).
+    bool qwen38_27b_qsa              = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

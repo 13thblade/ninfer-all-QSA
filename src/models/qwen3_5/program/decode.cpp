@@ -40,13 +40,14 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state.execution.device.stream));
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                         {}, state.execution.linear_attention, state.execution.io,
+                         state.qsa_kv, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_expert_runtime(state.execution.experts);
         card.set_steering(state.execution.steering);
         card.set_rope_yarn(state.execution.rope_yarn);
+        card.set_qsa_indexer(state.execution.qsa_indexer);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -649,16 +650,23 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         if (structured_round) { structured_round->publish(); }
         arm_logprobs(logprobs);
 
+        // --qwen38-27b-qsa: the sparse branch reads the sequence's row through its
+        // bound execution view; the gate pins the one lane's row, so the view never changes.
+        qwen3_5::PagedKVCacheView qsa_kv;
+        if (qsa_indexer_state.has_value()) { qsa_kv = text_kv_view(active_sequence(lanes.front())); }
+
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-             mtp_attention_window, experts.get(), steering.get()},
+             mtp_attention_window, experts.get(), steering.get(),
+             qsa_indexer_state ? &*qsa_indexer_state : nullptr},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            qsa_kv};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

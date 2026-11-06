@@ -28,8 +28,10 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/sparse_attention.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
 #include <algorithm>
@@ -233,6 +235,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .mtp_kv_head_shares        = std::move(mtp_kv_head_shares),
                               .invariant_attention       = plan.invariant_attention,
                           });
+    // The QSA block indexer's per-layer state, on rank 0: the pooled block keys by block
+    // (one slot per block the capacity can complete, plus one) followed by the incomplete
+    // block's tail, in one FP32 plane per full-attention layer.
+    if (plan.qsa) {
+        const auto& qsa        = config.qsa.value();
+        const std::uint32_t blocks = plan.capacity / qsa.indexer_compress_ratio + 1U;
+        const std::int32_t rows   = dimension(qsa.indexer_head_dim);
+        const std::int32_t cols   = static_cast<std::int32_t>(blocks) +
+                                    static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        out.qsa_indexer.reserve(config.full_attention_layers);
+        for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+            out.qsa_indexer.push_back(
+                add_tensor(builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys and tail"));
+        }
+    }
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.
     out.host_kv_text_page_stride =
@@ -586,12 +603,31 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout,
-                            ops::causal_softmax_attention_workspace_capacity_bytes(
-                                {dimension(share.attention->head_dim),
-                                 dimension(share.attention->num_attention_heads),
-                                 dimension(share.attention->num_key_value_heads)},
-                                plan.kv_storage, envelope, batch_size, min_width, max_width));
+                    if (attention->qsa && plan.qsa) {
+                        // The QSA sparse branch: the indexer's rows of the normalized residual,
+                        // its selection, and the sparse attention over the selected blocks.
+                        const auto& qsa = *attention->qsa;
+                        const std::uint32_t blocks = plan.capacity / qsa.compress_ratio + 1U;
+                        (void)workspace::matrix(layout, DType::BF16,
+                                                static_cast<std::int32_t>(qsa.query_rows +
+                                                                          qsa.key_rows),
+                                                last);
+                        linear_scratch(layout, qsa.query, first, last);
+                        linear_scratch(layout, qsa.key, first, last);
+                        (void)workspace::matrix(layout, DType::I32,
+                                                static_cast<std::int32_t>(qsa.block_budget), last);
+                        (void)workspace::matrix(layout, DType::I32, 1, last);
+                        scratch(layout, ops::qsa_indexer_select_workspace_bytes(
+                                            last, static_cast<std::int32_t>(blocks)));
+                        scratch(layout, ops::sparse_softmax_attention_workspace_bytes(last));
+                    } else {
+                        scratch(layout,
+                                ops::causal_softmax_attention_workspace_capacity_bytes(
+                                    {dimension(share.attention->head_dim),
+                                     dimension(share.attention->num_attention_heads),
+                                     dimension(share.attention->num_key_value_heads)},
+                                    plan.kv_storage, envelope, batch_size, min_width, max_width));
+                    }
                     residual_scratch(attention->output);
                     if (positions) {
                         // The merge of a position-split rank's query heads, a pass of its own.
@@ -1308,6 +1344,27 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // --qwen38-27b-qsa: the sparse path keeps one rank-0 copy of every full-attention
+    // layer's indexer state and runs one sequence at a time, so it admits only what that
+    // single copy can serve.
+    if (options.qwen38_27b_qsa) {
+        if (!parameters.model.config().text.qsa) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa requires an artifact carrying the QSA block indexer");
+        }
+        if (options.devices.size() > 1 || options.tensor_parallel) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa runs on one device without tensor parallelism");
+        }
+        if (options.max_concurrency != 1) {
+            throw std::invalid_argument("qwen38_27b_qsa serves one concurrent request");
+        }
+        if (options.speculative.backend != SpeculativeBackend::None ||
+            options.speculative.draft_tokens != 0 ||
+            options.speculative.ngram_draft_tokens != 0) {
+            throw std::invalid_argument("qwen38_27b_qsa rejects speculative decoding");
+        }
+    }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
@@ -1437,6 +1494,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
     impl->invariant_attention = inputs.invariant_attention;
+    impl->qsa                 = inputs.qsa;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -1777,6 +1835,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .invariant_attention        = options.invariant_attention,
+        .qsa                        = options.qwen38_27b_qsa,
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,
@@ -1800,6 +1859,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
         .steering_vectors           = !options.control_vectors.empty(),
     };
+    // The QSA indexer state is not in a StateImage yet, so a continuation could not restore it:
+    // the context cache stays off under the flag.
+    if (inputs.qsa) { inputs.context_cache.enabled = false; }
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.
     const std::uint64_t minimum_pages64 =

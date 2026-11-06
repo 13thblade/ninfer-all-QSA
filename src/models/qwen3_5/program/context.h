@@ -48,6 +48,8 @@ struct ExecutionCore {
     NativeExpertRuntime* experts = nullptr;
     // Null without LoRA adapters or control vectors.
     const SteeringView* steering = nullptr;
+    // --qwen38-27b-qsa: the full-attention layers' indexer state; null without the flag.
+    qwen3_5::QsaIndexerState* qsa_indexer = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,
@@ -108,6 +110,9 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // --qwen38-27b-qsa: the sequence's row-bound execution view for the sparse branch's
+    // explicit KV append and attention; empty without the flag.
+    qwen3_5::PagedKVCacheView qsa_kv;
 };
 
 struct MtpBatchContext {

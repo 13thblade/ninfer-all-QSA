@@ -56,6 +56,10 @@ struct SteeringRankLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
+    // --qwen38-27b-qsa: one FP32 [indexer_head_dim, blocks + compress_ratio - 1] per
+    // full-attention layer on rank 0, the pooled block keys by block followed by the
+    // incomplete block's tail. Empty without the flag.
+    std::vector<TensorLayout> qsa_indexer;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.
     std::optional<GdnReplayRecordLayout> replay_records;
     std::vector<GdnReplayRecordLayout> extra_replay_records;
@@ -120,6 +124,9 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
     bool invariant_attention                = false;
+    // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
+    // (ops::qsa_indexer, ops::sparse_softmax_attention) instead of dense attention.
+    bool qsa                               = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -163,6 +170,9 @@ struct SequencePlanImpl {
     bool fast_prefill_kernel                = false;
     // --invariant-attention: the text cache's calls take fixed key segments.
     bool invariant_attention                = false;
+    // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
+    // instead of dense attention; its rank-0 pooled-key and tail state below.
+    bool qsa                               = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;

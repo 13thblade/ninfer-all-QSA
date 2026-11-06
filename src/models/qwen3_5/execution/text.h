@@ -163,6 +163,10 @@ public:
     // residual after the embedding and after each write to it (ops::steer_residual).
     void set_steering(const SteeringView* steering) noexcept { steering_ = steering; }
 
+    // --qwen38-27b-qsa: the full-attention layers' block indexer state; null keeps every
+    // layer on its dense path.
+    void set_qsa_indexer(qwen3_5::QsaIndexerState* state) noexcept { qsa_indexer_ = state; }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -255,6 +259,14 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // The QSA-27B sparse branch of attn_mix for a layer carrying the block indexer: the
+    // indexer's rows of the normalized residual, the explicit KV append, the indexer's pool
+    // and select, and the sparse attention over the selected blocks and the call's own
+    // incomplete block, writing its ungated output into `attention`.
+    void run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden, InputBasis basis,
+                 const Tensor& qn, const Tensor& kn, const Tensor& value, const Tensor& attention,
+                 const Tensor& positions, int full_attention_index, std::int32_t total,
+                 cudaStream_t stream);
     // Position-split attention's second half on a rank: the merge of every rank's partial for its
     // query heads, gated by the gates attn_mix kept, and its share of the output projection.
     void attn_merge_output(const BlockParameters& weights, Tensor& x,
@@ -447,6 +459,9 @@ private:
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
     const SteeringView* steering_               = nullptr;
+    // --qwen38-27b-qsa: the full-attention layers' block indexer state (rank 0); null keeps
+    // every layer on its dense path.
+    qwen3_5::QsaIndexerState* qsa_indexer_ = nullptr;
     // A tensor-parallel pass: the rank whose share is being issued, and where its output
     // projections write their FP32 partial instead of adding to the residual.
     std::size_t tensor_rank_  = 0;
