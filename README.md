@@ -50,17 +50,17 @@ ninfer-serve model.ninfer --max-context 262144 \
 | QSA 2,048 块（8,192 token） | 1,020 | 47.4 | 26.1 s |
 | QSA 4,096 块（16,384 token） | 770 | 44.7 | 34.4 s |
 
-PPL：teacher-forced，65,536 上下文，68,408 token 语料（本仓库 docs 与 src 混合）。
+PPL：teacher-forced，语料 68,408 token（本仓库 docs 与 src 混合），上下文截断到 65,536、stride 512，共 7 个窗口。引擎的指标名本身就是 truncated-context，形状很关键：第一个窗口从文档开头起算、一次计分 65,535 token（占全篇 95.8%），深度从 0 递增到 65,535；其后 6 个窗口各 512 token，上下文都是 65,024。所以全篇均值主要由浅层决定，长上下文的代价看右列。
 
-| 配置 | PPL | 相对 dense |
-| --- | ---: | ---: |
-| dense | 3.9200 | — |
-| QSA 512 块 | 3.9993 | +2.02% |
-| QSA 1,024 块 | 3.9488 | +0.74% |
-| QSA 2,048 块 | 3.9303 | +0.26% |
-| QSA 4,096 块 | 3.9248 | +0.12% |
+| 配置 | 全篇 PPL（68,408 tok） | 相对 dense | 65K 深度 PPL（2,873 tok） | 相对 dense |
+| --- | ---: | ---: | ---: | ---: |
+| dense | 3.9200 | — | 3.9745 | — |
+| QSA 512 块 | 3.9993 | +2.02% | 4.2023 | +5.73% |
+| QSA 1,024 块 | 3.9488 | +0.74% | 4.0774 | +2.59% |
+| QSA 2,048 块 | 3.9303 | +0.26% | 4.0190 | +1.12% |
+| QSA 4,096 块 | 3.9248 | +0.12% | 3.9923 | +0.45% |
 
-窗口越宽越接近 dense，但 prefill 的时间大致随块数线性增长（4,096 块约为 dense 的 39%）；从默认 512 块加到 1,024 块就收回约 2/3 的 PPL 差距，2,048 块起进入 0.3% 以内。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），所以宽窗口与"省显存"基本互斥。
+窗口越宽越接近 dense，但 prefill 的时间大致随块数线性增长（4,096 块约为 dense 的 39%）；从默认 512 块加到 1,024 块就收回约 2/3 的差距。稀疏的代价随深度放大：在 65,024 上下文的 6 个 512-token 块上，512 块是 +5.7%，2,048 块才降到 +1.1%（逐块比值 1.01–1.09，6 块全部劣于 dense）。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），KV stream 仅改变全量 KV 存放的位置，不影响模型质量。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -113,17 +113,17 @@ Speed: one cold request, a 26,522-token prompt and 64 output tokens, KV capacity
 | QSA 2,048 blocks (8,192 tokens) | 1,020 | 47.4 | 26.1 s |
 | QSA 4,096 blocks (16,384 tokens) | 770 | 44.7 | 34.4 s |
 
-Perplexity: teacher-forced over a 68,408-token corpus (this repository's docs and src) at a 65,536-token context.
+Perplexity: teacher-forced over a 68,408-token corpus (this repository's docs and src), context truncated at 65,536 with a 512-token stride, seven windows. The engine names the metric truncated-context, and its shape matters: the first window starts at the document's beginning and scores 65,535 tokens in one go (95.8% of the corpus), at depths rising from 0 to 65,535; the six windows after it score 512 tokens each at a 65,024-token context. The whole-corpus average is therefore mostly a shallow-depth number; the right-hand column is the long-context one.
 
-| Configuration | PPL | vs dense |
-| --- | ---: | ---: |
-| dense | 3.9200 | — |
-| QSA 512 blocks | 3.9993 | +2.02% |
-| QSA 1,024 blocks | 3.9488 | +0.74% |
-| QSA 2,048 blocks | 3.9303 | +0.26% |
-| QSA 4,096 blocks | 3.9248 | +0.12% |
+| Configuration | whole corpus (68,408 tok) | vs dense | at 65K depth (2,873 tok) | vs dense |
+| --- | ---: | ---: | ---: | ---: |
+| dense | 3.9200 | — | 3.9745 | — |
+| QSA 512 blocks | 3.9993 | +2.02% | 4.2023 | +5.73% |
+| QSA 1,024 blocks | 3.9488 | +0.74% | 4.0774 | +2.59% |
+| QSA 2,048 blocks | 3.9303 | +0.26% | 4.0190 | +1.12% |
+| QSA 4,096 blocks | 3.9248 | +0.12% | 3.9923 | +0.45% |
 
-A wider window moves towards dense, and prefill time grows roughly with the block count (4,096 blocks is about 39% of dense). Going from the default 512 blocks to 1,024 recovers about two thirds of the perplexity gap, and 2,048 blocks lands inside 0.3%. Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks), so a wide window and a small device footprint pull against each other.
+A wider window moves towards dense, and prefill time grows roughly with the block count (4,096 blocks is about 39% of dense). Going from the default 512 blocks to 1,024 recovers about two thirds of the gap. Sparsity costs more the deeper you go: over the six 512-token blocks at a 65,024-token context, 512 blocks costs 5.7% and 2,048 blocks still costs 1.1% (per-block ratios 1.01 to 1.09, all six worse than dense). Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks). Streaming only changes where the full KV lives; it does not affect model quality.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 
