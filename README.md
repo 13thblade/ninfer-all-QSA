@@ -2,17 +2,38 @@
 
 # 中文
 
-本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型为Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（可用--qsa-top-blocks调整），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（可用--qsa-top-blocks调整），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。
 
 模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 
 模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-支持Qwen3.8-27B的ViT和MTP，暂不支持Dflash2
+支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文。
 
 后续计划：
 1. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
 2. 提供Dflash2和Dspine草稿的支持。
+
+## 旗标
+
+三个旗标分别决定「是否启用 QSA」「每个 token 能看多远」「KV 放在哪里」。
+
+| 旗标 | 作用 | 取值 | 默认 |
+| --- | --- | --- | --- |
+| `--qwen38-27b-qsa` | 打开 QSA 分支：16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力。要求 artifact 自带 indexer；只能用单卡、不开张量并行、`--max-concurrency 1`，投机后端只能是模型自带的 MTP。不开则走原生 dense 全注意力。 | 布尔开关 | 关 |
+| `--qsa-top-blocks N` | 每个 token 可见的历史块数，1 块 = 4 token。值越大越接近 dense，但 prefill 时间大致随块数线性增长。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
+| `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
+
+`--kv-resident` 的池子至少要容纳 `验证宽度 × (块数 + 1)` 个块。典型用法：
+
+```bash
+# 启用QSA + 2048 token 注意力窗口 + KV 全驻留
+ninfer-serve model.ninfer --qwen38-27b-qsa
+
+# 4 倍注意力窗口（8,192 token），并把 KV 的 16,384 个位置留在显存、其余流式
+ninfer-serve model.ninfer --max-context 262144 \
+  --qwen38-27b-qsa --qsa-top-blocks 2048 --kv-resident 16384
+```
 
 ## 实测
 
@@ -49,11 +70,32 @@ This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This mo
 - Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 - Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-It supports the ViT and MTP of Qwen3.8-27B; DFlash2 is not yet supported.
+It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts.
 
 Planned work:
 1. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
 2. Add support for DFlash2 and DSpine drafting.
+
+## Flags
+
+Three flags decide whether QSA runs, how far each token looks back, and where the KV lives.
+
+| Flag | What it does | Values | Default |
+| --- | --- | --- | --- |
+| `--qwen38-27b-qsa` | Runs the QSA branch: the sixteen full-attention layers score only the blocks the artifact's indexer selects. Needs the artifact's indexer, one device, no tensor parallelism, `--max-concurrency 1`, and either no speculative backend or the model's own MTP. Without it the model runs its native dense attention. | boolean switch | off |
+| `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over. A wider window moves towards dense, at a prefill cost that grows roughly with the block count. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
+| `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
+
+The `--kv-resident` pool must hold at least `verification width × (blocks + 1)` blocks. Typical use:
+
+```bash
+# QSA on, a 2048-token attention window, every layer's KV resident
+ninfer-serve model.ninfer --qwen38-27b-qsa
+
+# four times the attention window (8,192 tokens), keeping 16,384 KV positions on the device and streaming the rest
+ninfer-serve model.ninfer --max-context 262144 \
+  --qwen38-27b-qsa --qsa-top-blocks 2048 --kv-resident 16384
+```
 
 ## Measurements
 
