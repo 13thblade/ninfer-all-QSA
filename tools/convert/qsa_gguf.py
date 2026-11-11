@@ -4,8 +4,10 @@ The 27B QSA adaptation keeps the dense Qwen3.5/3.8-27B text tower (64 layers, 16
 full-attention + 48 Gated DeltaNet) and adds a 4-head, 128-dim block indexer to each of
 the 16 full-attention layers.  The published GGUFs therefore carry 80 extra F32
 tensors on top of the 866 tensors of the stock model (``blk.N.indexer.*``), which the
-stock ``qwen3_8_27b_gguf`` recipe rejects as unknown names.  See
-``docs/qsa-port.md`` and the model card at huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF.
+stock ``qwen3_8_27b_gguf`` recipe rejects as unknown names.  See the fork's
+root ``MODIFICATION.md`` and the model card at
+huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF. The one-shot converter entry
+point is ``tools/convert/convert_qsa27b.py``.
 
 Indexer mathematics (identical to ninfer's existing QSA path, see
 ``include/ninfer/ops/qsa_indexer.h``)::
