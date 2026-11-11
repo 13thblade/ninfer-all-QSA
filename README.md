@@ -13,6 +13,8 @@
 3. QSA注意力每token原生仅能看到2048个历史token，损失可能较大，将把它改为可调的；
 4. 提供Dflash2和Dspine草稿的支持。
 
+# This is the upstream original documentation
+
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
