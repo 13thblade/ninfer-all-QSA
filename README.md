@@ -1,3 +1,40 @@
+# Ninfer for Qwen3.8-27B-QSA
+
+# 中文
+
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型为Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token只需看到2048个历史token，可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题
+
+模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
+
+模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+
+支持Qwen3.8-27B的ViT和MTP，暂不支持Dflash2
+
+后续计划：
+1. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
+2. QSA注意力每token原生仅能看到2048个历史token，损失可能较大，将把它改为可调的；
+3. 提供Dflash2和Dspine草稿的支持。
+
+本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。QSA 模型权重与转换来自 higa2515，QSA 的 llama.cpp 移植来自 kuraneko1。
+
+# English
+
+This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token, the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints.
+
+- Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
+- Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+
+It supports the ViT and MTP of Qwen3.8-27B; DFlash2 is not yet supported.
+
+Planned work:
+1. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
+2. QSA attention natively sees only 2,048 historical tokens per token, which may cause noticeable loss; we plan to make this window configurable.
+3. Add support for DFlash2 and DSpine drafting.
+
+This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history. The QSA model weights and conversion are by **higa2515**; the QSA llama.cpp port is by **kuraneko1**.
+
+# This is the upstream original documentation
+
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
