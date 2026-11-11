@@ -135,14 +135,11 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "Engine rope_scaling_factor excludes rope_yarn and rope_yarn_factor");
     }
-    // --qsa-history-tokens: a whole number of 4-token blocks, within the ops' compile-time cap.
-    constexpr std::uint32_t kQsaBlockTokens = static_cast<std::uint32_t>(ops::kQsaBlockTokens);
-    constexpr std::uint32_t kQsaMaxTokens =
-        static_cast<std::uint32_t>(ops::kQsaTopBlocksMax) * kQsaBlockTokens;
-    if (options.qsa_history_tokens % kQsaBlockTokens != 0 ||
-        options.qsa_history_tokens > kQsaMaxTokens) {
-        throw std::invalid_argument("Engine qsa_history_tokens must be a multiple of 4, at most " +
-                                    std::to_string(kQsaMaxTokens));
+    // --qsa-top-blocks: a block count within the ops' cap; no token conversion here.
+    constexpr std::uint32_t kQsaMaxBlocks = static_cast<std::uint32_t>(ops::kQsaTopBlocksMax);
+    if (options.qsa_top_blocks > kQsaMaxBlocks) {
+        throw std::invalid_argument("Engine qsa_top_blocks must be at most " +
+                                    std::to_string(kQsaMaxBlocks));
     }
 }
 
@@ -493,7 +490,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model, options.qsa_history_tokens),
+    : model(std::move(source)), parameters(*model, options.qsa_top_blocks),
       steering(load_engine_steering(options, model->config().text)),
       frontend(models::qwen3_5::make_frontend(
           model->resources(),

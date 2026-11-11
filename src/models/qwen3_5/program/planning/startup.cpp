@@ -1486,11 +1486,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
-    // --qsa-history-tokens widens the QSA indexer's selection. Without the sparse branch it has
+    // --qsa-top-blocks widens the QSA indexer's selection. Without the sparse branch it has
     // no effect, so it is refused rather than silently dropped.
-    if (options.qsa_history_tokens != 0 && !options.qwen38_27b_qsa) {
+    if (options.qsa_top_blocks != 0 && !options.qwen38_27b_qsa) {
         throw std::invalid_argument(
-            "qsa_history_tokens requires qwen38_27b_qsa (the QSA sparse attention branch)");
+            "qsa_top_blocks requires qwen38_27b_qsa (the QSA sparse attention branch)");
     }
     // --qwen38-27b-qsa: the sparse path keeps one rank-0 copy of every full-attention
     // layer's indexer state and runs one sequence at a time, so it admits only what that
@@ -1523,7 +1523,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns, and
         // its pool is sized width * (budget + 1) blocks, budget the indexer's selection
-        // width (512 blocks, wider with --qsa-history-tokens). Cap the widest
+        // width (512 blocks, wider with --qsa-top-blocks). Cap the widest
         // verification when --kv-resident actually streams (a wider call takes the
         // staging route).
         if (resolved_kv_resident_positions(options) != 0) {
@@ -1726,7 +1726,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 " blocks per query, so the " + std::to_string(inputs.capacity) +
                 "-token context no longer fits the --kv-resident pool and every full-attention "
                 "layer keeps its KV resident; a smaller --max-context or "
-                "--qsa-history-tokens restores streaming";
+                "--qsa-top-blocks restores streaming";
         }
     }
     impl->persistent          = persistent_layout(*impl);

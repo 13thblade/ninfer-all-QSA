@@ -210,7 +210,7 @@ public:
     // reports or enforces capacity must take them from the plan rather than from raw options.
     [[nodiscard]] const ContextCacheOptions& context_cache_options() const noexcept;
     // A startup diagnostic planning could not publish itself: a --kv-resident stream pool that a
-    // raised --qsa-history-tokens no longer fits the context. Empty when there is nothing to say.
+    // raised --qsa-top-blocks no longer fits the context. Empty when there is nothing to say.
     [[nodiscard]] const std::string& stream_warning() const noexcept;
 
 public:

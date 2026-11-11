@@ -163,7 +163,7 @@ TextConfig text(const Json& value, bool mtp) {
     // artifacts have none of these fields and keep dense full attention. The geometry is
     // the one ninfer::ops::qsa_indexer implements: 4-token blocks and four 128-dim heads.
     // The budget is the artifact's own selection width, which the range the ops compile in
-    // bounds; --qsa-history-tokens may widen the selection at run time without touching it.
+    // bounds; --qsa-top-blocks may widen the selection at run time without touching it.
     static constexpr const char* qsa_fields[] = {
         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"};
     bool has_qsa = false;

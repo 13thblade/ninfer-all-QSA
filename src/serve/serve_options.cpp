@@ -1,6 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
-#include "product/qsa_history_options.h"
+#include "product/qsa_top_blocks_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -225,7 +225,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                of every full-attention layer; needs the\n"
            "                                artifact's block indexer and one concurrent\n"
            "                                request; works with the model's own MTP drafts\n" +
-           std::string(product::kQsaHistoryTokensHelp) +
+           std::string(product::kQsaTopBlocksHelp) +
                       "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
@@ -1185,7 +1185,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                               [&] { return require_value(arg.c_str()); })) {
             continue;
         }
-        if (product::parse_qsa_history_tokens_option(arg, options.qsa_history_tokens,
+        if (product::parse_qsa_top_blocks_option(arg, options.qsa_top_blocks,
                                                       [&] { return require_value(arg.c_str()); })) {
             continue;
         }

@@ -319,7 +319,7 @@ Consequences:
 - Context ≤ 2051 tokens (nb ≤ 512): selection is the identity -> plain dense causal GQA.
 - No sliding/local window and no sink beyond the tail rule.
 - In Flash-Next the width `512` above is fixed; in this fork's Qwen3.8-27B QSA model the same
-  selection runs with a runtime width, `--qsa-history-tokens N` (a multiple of 4 up to 8,192),
+  selection runs with a runtime width, `--qsa-top-blocks N` (1 to 65,536 blocks),
   512 blocks by default.
 - Pooled keys are deterministic functions of the cached raw keys: an engine caches `K_b` once per completed block
   (FP32 recommended, 512 B per block per layer) plus the raw keys of the incomplete tail (≤ 3 x 128).

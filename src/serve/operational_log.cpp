@@ -597,18 +597,19 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         // source: a reader of the log must be able to tell 2,048 from an override (plan §6.5).
         const std::uint32_t native_tokens = static_cast<std::uint32_t>(ninfer::ops::kQsaBlockTokens) *
                                             static_cast<std::uint32_t>(ninfer::ops::kQsaTopBlocksDefault);
-        if (engine.qsa_history_tokens == 0) {
-            logger_->info("qsa | history window {} tokens, {} blocks | the artifact's own",
-                          product::format_pretty_count(native_tokens),
+        if (engine.qsa_top_blocks == 0) {
+            logger_->info("qsa | history window {} blocks, {} tokens | the artifact's own",
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)),
+                          product::format_pretty_count(native_tokens));
+        } else {
+            logger_->info("qsa | history window {} blocks, {} tokens | overrides the artifact's {}",
+                          product::format_pretty_count(engine.qsa_top_blocks),
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(engine.qsa_top_blocks) *
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaBlockTokens)),
                           product::format_pretty_count(
                               static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)));
-        } else {
-            logger_->info("qsa | history window {} tokens, {} blocks | overrides the artifact's {}",
-                          product::format_pretty_count(engine.qsa_history_tokens),
-                          product::format_pretty_count(
-                              static_cast<std::uint64_t>(engine.qsa_history_tokens /
-                                                         ninfer::ops::kQsaBlockTokens)),
-                          product::format_pretty_count(native_tokens));
         }
     }
 

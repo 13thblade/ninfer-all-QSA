@@ -147,28 +147,26 @@ int main() {
         catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid --kv-resident");
     }
-    failures += check(!parse({"ninfer-serve", "model.ninfer"}).qsa_history_tokens &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "4096"})
-                                   .qsa_history_tokens == 4096U &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "8192"})
-                                   .qsa_history_tokens == 8192U &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "16384"})
-                                   .qsa_history_tokens == 16384U &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "32768"})
-                                   .qsa_history_tokens == 32768U &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "65536"})
-                                   .qsa_history_tokens == 65536U &&
-                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "262144"})
-                                   .qsa_history_tokens == 262144U &&
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).qsa_top_blocks &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "1"})
+                                   .qsa_top_blocks == 1U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "512"})
+                                   .qsa_top_blocks == 512U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "5003"})
+                                   .qsa_top_blocks == 5003U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "8192"})
+                                   .qsa_top_blocks == 8192U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "65536"})
+                                   .qsa_top_blocks == 65536U &&
                            parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
-                                 "--qsa-history-tokens", "4096", "--kv-resident", "16384"})
-                                   .qsa_history_tokens == 4096U,
-                       "server did not preserve --qsa-history-tokens");
-    for (const auto* value : {"5003", "262148", "8192x", ""}) {
+                                 "--qsa-top-blocks", "4096", "--kv-resident", "16384"})
+                                   .qsa_top_blocks == 4096U,
+                       "server did not preserve --qsa-top-blocks");
+    for (const auto* value : {"65537", "262144", "8192x", ""}) {
         bool rejected = false;
-        try { (void)parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", value}); }
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", value}); }
         catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "server accepted an invalid --qsa-history-tokens");
+        failures += check(rejected, "server accepted an invalid --qsa-top-blocks");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&

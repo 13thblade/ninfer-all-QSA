@@ -8,7 +8,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
-#include "product/qsa_history_options.h"
+#include "product/qsa_top_blocks_options.h"
 #include "product/tensor_split_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
@@ -72,8 +72,8 @@ struct Options {
     bool invariant_attention                 = false;
     // Qwen3.8-27B: run the QSA sparse attention branch of every full-attention layer.
     bool qwen38_27b_qsa                      = false;
-    // Qwen3.8-27B with --qwen38-27b-qsa: --qsa-history-tokens, the history a QSA query sees.
-    std::uint32_t qsa_history_tokens         = 0;
+    // Qwen3.8-27B with --qwen38-27b-qsa: --qsa-top-blocks, the history a QSA query sees.
+    std::uint32_t qsa_top_blocks         = 0;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
@@ -120,7 +120,7 @@ std::string usage_text() {
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--tensor-attention heads|positions] [--invariant-attention]\n"
-            "       [--qwen38-27b-qsa] [--qsa-history-tokens N]\n"
+            "       [--qwen38-27b-qsa] [--qsa-top-blocks N]\n"
            "       [--tensor-parallel-transport auto|host|peer-read|peer-write]\n"
            "       [--tensor-parallel-prompt-partials fp32|bf16|int8]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
@@ -282,8 +282,8 @@ Options parse_options(int argc, char** argv) {
             out.invariant_attention = true;
         } else if (option == "--qwen38-27b-qsa") {
             out.qwen38_27b_qsa = true;
-        } else if (ninfer::product::parse_qsa_history_tokens_option(
-                       option, out.qsa_history_tokens,
+        } else if (ninfer::product::parse_qsa_top_blocks_option(
+                       option, out.qsa_top_blocks,
                        [&] { return value(option.data()); })) {
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
@@ -466,7 +466,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     engine_options.invariant_attention           = options.invariant_attention;
     engine_options.qwen38_27b_qsa                = options.qwen38_27b_qsa;
-    engine_options.qsa_history_tokens            = options.qsa_history_tokens;
+    engine_options.qsa_top_blocks            = options.qsa_top_blocks;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;

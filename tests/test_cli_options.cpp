@@ -166,24 +166,23 @@ int run_tests() {
         }
     }
     {
-        // --qsa-history-tokens: a multiple of 4 within the ops' 262144-token cap.
-        const auto history = [&](std::vector<std::string> tail) {
+        // --qsa-top-blocks: a block count within the ops' 65536-block cap, no token conversion.
+        const auto blocks = [&](std::vector<std::string> tail) {
             std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
             args.insert(args.end(), tail.begin(), tail.end());
-            return parse(args).qsa_history_tokens;
+            return parse(args).qsa_top_blocks;
         };
-        failures += check(history({}) == 0U && history({"--qsa-history-tokens", "4096"}) == 4096U &&
-                              history({"--qsa-history-tokens", "8192"}) == 8192U &&
-                              history({"--qsa-history-tokens", "16384"}) == 16384U &&
-                              history({"--qsa-history-tokens", "32768"}) == 32768U &&
-                              history({"--qsa-history-tokens", "65536"}) == 65536U &&
-                              history({"--qsa-history-tokens", "262144"}) == 262144U &&
-                              history({"--qsa-history-tokens", "4096", "--kv-resident", "16384"}) ==
+        failures += check(blocks({}) == 0U && blocks({"--qsa-top-blocks", "1"}) == 1U &&
+                              blocks({"--qsa-top-blocks", "512"}) == 512U &&
+                              blocks({"--qsa-top-blocks", "5003"}) == 5003U &&
+                              blocks({"--qsa-top-blocks", "8192"}) == 8192U &&
+                              blocks({"--qsa-top-blocks", "65536"}) == 65536U &&
+                              blocks({"--qsa-top-blocks", "4096", "--kv-resident", "16384"}) ==
                                   4096U,
-                          "CLI did not preserve --qsa-history-tokens");
-        for (const auto* value : {"5003", "262148", "8192x", "-4", ""}) {
-            failures += check(rejects([&] { (void)history({"--qsa-history-tokens", value}); }),
-                              "CLI accepted an invalid --qsa-history-tokens");
+                          "CLI did not preserve --qsa-top-blocks");
+        for (const auto* value : {"65537", "262144", "8192x", "-4", ""}) {
+            failures += check(rejects([&] { (void)blocks({"--qsa-top-blocks", value}); }),
+                              "CLI accepted an invalid --qsa-top-blocks");
         }
     }
     for (const auto* share : {"0", "0.25", "1"}) {

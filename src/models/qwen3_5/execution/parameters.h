@@ -131,7 +131,7 @@ struct TextParameters {
     // Stage s owns layers [stage_begin[s], stage_end(s)).
     std::vector<std::uint32_t> stage_begin{0};
     // The QSA indexer's selection width in blocks, in effect for this process: the artifact's
-    // own budget unless --qsa-history-tokens raised it. Zero on artifacts without the indexer.
+    // own budget unless --qsa-top-blocks raised it. Zero on artifacts without the indexer.
     std::uint32_t qsa_block_budget = 0;
 
     [[nodiscard]] bool split_execution() const noexcept { return rank_count > 1; }
@@ -246,9 +246,9 @@ struct ProposalParameters {
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
 class Parameters {
 public:
-    // `qsa_history_tokens` is --qsa-history-tokens: the history a QSA query sees, in tokens, a
-    // multiple of four. Zero keeps the artifact's own budget.
-    explicit Parameters(const Model& source, std::uint32_t qsa_history_tokens = 0);
+    // `qsa_top_blocks` is --qsa-top-blocks: the history a QSA query sees, in four-token
+    // blocks. Zero keeps the artifact's own budget.
+    explicit Parameters(const Model& source, std::uint32_t qsa_top_blocks = 0);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;

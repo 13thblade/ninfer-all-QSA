@@ -26,7 +26,7 @@ auto with_context(const std::string& context, Function&& function) {
 
 class Prepare {
 public:
-    // `qsa_block_budget` is --qsa-history-tokens in blocks, or zero for the artifact's own.
+    // `qsa_block_budget` is --qsa-top-blocks in blocks, or zero for the artifact's own.
     explicit Prepare(const Model& model, std::uint32_t qsa_block_budget = 0)
         : model_(model), qsa_block_budget_(qsa_block_budget) {}
 
@@ -701,25 +701,21 @@ public:
 
 private:
     const Model& model_;
-    // --qsa-history-tokens in blocks: nonzero replaces the artifact's indexer budget.
+    // --qsa-top-blocks in blocks: nonzero replaces the artifact's indexer budget.
     std::uint32_t qsa_block_budget_ = 0;
 };
 
 } // namespace
 
-Parameters::Parameters(const Model& source, std::uint32_t qsa_history_tokens) : model(source) {
-    // --qsa-history-tokens: the indexer's selection width, in blocks. The flag is a whole number
-    // of 4-token blocks within the range the ops compile in (validate_options checks it too).
-    constexpr std::uint32_t kBlockTokens = static_cast<std::uint32_t>(ops::kQsaBlockTokens);
-    const std::uint32_t qsa_blocks =
-        qsa_history_tokens == 0 ? 0 : qsa_history_tokens / kBlockTokens;
-    if (qsa_history_tokens != 0 &&
-        (qsa_history_tokens % kBlockTokens != 0 ||
-         qsa_blocks > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax))) {
-        throw std::invalid_argument("qsa_history_tokens must be a multiple of 4 tokens, at most " +
-                                    std::to_string(static_cast<std::uint32_t>(ops::kQsaTopBlocksMax) *
-                                                   kBlockTokens));
+Parameters::Parameters(const Model& source, std::uint32_t qsa_top_blocks) : model(source) {
+    // --qsa-top-blocks: the indexer's selection width, already in blocks. Zero keeps the
+    // artifact's own budget; anything else must sit inside the range the ops compile in
+    // (validate_options checks it too).
+    if (qsa_top_blocks > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)) {
+        throw std::invalid_argument("qsa_top_blocks must be at most " +
+                                    std::to_string(static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)));
     }
+    const std::uint32_t qsa_blocks = qsa_top_blocks;
     if (const auto& artifact_qsa = model.config().text.qsa) {
         text.qsa_block_budget = qsa_blocks != 0 ? qsa_blocks : artifact_qsa->block_budget();
     }
