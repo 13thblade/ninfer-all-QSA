@@ -13,8 +13,8 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Fork baseline | `c1d98a69` imports upstream master at `8327e99c98b7` (2026-11-05) |
-| Upstream sync | two merges: `cc415771` took `64bd1115` (137 commits), `1c747d57` took `2207ee04` |
+| Fork baseline | `052d0380` imports upstream master at `8327e99c98b7` (2026-11-05) |
+| Upstream sync | two merges: `01bcc2ef` took `d406f46d` (137 commits), `7afc29e3` took `2207ee04` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -28,52 +28,52 @@ offered under the same Apache-2.0 license.
 
 | Commit | Date | Subject |
 | --- | --- | --- |
-| `c1d98a69` | 2026-11-06 | baseline: import ninfer-all master @ 8327e99c98b7 (2026-11-05) |
-| `efae170c` | 2026-11-06 | convert: accept Qwen3.8-27B-QSA GGUF (80 F32 indexer tensors) |
-| `e1947bac` | 2026-11-06 | engine: bind the QSA-27B indexer config and weights in qwen3_5 |
-| `71b8aeb2` | 2026-11-06 | ops: declare the QSA-27B key_pre_norm indexer input (interface only) |
-| `0e9ca66f` | 2026-11-06 | scripts: preflight a downloaded QSA-27B GGUF |
-| `31874483` | 2026-11-06 | docs: add QSA-27B port status and continuation guide |
-| `722567dd` | 2026-11-06 | ops: pool QSA-27B indexer keys through the pre-key RMSNorm |
-| `47a9c7f1` | 2026-11-06 | ops: score sparse attention with the QSA-27B 24-over-4 geometry |
-| `c99329f1` | 2026-11-06 | docs: record the verified QSA-27B operator stage |
-| `cf3053de` | 2026-11-06 | convert: register the late-constructed QSA indexer parameters on the recipe |
-| `75d30b9a` | 2026-11-06 | engine: run the QSA sparse branch of qwen3_5 behind --qwen38-27b-qsa |
-| `08e539c5` | 2026-11-06 | docs: record the landed QSA executor and converter commits |
-| `3127a610` | 2026-11-06 | engine: run QSA-27B with the artifact's own MTP speculative drafts |
-| `8d103dae` | 2026-11-06 | docs: record QSA-27B MTP support, real-model verification and the 32K A/B |
-| `eadd2282` | 2026-11-06 | docs: plan QSA-27B Vision (IMROPE) and streamed KV compatibility |
-| `567f2cab` | 2026-11-06 | ops: add interleaved 3-axis M-RoPE to the QSA indexer (V1) |
-| `d49f7f4c` | 2026-11-06 | tests: cover QSA indexer 3-axis M-RoPE, YaRN and interpolation (V2) |
-| `d78fe1e2` | 2026-11-06 | engine: wire QSA-27B indexer to interleaved M-RoPE positions (V3) |
-| `7e9906d8` | 2026-11-06 | engine: enable --vision under QSA-27B (V4) |
-| `213085f1` | 2026-11-06 | docs: mark the V4 commit in the roadmap |
-| `d7fdefd2` | 2026-11-06 | engine: plan and allocate QSA-27B streamed KV (K1) |
-| `a07fc300` | 2026-11-06 | engine: run QSA-27B attention through the KV stream (K2) |
-| `0fefb8af` | 2026-11-06 | engine: complete QSA-27B streamed KV (K3/K4) |
-| `b04c5af2` | 2026-11-06 | docs: mark all K-stage commits in the roadmap |
-| `8e1dc055` | 2026-11-11 | engine: stream QSA KV through one shared staging layer (L1-L3) |
-| `d7218f70` | 2026-11-11 | tools: replace in-engine PCIe counters with an external NVML monitor |
-| `dfc501c5` | 2026-11-11 | tools: add QSA-27B one-shot converter and the external PCIe benchmark driver |
-| `b38838a2` | 2026-11-11 | engine: resolve QSA --kv-resident "auto" from the upstream preset |
-| `99faf43e` | 2026-11-11 | docs: attribute the QSA fork in README and add MODIFICATIONS.md |
-| `2d9a1dde` | 2026-11-11 | docs: plan the QSA history window and record the current fork |
-| `8fb368fe` | 2026-11-11 | ops: take the QSA selection budget at run time |
-| `356c2f6d` | 2026-11-11 | engine: apply --qsa-history-tokens to the QSA selection budget |
-| `34f65aed` | 2026-11-11 | flags: expose --qsa-history-tokens in all three entry points |
-| `a96630c1` | 2026-11-11 | docs: document the QSA history window and mark the plan done |
-| `8c4177f0` | 2026-11-11 | engine: raise the QSA history cap to 32K tokens |
-| `8a0b56a9` | 2026-11-11 | serve: log the QSA history window and where it came from |
-| `a0edc938` | 2026-11-11 | ops: size the QSA split grid from the call's budget, not the cap |
-| `7e02815e` | 2026-11-11 | flags: count the QSA history window in blocks |
-| `14fd1c32` | 2026-11-11 | docs: record the QSA history window and tabulate its measurements |
-| `b7e39f8d` | 2026-11-11 | docs: keep the planning document out of the repository |
+| `052d0380` | 2026-11-06 | baseline: import ninfer-all master @ 8327e99c98b7 (2026-11-05) |
+| `b9912805` | 2026-11-06 | convert: accept Qwen3.8-27B-QSA GGUF (80 F32 indexer tensors) |
+| `251ea4bc` | 2026-11-06 | engine: bind the QSA-27B indexer config and weights in qwen3_5 |
+| `a725a22b` | 2026-11-06 | ops: declare the QSA-27B key_pre_norm indexer input (interface only) |
+| `11a092d3` | 2026-11-06 | scripts: preflight a downloaded QSA-27B GGUF |
+| `4651f03f` | 2026-11-06 | docs: add QSA-27B port status and continuation guide |
+| `474dd4cd` | 2026-11-06 | ops: pool QSA-27B indexer keys through the pre-key RMSNorm |
+| `62036944` | 2026-11-06 | ops: score sparse attention with the QSA-27B 24-over-4 geometry |
+| `b74c94b3` | 2026-11-06 | docs: record the verified QSA-27B operator stage |
+| `7e287d78` | 2026-11-06 | convert: register the late-constructed QSA indexer parameters on the recipe |
+| `e3fc8bb0` | 2026-11-06 | engine: run the QSA sparse branch of qwen3_5 behind --qwen38-27b-qsa |
+| `a9b95b1a` | 2026-11-06 | docs: record the landed QSA executor and converter commits |
+| `3bc6c49d` | 2026-11-06 | engine: run QSA-27B with the artifact's own MTP speculative drafts |
+| `d2cb0fa6` | 2026-11-06 | docs: record QSA-27B MTP support, real-model verification and the 32K A/B |
+| `00ec0c4a` | 2026-11-06 | docs: plan QSA-27B Vision (IMROPE) and streamed KV compatibility |
+| `a4894964` | 2026-11-06 | ops: add interleaved 3-axis M-RoPE to the QSA indexer (V1) |
+| `bd329e04` | 2026-11-06 | tests: cover QSA indexer 3-axis M-RoPE, YaRN and interpolation (V2) |
+| `b4944a0e` | 2026-11-06 | engine: wire QSA-27B indexer to interleaved M-RoPE positions (V3) |
+| `3918197c` | 2026-11-06 | engine: enable --vision under QSA-27B (V4) |
+| `672c1e71` | 2026-11-06 | docs: mark the V4 commit in the roadmap |
+| `b5af538f` | 2026-11-06 | engine: plan and allocate QSA-27B streamed KV (K1) |
+| `423ce2be` | 2026-11-06 | engine: run QSA-27B attention through the KV stream (K2) |
+| `36c636d4` | 2026-11-06 | engine: complete QSA-27B streamed KV (K3/K4) |
+| `f0b35872` | 2026-11-06 | docs: mark all K-stage commits in the roadmap |
+| `ae212f10` | 2026-11-11 | engine: stream QSA KV through one shared staging layer (L1-L3) |
+| `3fb7f647` | 2026-11-11 | tools: replace in-engine PCIe counters with an external NVML monitor |
+| `a5865c12` | 2026-11-11 | tools: add QSA-27B one-shot converter and the external PCIe benchmark driver |
+| `878c9712` | 2026-11-11 | engine: resolve QSA --kv-resident "auto" from the upstream preset |
+| `ca748d86` | 2026-11-11 | docs: attribute the QSA fork in README and add MODIFICATIONS.md |
+| `67b8d0bd` | 2026-11-11 | docs: plan the QSA history window and record the current fork |
+| `174c0a18` | 2026-11-11 | ops: take the QSA selection budget at run time |
+| `becf3ce4` | 2026-11-11 | engine: apply --qsa-history-tokens to the QSA selection budget |
+| `82fb2a9d` | 2026-11-11 | flags: expose --qsa-history-tokens in all three entry points |
+| `ce2d266e` | 2026-11-11 | docs: document the QSA history window and mark the plan done |
+| `1da2b6f6` | 2026-11-11 | engine: raise the QSA history cap to 32K tokens |
+| `960990eb` | 2026-11-11 | serve: log the QSA history window and where it came from |
+| `93564799` | 2026-11-11 | ops: size the QSA split grid from the call's budget, not the cap |
+| `17105e33` | 2026-11-11 | flags: count the QSA history window in blocks |
+| `2d4a1ffb` | 2026-11-11 | docs: record the QSA history window and tabulate its measurements |
+| `190507b0` | 2026-11-11 | docs: keep the planning document out of the repository |
 
 ## Change summary
 
 Relative to upstream master (`2207ee04`) this fork carries **48 modified
 upstream files and 10 new files**, and deletes no upstream file.
-`docs/qsa-port.md` was a fork-only document, removed by `d7218f70`, so it does
+`docs/qsa-port.md` was a fork-only document, removed by `3fb7f647`, so it does
 not appear in the lists below.
 
 Because the fork was cut from an older upstream snapshot and later took two
