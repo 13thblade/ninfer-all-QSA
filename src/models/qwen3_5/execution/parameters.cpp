@@ -716,8 +716,9 @@ Parameters::Parameters(const Model& source, std::uint32_t qsa_history_tokens) : 
     if (qsa_history_tokens != 0 &&
         (qsa_history_tokens % kBlockTokens != 0 ||
          qsa_blocks > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax))) {
-        throw std::invalid_argument(
-            "qsa_history_tokens must be a multiple of 4 tokens, at most 8192");
+        throw std::invalid_argument("qsa_history_tokens must be a multiple of 4 tokens, at most " +
+                                    std::to_string(static_cast<std::uint32_t>(ops::kQsaTopBlocksMax) *
+                                                   kBlockTokens));
     }
     if (const auto& artifact_qsa = model.config().text.qsa) {
         text.qsa_block_budget = qsa_blocks != 0 ? qsa_blocks : artifact_qsa->block_budget();

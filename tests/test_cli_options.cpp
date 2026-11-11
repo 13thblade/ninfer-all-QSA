@@ -166,7 +166,7 @@ int run_tests() {
         }
     }
     {
-        // --qsa-history-tokens: a multiple of 4 within the ops' 8192-token cap.
+        // --qsa-history-tokens: a multiple of 4 within the ops' 32768-token cap.
         const auto history = [&](std::vector<std::string> tail) {
             std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
             args.insert(args.end(), tail.begin(), tail.end());
@@ -174,10 +174,12 @@ int run_tests() {
         };
         failures += check(history({}) == 0U && history({"--qsa-history-tokens", "4096"}) == 4096U &&
                               history({"--qsa-history-tokens", "8192"}) == 8192U &&
+                              history({"--qsa-history-tokens", "16384"}) == 16384U &&
+                              history({"--qsa-history-tokens", "32768"}) == 32768U &&
                               history({"--qsa-history-tokens", "4096", "--kv-resident", "16384"}) ==
                                   4096U,
                           "CLI did not preserve --qsa-history-tokens");
-        for (const auto* value : {"5003", "8196", "8192x", "-4", ""}) {
+        for (const auto* value : {"5003", "32772", "8192x", "-4", ""}) {
             failures += check(rejects([&] { (void)history({"--qsa-history-tokens", value}); }),
                               "CLI accepted an invalid --qsa-history-tokens");
         }

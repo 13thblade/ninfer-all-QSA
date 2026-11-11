@@ -18,7 +18,7 @@ namespace ninfer::product {
 inline constexpr const char* kQsaHistoryTokensHelp =
     "  --qsa-history-tokens N        Qwen3.8-27B with --qwen38-27b-qsa: how many\n"
     "                                history tokens each query may look back over,\n"
-    "                                a multiple of 4 up to 8192; wider selections need\n"
+    "                                a multiple of 4 up to 32768; wider selections need\n"
     "                                a --kv-resident pool of more blocks\n"
     "                                (default: the artifact's own 2048)\n";
 
@@ -35,7 +35,8 @@ bool parse_qsa_history_tokens_option(std::string_view option, std::uint32_t& out
     if (error != std::errc{} || end != text.data() + text.size() ||
         tokens % static_cast<std::uint32_t>(ops::kQsaBlockTokens) != 0 || tokens > kMaxTokens) {
         throw std::invalid_argument(
-            "--qsa-history-tokens takes a multiple of 4 tokens, at most 8192");
+            "--qsa-history-tokens takes a multiple of 4 tokens, at most " +
+            std::to_string(kMaxTokens));
     }
     out = tokens;
     return true;

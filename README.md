@@ -12,7 +12,7 @@
 
 后续计划：
 1. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
-2. QSA注意力每token默认仅能看到2048个历史token，损失可能较大，已用--qsa-history-tokens把可见历史改为可调（默认2048，4的倍数，最大8192）；
+2. QSA注意力每token默认仅能看到2048个历史token，损失可能较大，已用--qsa-history-tokens把可见历史改为可调（默认2048，4的倍数，最大32768）；
 3. 提供Dflash2和Dspine草稿的支持。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。QSA 模型权重与转换来自 higa2515，QSA 的 llama.cpp 移植来自 kuraneko1。
@@ -28,7 +28,7 @@ It supports the ViT and MTP of Qwen3.8-27B; DFlash2 is not yet supported.
 
 Planned work:
 1. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
-2. QSA attention natively sees only 2,048 historical tokens per token, which may cause noticeable loss; `--qsa-history-tokens` widens the window (a multiple of 4 up to 8,192, default 2,048).
+2. QSA attention natively sees only 2,048 historical tokens per token, which may cause noticeable loss; `--qsa-history-tokens` widens the window (a multiple of 4 up to 32,768, default 2,048).
 3. Add support for DFlash2 and DSpine drafting.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history. The QSA model weights and conversion are by **higa2515**; the QSA llama.cpp port is by **kuraneko1**.
