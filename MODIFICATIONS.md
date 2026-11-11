@@ -57,11 +57,20 @@ offered under the same Apache-2.0 license.
 | `dfc501c5` | 2026-11-11 | tools: add QSA-27B one-shot converter and the external PCIe benchmark driver |
 | `b38838a2` | 2026-11-11 | engine: resolve QSA --kv-resident "auto" from the upstream preset |
 | `99faf43e` | 2026-11-11 | docs: attribute the QSA fork in README and add MODIFICATIONS.md |
+| `75eba4ea` | 2026-11-11 | docs: plan the QSA history window and record the current fork |
+| `e6b88ce3` | 2026-11-11 | ops: take the QSA selection budget at run time |
+| `b3c716c8` | 2026-11-11 | engine: apply --qsa-history-tokens to the QSA selection budget |
+| `89db8d9c` | 2026-11-11 | flags: expose --qsa-history-tokens in all three entry points |
+| `907e8446` | 2026-11-11 | docs: document the QSA history window and mark the plan done |
+| `b9a5c8ee` | 2026-11-11 | engine: raise the QSA history cap to 32K tokens |
+| `b25aa6a4` | 2026-11-11 | serve: log the QSA history window and where it came from |
+| `a9557df0` | 2026-11-11 | ops: size the QSA split grid from the call's budget, not the cap |
+| `a13fabeb` | 2026-11-11 | flags: count the QSA history window in blocks |
 
 ## Change summary
 
-Relative to upstream master (`2207ee04`) this fork carries **38 modified
-upstream files and 8 new files**, and deletes no upstream file.
+Relative to upstream master (`2207ee04`) this fork carries **48 modified
+upstream files and 11 new files**, and deletes no upstream file.
 `docs/qsa-port.md` was a fork-only document, removed by `d7218f70`, so it does
 not appear in the lists below.
 
@@ -117,12 +126,28 @@ reported PCIe generation and width. `tools/bench/run_qsa27b_kvstream_bench.py`
 (`perf32k` and `pcie512k` phases) and `tools/bench/run_qsa27b_32k_ab.py` are
 the benchmark drivers that start a server and use those windows.
 
+**Configurable history window.** `--qsa-top-blocks N` (CLI, `ninfer-serve` and
+`ninfer-perplexity`, parsed by the shared `src/product/qsa_top_blocks_options.h`)
+sets how many four-token history blocks each QSA query may look back over, 1 to
+65,536; unset or `0` keeps the artifact's own 512 blocks. The value is fixed at
+startup, so a captured graph replays the grid it captured.
+`include/ninfer/ops/qsa_budget.h` carries the shared geometry; the indexer
+select, `sparse_softmax_attention` and the `kv_stream` family take the budget as
+their last argument, and `src/ops/sparse_attention/sparse_attention.cu` derives
+its split count, merge bound and partial-softmax workspace from that call's
+budget (`split_count(top_blocks)`), so a narrow budget no longer pays for the
+largest accepted one. The planner (`program/planning/startup.cpp`,
+`qwen4_exp/executor.cpp`) sizes the selected matrix, the indexer and split
+workspaces and the KV-stream pool from the same number, and
+`src/serve/operational_log.cpp` logs the effective window with its source. The
+measurements this knob was tuned against are in `README.md`.
+
 **Documentation.** `README.md` keeps the Chinese description, adds an English
 counterpart, and states the fork's attribution in both languages. This file is
 the record of the fork's changes; untouched files remain exactly as upstream,
 credited in `CONTRIBUTORS.md` and the git history.
 
-## Modified files (38)
+## Modified files (48)
 
 ### Root (1)
 
@@ -138,14 +163,15 @@ credited in `CONTRIBUTORS.md` and the git history.
 
 - `apps/perplexity/main.cpp`
 
-### include/ninfer (4)
+### include/ninfer (5)
 
 - `include/ninfer/engine_options.h`
+- `include/ninfer/ops/kv_stream.h`
 - `include/ninfer/ops/qsa_indexer.h`
 - `include/ninfer/ops/rope.h`
 - `include/ninfer/ops/sparse_attention.h`
 
-### src/models/qwen3_5 (19)
+### src/models/qwen3_5 (21)
 
 - `src/models/qwen3_5/config.cpp`
 - `src/models/qwen3_5/config.h`
@@ -160,6 +186,8 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `src/models/qwen3_5/program/planning/startup.cpp`
 - `src/models/qwen3_5/program/planning/startup.h`
 - `src/models/qwen3_5/program/prefill.cpp`
+- `src/models/qwen3_5/program/program.cpp`
+- `src/models/qwen3_5/program/program.h`
 - `src/models/qwen3_5/program/program_impl.cpp`
 - `src/models/qwen3_5/program/program_impl.h`
 - `src/models/qwen3_5/program/speculative/mtp.cpp`
@@ -167,8 +195,13 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `src/models/qwen3_5/state/decoder_state.h`
 - `src/models/qwen3_5/weights.h`
 
-### src/ops (3)
+### src/models/qwen4_exp (1)
 
+- `src/models/qwen4_exp/executor.cpp`
+
+### src/ops (4)
+
+- `src/ops/kv_stream/kv_stream.cu`
 - `src/ops/launcher/rope.cu`
 - `src/ops/qsa_indexer/qsa_indexer.cu`
 - `src/ops/sparse_attention/sparse_attention.cu`
@@ -177,14 +210,25 @@ credited in `CONTRIBUTORS.md` and the git history.
 
 - `src/product/kv_resident_options.h`
 
-### src/serve (3)
+### src/runtime/engine (1)
+
+- `src/runtime/engine/model_instance.cpp`
+
+### src/serve (4)
 
 - `src/serve/generation_service.cpp`
+- `src/serve/operational_log.cpp`
 - `src/serve/serve_options.cpp`
 - `src/serve/serve_options.h`
 
-### tests/ops (2)
+### tests (2)
 
+- `tests/test_cli_options.cpp`
+- `tests/test_serve_options.cpp`
+
+### tests/ops (3)
+
+- `tests/ops/test_kv_stream.cpp`
 - `tests/ops/test_qsa_indexer.cpp`
 - `tests/ops/test_sparse_attention.cpp`
 
@@ -192,11 +236,23 @@ credited in `CONTRIBUTORS.md` and the git history.
 
 - `tools/convert/gguf_blocks.py`
 
-## Added files (8)
+## Added files (11)
 
 ### Root (1)
 
 - `MODIFICATIONS.md`
+
+### docs (1)
+
+- `docs/qsa-history-window-plan.md`
+
+### include/ninfer/ops (1)
+
+- `include/ninfer/ops/qsa_budget.h`
+
+### src/product (1)
+
+- `src/product/qsa_top_blocks_options.h`
 
 ### scripts (1)
 

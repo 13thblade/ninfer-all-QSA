@@ -15,6 +15,32 @@
 2. QSA注意力每token默认仅能看到2048个历史token，损失可能较大，已用--qsa-top-blocks把可见历史改为可调（单位是 4-token 块，默认 512 块=2048 token，最大 65536 块=262144 token）；
 3. 提供Dflash2和Dspine草稿的支持。
 
+## 实测
+
+同一块 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA.ninfer`、int8 KV、关闭投机解码与前缀复用、KV 全驻留。
+
+速度：单次冷请求，26,522 token 提示 + 64 token 输出，KV 容量 32,768。
+
+| 配置 | prefill (tok/s) | decode (tok/s) | TTFT |
+| --- | ---: | ---: | ---: |
+| dense（不开 `--qwen38-27b-qsa`） | 1,960 | 49.7 | 13.6 s |
+| QSA 512 块（2,048 token，默认） | 1,600 | 49.6 | 16.6 s |
+| QSA 1,024 块（4,096 token） | 1,330 | 48.9 | 20.0 s |
+| QSA 2,048 块（8,192 token） | 1,020 | 47.4 | 26.1 s |
+| QSA 4,096 块（16,384 token） | 770 | 44.7 | 34.4 s |
+
+PPL：teacher-forced，65,536 上下文，68,408 token 语料（本仓库 docs 与 src 混合）。
+
+| 配置 | PPL | 相对 dense |
+| --- | ---: | ---: |
+| dense | 3.9200 | — |
+| QSA 512 块 | 3.9993 | +2.02% |
+| QSA 1,024 块 | 3.9488 | +0.74% |
+| QSA 2,048 块 | 3.9303 | +0.26% |
+| QSA 4,096 块 | 3.9248 | +0.12% |
+
+读法：窗口越宽越接近 dense，但 prefill 的时间大致随块数线性增长（4,096 块约为 dense 的 39%）；从默认 512 块加到 1,024 块就收回约 2/3 的 PPL 差距，2,048 块起进入 0.3% 以内。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），所以宽窗口与"省显存"基本互斥。
+
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。QSA 模型权重与转换来自 higa2515，QSA 的 llama.cpp 移植来自 kuraneko1。
 
 # English
@@ -30,6 +56,32 @@ Planned work:
 1. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
 2. QSA attention natively sees only 2,048 historical tokens per token, which may cause noticeable loss; `--qsa-top-blocks` widens the window, counted in four-token blocks (1 to 65,536 blocks, default 512 = 2,048 tokens).
 3. Add support for DFlash2 and DSpine drafting.
+
+## Measurements
+
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA.ninfer`, int8 KV, speculative decoding and prefix reuse off, every sparse layer's KV resident.
+
+Speed: one cold request, a 26,522-token prompt and 64 output tokens, KV capacity 32,768.
+
+| Configuration | prefill (tok/s) | decode (tok/s) | TTFT |
+| --- | ---: | ---: | ---: |
+| dense (no `--qwen38-27b-qsa`) | 1,960 | 49.7 | 13.6 s |
+| QSA 512 blocks (2,048 tokens, default) | 1,600 | 49.6 | 16.6 s |
+| QSA 1,024 blocks (4,096 tokens) | 1,330 | 48.9 | 20.0 s |
+| QSA 2,048 blocks (8,192 tokens) | 1,020 | 47.4 | 26.1 s |
+| QSA 4,096 blocks (16,384 tokens) | 770 | 44.7 | 34.4 s |
+
+Perplexity: teacher-forced over a 68,408-token corpus (this repository's docs and src) at a 65,536-token context.
+
+| Configuration | PPL | vs dense |
+| --- | ---: | ---: |
+| dense | 3.9200 | — |
+| QSA 512 blocks | 3.9993 | +2.02% |
+| QSA 1,024 blocks | 3.9488 | +0.74% |
+| QSA 2,048 blocks | 3.9303 | +0.26% |
+| QSA 4,096 blocks | 3.9248 | +0.12% |
+
+How to read it: a wider window moves towards dense, and prefill time grows roughly with the block count (4,096 blocks is about 39% of dense). Going from the default 512 blocks to 1,024 recovers about two thirds of the perplexity gap, and 2,048 blocks lands inside 0.3%. Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks), so a wide window and a small device footprint pull against each other.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history. The QSA model weights and conversion are by **higa2515**; the QSA llama.cpp port is by **kuraneko1**.
 
