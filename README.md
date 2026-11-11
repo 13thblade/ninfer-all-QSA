@@ -11,8 +11,9 @@
 支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文。
 
 后续计划：
-1. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
-2. 提供Dflash2和Dspine草稿的支持。
+1. QSA目前只允许一条序列（--max-concurrency 1），考虑增加并发支持；
+2. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
+3. 提供Dflash2和Dspine草稿的支持。
 
 ## 旗标
 
@@ -73,8 +74,9 @@ This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This mo
 It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts.
 
 Planned work:
-1. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
-2. Add support for DFlash2 and DSpine drafting.
+1. QSA serves one sequence at a time (`--max-concurrency 1`); we plan to add concurrent serving.
+2. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
+3. Add support for DFlash2 and DSpine drafting.
 
 ## Flags
 
