@@ -535,8 +535,10 @@ struct EngineOptions {
     // Qwen3.8-Flash-Next, and Qwen3.8-27B under --qwen38-27b-qsa: positions of each
     // sparse-attention layer's KV a sequence keeps in device memory. A longer context
     // streams those layers: their KV lives in pinned host memory and the device keeps
-    // the blocks the indexer selected most recently. Unset / 0 keeps every position
-    // resident on the device; under QSA the widest verification must be <= 15 drafts.
+    // the blocks the indexer selected most recently. Unset follows the upstream
+    // preset (qwen4_exp_core.cpp): device experts keep every position resident,
+    // host/disk experts use kDefaultKvResidentPositions. Explicit 0 / "all" keeps
+    // everything resident; under QSA the widest verification must be <= 15 drafts.
     std::optional<std::uint32_t> kv_resident_positions;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run

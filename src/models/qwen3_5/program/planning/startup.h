@@ -144,7 +144,10 @@ struct SequencePlanningInputs {
     bool qsa                               = false;
     // --kv-resident: positions of each QSA full-attention layer's KV kept on the
     // device; a longer context streams the rest from pinned host memory. Zero
-    // keeps every layer fully resident. Only meaningful with `qsa`.
+    // keeps every layer fully resident. This is the resolved value: an unset
+    // EngineOptions flag follows the upstream preset (qwen4_exp_core.cpp: device
+    // experts -> all resident, host/disk experts -> kDefaultKvResidentPositions).
+    // Only meaningful with `qsa`.
     std::uint32_t kv_resident_positions     = 0;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;

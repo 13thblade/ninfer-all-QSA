@@ -37,6 +37,8 @@
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
+#include "ninfer/base.h"
+#include "ninfer/model_enums.h"
 #include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
@@ -51,6 +53,19 @@ namespace {
 
 using execution::dimension;
 namespace workspace = execution::workspace;
+
+// --kv-resident's "auto" is resolved exactly as upstream qwen4_exp_core.cpp:337-338
+// does: device experts keep every position resident, while host/disk experts
+// trade device KV for expert slots using the default hot window. QSA-27B has
+// no host experts by default (EngineOptions::expert_residency == Device), so
+// enabling --qwen38-27b-qsa alone leaves streaming off, matching upstream.
+// An explicit N / all / auto goes through the shared parse_kv_resident_option.
+std::uint32_t resolved_kv_resident_positions(const EngineOptions& options) {
+    return options.kv_resident_positions.value_or(
+        options.expert_residency == ExpertResidency::Device
+            ? 0U
+            : kDefaultKvResidentPositions);
+}
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
@@ -1501,7 +1516,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns, and
         // its pool is sized width * 513 blocks. Cap the widest verification when
         // --kv-resident actually streams (a wider call takes the staging route).
-        if (options.kv_resident_positions.value_or(0) != 0) {
+        if (resolved_kv_resident_positions(options) != 0) {
             const std::uint32_t widest = std::max(options.speculative.draft_tokens,
                                                   options.speculative.ngram_draft_tokens);
             if (widest + 1U > static_cast<std::uint32_t>(ops::kKvStreamMaxTokens)) {
@@ -1510,7 +1525,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                     "(--kv-resident with --draft-tokens / --ngram-draft-tokens)");
             }
         }
-    } else if (options.kv_resident_positions.value_or(0) != 0) {
+    } else if (options.kv_resident_positions.has_value() &&
+               resolved_kv_resident_positions(options) != 0) {
+        // Only an EXPLICIT --kv-resident is refused without the QSA flag. An
+        // unset value (upstream "auto") is left to the upstream preset and must
+        // not change the dense path or raise a new error here.
         throw std::invalid_argument(
             "--kv-resident needs --qwen38-27b-qsa on this model (Qwen3.8-Flash-Next "
             "uses its own executor)");
@@ -2008,7 +2027,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .invariant_attention        = options.invariant_attention,
         .qsa                        = options.qwen38_27b_qsa,
-        .kv_resident_positions      = options.kv_resident_positions.value_or(0),
+        .kv_resident_positions      = resolved_kv_resident_positions(options),
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,

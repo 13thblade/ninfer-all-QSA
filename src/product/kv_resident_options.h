@@ -19,8 +19,10 @@ inline constexpr const char* kKvResidentHelp =
     "                                --qwen38-27b-qsa: positions of each sparse-\n"
     "                                attention layer's KV a sequence keeps on the GPU;\n"
     "                                a longer context keeps that KV in pinned RAM and\n"
-    "                                the GPU the blocks it reads. Under QSA it needs\n"
-    "                                one device and a verification window <= 15 drafts\n";
+    "                                the GPU the blocks it reads. auto follows the\n"
+    "                                upstream preset (device experts: all; host/disk\n"
+    "                                experts: 32768). QSA needs one device and a\n"
+    "                                verification window <= 15 drafts\n";
 
 // Applies `option` when it is --kv-resident, taking its argument from `value()`; false leaves it
 // to the caller.
