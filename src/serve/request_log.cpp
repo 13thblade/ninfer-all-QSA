@@ -992,6 +992,11 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                     {"exclusive_windows",
                                      outcome.metrics.overlay_exclusive_windows}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["kv_stream"] = Json{{"calls", outcome.metrics.kv_stream.calls},
+                               {"lookups", outcome.metrics.kv_stream.lookups},
+                               {"copies", outcome.metrics.kv_stream.copies},
+                               {"h2d_bytes", outcome.metrics.kv_stream.h2d_bytes},
+                               {"overflow", outcome.metrics.kv_stream.overflow}};
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();

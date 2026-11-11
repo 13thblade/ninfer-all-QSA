@@ -221,7 +221,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
         builder_pointers, qwen3_5::DecoderStateSpec{
-                              .full_attention_layers = config.full_attention_layers,
+                              // --kv-resident under QSA: the authoritative KV of every
+                              // full-attention layer lives in pinned host memory, and a
+                              // wide call reads one shared 64-position device staging
+                              // layer. Keep exactly one device layer instead of sixteen;
+                              // physical/logical page counts stay unchanged, so the block
+                              // table, graph capture and the independent MTP pool do not
+                              // need to be touched.
+                              .full_attention_layers = plan.stream_slots != 0
+                                                           ? 1U
+                                                           : config.full_attention_layers,
                               .mtp_layers            = 1,
                               .capacity              = plan.capacity,
                               .kv_heads = dimension(config.attention->num_key_value_heads),

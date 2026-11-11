@@ -78,6 +78,20 @@ struct QsaStreamState {
     std::uint32_t width  = 0;
     Tensor identity; // device I32 [pages], 0..pages-1
     std::vector<QsaStreamLayerState> layers;
+    // The one remaining device text-KV layer, reused as a fully resident
+    // 64-position staging copy shared by every QSA layer. `stage()` fills it
+    // from that layer's pinned host copy before a wide call reads it.
+    PagedKVLayerView staging;
+    // Which QSA layer currently owns the staging bytes, and the position
+    // frontier they cover. A narrow call appends to host and invalidates it
+    // (matching qwen4_exp's kv_staged / kv_staged_end).
+    std::int32_t  staged_layer = -1;
+    std::uint32_t staged_end   = 0;
+    // Host pinned and device staging bytes, reported at startup.
+    std::uint64_t host_bytes    = 0;
+    std::uint64_t staging_bytes = 0;
+    // Wide-call host->staging PCIe bytes since the last request boundary.
+    std::uint64_t h2d_bytes = 0;
 };
 
 struct DecoderStateSpec {

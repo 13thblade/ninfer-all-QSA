@@ -1287,6 +1287,9 @@ public:
     // capacities, so any thread may call it.
     [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     void reset_memory_peaks() noexcept;
+    // Drains the QSA streamed-KV counters accumulated by the finished request.
+    // Returns zeros when --kv-resident is off.
+    [[nodiscard]] KvStreamDiagnostics take_kv_stream_diagnostics();
 
     // Inject a direct_kv or softprompt_kv graft into a synthesized shared-prefix entry.
     // Called once at startup before any request is admitted.

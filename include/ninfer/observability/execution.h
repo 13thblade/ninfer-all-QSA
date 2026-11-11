@@ -58,6 +58,18 @@ struct GenerationEngineTiming {
     std::uint64_t control_units                 = 0;
 };
 
+// --kv-resident under QSA: per-request PCIe traffic of the streamed KV path.
+// `copies` counts 4-token blocks brought from pinned host memory into a
+// layer's device pool by kv_stream_resolve; `h2d_bytes` is the wide-call
+// host->staging copy. Both are drained at each request boundary.
+struct KvStreamDiagnostics {
+    std::uint64_t calls      = 0;
+    std::uint64_t lookups    = 0;
+    std::uint64_t copies     = 0;
+    std::uint64_t h2d_bytes  = 0;
+    bool overflow            = false;
+};
+
 struct SpeculativeStats {
     SpeculativeBackend backend    = SpeculativeBackend::None;
     bool enabled                  = false;

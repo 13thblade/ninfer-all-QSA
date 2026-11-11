@@ -737,6 +737,27 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (qsa_indexer_state.has_value()) {
             qsa_indexer_state->stream = &*qsa_stream_state;
         }
+        // The single device text-KV layer planned under QSA+stream is the shared
+        // staging copy. Its planes are already PageMajor {leading, 64, heads,
+        // pages} tensors; only the block table changes to the identity table so
+        // stage() can copy whole page runs from the pinned host layer.
+        const auto& kv_pool = decoder->text_kv.page_pool();
+        PagedKVLayerView staging{};
+        Tensor* targets[4] = {&staging.k_pages, &staging.v_pages,
+                              &staging.k_scale_pages, &staging.v_scale_pages};
+        for (std::size_t i = 0; i < kv_pool.plane_count() && i < 4; ++i) {
+            *targets[i] = kv_pool.plane(i);
+        }
+        staging.block_table  = stream.identity;
+        staging.head_dim     = kD256KVCacheHeadDim;
+        staging.num_kv_heads = static_cast<std::int32_t>(plan.stream_heads);
+        staging.storage      = plan.kv_storage;
+        stream.staging       = staging;
+        stream.host_bytes    = host_bytes * static_cast<std::uint64_t>(stream.layers.size());
+        stream.staging_bytes = 0;
+        for (std::size_t i = 0; i < kv_pool.plane_count() && i < 4; ++i) {
+            stream.staging_bytes += kv_pool.plane(i).bytes();
+        }
     }
     bind_steering(plan, steering_source, backings);
     if (plan.persistent.score_hidden) {
@@ -1290,5 +1311,24 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+
+// TEMPORARY PCIe measurement hook (removed after the 512K test).
+ninfer::KvStreamDiagnostics ProgramImpl::take_kv_stream_diagnostics() {
+    ninfer::KvStreamDiagnostics out;
+    if (!qsa_stream_state.has_value()) { return out; }
+    for (const auto& layer : qsa_stream_state->layers) {
+        const ops::KvStreamCounters c = ops::kv_stream_counters(layer.map, device.stream);
+        out.calls   += c.calls;
+        out.lookups += c.lookups;
+        out.copies  += c.copies;
+        out.overflow = out.overflow || c.overflow;
+        // The counters are cumulative; drain them so each request reports its
+        // own PCIe traffic. QSA disables the context cache, so a fresh prefill
+        // repopulates the pool on the next request anyway.
+        ops::kv_stream_reset(layer.map, device.stream);
+    }
+    out.h2d_bytes = std::exchange(qsa_stream_state->h2d_bytes, std::uint64_t{0});
+    return out;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

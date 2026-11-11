@@ -717,6 +717,9 @@ public:
                 const Steering* steering);
     ~ProgramImpl() noexcept;
 
+    // TEMPORARY PCIe measurement hook (removed after the 512K test).
+    [[nodiscard]] ninfer::KvStreamDiagnostics take_kv_stream_diagnostics();
+
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options,
                                                std::span<const std::uint32_t> engine_anchors = {});

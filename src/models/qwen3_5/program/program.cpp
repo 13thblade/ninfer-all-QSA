@@ -741,6 +741,11 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
+// TEMPORARY PCIe measurement hook (removed after the 512K test).
+KvStreamDiagnostics Program::take_kv_stream_diagnostics() {
+    return impl_->take_kv_stream_diagnostics();
+}
+
 ExpertResidencyStats Program::expert_residency_stats() const {
     ExpertResidencyStats out;
     if (!impl_->experts) { return out; }

@@ -1772,19 +1772,21 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(index.data) + query_bytes, pitch,
                                  index_key.data, key_bytes, key_bytes, static_cast<std::size_t>(T),
                                  cudaMemcpyDeviceToDevice, stream));
-    // The call's K/V rows enter the layer's cache before the sparse attention reads them, as the
-    // dense branch's fused append does.
-    PagedKVLayerView layer = kv_.layer_view(static_cast<std::uint32_t>(full_attention_index));
-    ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
-    // --kv-resident: the pinned host copy is authoritative. Keep it in step with
-    // the ordinary device layer on every call; a narrow call then resolves its
-    // selected blocks into the 4-token device pool and reads that pool.
-    const qwen3_5::QsaStreamState* qsa_stream = qsa_indexer_->stream;
+    // The call's K/V rows enter the layer's cache before the sparse attention
+    // reads them, as the dense branch's fused append does. Under --kv-resident
+    // the pinned host copy is the ONLY authoritative one: the device text-KV
+    // pool holds a single shared 64-position staging layer (planned in
+    // persistent_layout), which wide calls fill from the host copy.
+    qwen3_5::QsaStreamState* qsa_stream = qsa_indexer_->stream;
     const qwen3_5::QsaStreamLayerState* stream_layer = nullptr;
+    PagedKVLayerView layer;
     if (qsa_stream != nullptr) {
         stream_layer =
             &qsa_stream->layers[static_cast<std::size_t>(full_attention_index)];
         ops::kv_cache_append(k_span, v_span, call_positions, stream_layer->host, stream);
+    } else {
+        layer = kv_.layer_view(static_cast<std::uint32_t>(full_attention_index));
+        ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
     }
     const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
     ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
@@ -1797,18 +1799,60 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                             work_, selected, counts, stream, indexer_positions);
     PagedKVLayerView read = layer;
     bool wide_stream_call = false;
-    if (stream_layer != nullptr) {
+    std::int32_t first_host = 0;
+    if (qsa_stream != nullptr) {
         if (T <= static_cast<std::int32_t>(qsa_stream->width)) {
             ops::kv_stream_resolve(stream_layer->map, first, selected, counts,
                                    stream_layer->host, stream_layer->pool, stream);
             read = stream_layer->pool;
+            // A narrow call appended tokens to the host copy, so the shared
+            // staging bytes no longer cover this layer's frontier.
+            qsa_stream->staged_layer = -1;
         } else {
             // A wide prefill chunk exceeds kv_stream_resolve's 16-column limit.
-            // It reads the ordinary 64-position device layer instead, then drops
-            // the pool's copies of the blocks it just wrote so a later narrow
-            // call cannot reuse stale bytes. Prefills are not captured graphs,
-            // so reading the first position back to the host is safe here.
+            // Prefills are not captured graphs, so reading the first position
+            // back to the host is safe here.
             wide_stream_call = true;
+            CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // QSA keeps one stream copy with the context cache off, so a prefill
+            // starting at position zero begins a fresh sequence.
+            if (first_host == 0) {
+                ops::kv_stream_reset(stream_layer->map, stream);
+                qsa_stream->staged_layer = -1;
+            }
+            // stage(): one shared staging layer, filled from this layer's host
+            // copy. A change of layer (or a frontier beyond what is staged)
+            // invalidates the cache, as qwen4_exp's kv_staged does.
+            if (qsa_stream->staged_layer != full_attention_index ||
+                qsa_stream->staged_end < static_cast<std::uint32_t>(first_host)) {
+                const std::uint32_t used =
+                    (static_cast<std::uint32_t>(first_host) + kPagedKVPageSize - 1U) /
+                    static_cast<std::uint32_t>(kPagedKVPageSize);
+                const Tensor* host_planes[4] = {
+                    &stream_layer->host.k_pages, &stream_layer->host.v_pages,
+                    &stream_layer->host.k_scale_pages, &stream_layer->host.v_scale_pages};
+                const Tensor* staging_planes[4] = {
+                    &qsa_stream->staging.k_pages, &qsa_stream->staging.v_pages,
+                    &qsa_stream->staging.k_scale_pages, &qsa_stream->staging.v_scale_pages};
+                for (std::size_t i = 0; i < 4; ++i) {
+                    if (host_planes[i]->data == nullptr ||
+                        staging_planes[i]->data == nullptr) { continue; }
+                    const std::size_t bytes =
+                        static_cast<std::size_t>(used) * host_planes[i]->nb[3];
+                    qsa_stream->h2d_bytes += bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        staging_planes[i]->data, host_planes[i]->data,
+                        bytes, cudaMemcpyHostToDevice, stream));
+                }
+                qsa_stream->staged_layer = full_attention_index;
+            }
+            // The wide call's own rows must also land in staging, or stage()'s
+            // cache could skip the next copy and drop these tokens.
+            ops::kv_cache_append(k_span, v_span, call_positions, qsa_stream->staging, stream);
+            qsa_stream->staged_end = static_cast<std::uint32_t>(first_host + T);
+            read = qsa_stream->staging;
         }
     }
     ops::sparse_softmax_attention(
@@ -1816,14 +1860,6 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
         work_, a_span, stream);
     if (wide_stream_call) {
-        std::int32_t first_host = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        // QSA keeps one indexer/stream copy with the context cache off, so a
-        // prefill starting at position zero begins a fresh sequence: drop every
-        // pool residency from the previous request before any resolve runs.
-        if (first_host == 0) { ops::kv_stream_reset(stream_layer->map, stream); }
         const std::int32_t first_block = first_host / ops::kKvStreamPageTokens;
         const std::int32_t end_block =
             (first_host + T - 1) / ops::kKvStreamPageTokens + 1;
