@@ -70,7 +70,7 @@ offered under the same Apache-2.0 license.
 ## Change summary
 
 Relative to upstream master (`2207ee04`) this fork carries **48 modified
-upstream files and 11 new files**, and deletes no upstream file.
+upstream files and 10 new files**, and deletes no upstream file.
 `docs/qsa-port.md` was a fork-only document, removed by `d7218f70`, so it does
 not appear in the lists below.
 
@@ -236,15 +236,11 @@ credited in `CONTRIBUTORS.md` and the git history.
 
 - `tools/convert/gguf_blocks.py`
 
-## Added files (11)
+## Added files (10)
 
 ### Root (1)
 
 - `MODIFICATIONS.md`
-
-### docs (1)
-
-- `docs/qsa-history-window-plan.md`
 
 ### include/ninfer/ops (1)
 
