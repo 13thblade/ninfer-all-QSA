@@ -11,10 +11,9 @@
 支持Qwen3.8-27B的ViT和MTP，暂不支持Dflash2
 
 后续计划：
-1. 更新正在上传；
-2. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
-3. QSA注意力每token原生仅能看到2048个历史token，损失可能较大，将把它改为可调的；
-4. 提供Dflash2和Dspine草稿的支持。
+1. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
+2. QSA注意力每token原生仅能看到2048个历史token，损失可能较大，将把它改为可调的；
+3. 提供Dflash2和Dspine草稿的支持。
 
 # This is the upstream original documentation
 
