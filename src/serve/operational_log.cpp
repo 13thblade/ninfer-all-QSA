@@ -4,6 +4,8 @@
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
+#include "ninfer/ops/qsa_budget.h"
+
 #include <spdlog/logger.h>
 
 #include <algorithm>
@@ -588,6 +590,26 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           ? std::string()
                           : " | expert cache " +
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
+    }
+
+    if (engine.qwen38_27b_qsa) {
+        // The artifact's own budget no longer decides the window once the flag is set, so name the
+        // source: a reader of the log must be able to tell 2,048 from an override (plan §6.5).
+        const std::uint32_t native_tokens = static_cast<std::uint32_t>(ninfer::ops::kQsaBlockTokens) *
+                                            static_cast<std::uint32_t>(ninfer::ops::kQsaTopBlocksDefault);
+        if (engine.qsa_history_tokens == 0) {
+            logger_->info("qsa | history window {} tokens, {} blocks | the artifact's own",
+                          product::format_pretty_count(native_tokens),
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)));
+        } else {
+            logger_->info("qsa | history window {} tokens, {} blocks | overrides the artifact's {}",
+                          product::format_pretty_count(engine.qsa_history_tokens),
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(engine.qsa_history_tokens /
+                                                         ninfer::ops::kQsaBlockTokens)),
+                          product::format_pretty_count(native_tokens));
+        }
     }
 
     if (cache.enabled) {
