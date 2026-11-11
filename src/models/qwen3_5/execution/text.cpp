@@ -1802,15 +1802,19 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     // layer view or the staging copy that stage() filled from the pinned host layer. Selecting
     // and gathering K blocks from it pays for the whole copy and then reads each query's window
     // again with no cross-query tile reuse. Decode/verify must keep the sparse route: their
-    // stream pool holds only the blocks resolve() brought in. Text-only calls only: a 3-D
-    // M-RoPE prompt needs the indexer's interleaved axes, which the dense Op does not take.
+    // stream pool holds only the blocks resolve() brought in.
+    //
+    // A multimodal prompt takes this route too. Its 3-D M-RoPE already rotated q/k in
+    // text_qk_norm_rope above, and the indexer's append keeps its interleaved axes in
+    // `indexer_positions`; the dense Op only needs the single-axis causal positions, which are
+    // the same `cache_positions` the dense branch passes when QSA is off.
     static const bool dense_prefill_opt = [] {
         const char* setting = std::getenv("NINFER_QSA_DENSE_PREFILL");
         return setting == nullptr || std::strcmp(setting, "0") != 0;
     }();
     const bool dense_prefill =
-        phase == Phase::Prefill && dense_prefill_opt && active_causal_attention_envelope_ != nullptr &&
-        call_positions.is_contiguous() && indexer_positions.rope_positions == nullptr &&
+        phase == Phase::Prefill && dense_prefill_opt &&
+        active_causal_attention_envelope_ != nullptr && call_positions.is_contiguous() &&
         (qsa_stream == nullptr || T > static_cast<std::int32_t>(qsa_stream->width));
 
     auto scope = work_.scope();
