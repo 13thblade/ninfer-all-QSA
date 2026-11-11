@@ -2,8 +2,10 @@
 // include/ninfer/ops/qsa_indexer.h). Pooling runs one CTA per completed block. Selection scores the
 // blocks into workspace, a few tokens with one CTA per token and 64 blocks, prompts in tiles of
 // tokens x blocks (grids sized by the capacity, so a graph replays them at any position), then one
-// CTA per query runs a four-pass radix select of the 512th key and two ordered passes that keep
-// ties at the lower block index and write the blocks in increasing order.
+// CTA per query runs a four-pass radix select of the top_blocks-th key and two ordered passes that
+// keep ties at the lower block index and write the blocks in increasing order. `top_blocks` is a
+// kernel argument (defaulting to the artifact's 512): the geometry and grids do not depend on it,
+// so a captured graph replays a raised budget as it stands.
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/rope.h"
 
@@ -31,8 +33,7 @@ namespace {
 constexpr int kHeadDim     = 128;
 constexpr int kHeads       = 4;
 constexpr int kRotaryPairs = 32;
-constexpr int kBlock       = 4;
-constexpr int kTopBlocks   = 512;
+constexpr int kBlock       = kQsaBlockTokens;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
 constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
@@ -274,12 +275,12 @@ __global__ void __launch_bounds__(kThreads)
     qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
                      const __nv_bfloat16* query_norm, float eps, float* queries,
                      const int* __restrict__ rope_positions, std::int32_t pos_tokens,
-                     const QsaRope rope) {
+                     const QsaRope rope, int top_blocks) {
     __shared__ float row[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
     const int t = blockIdx.x, position = *first + t;
-    if ((position + 1) / kBlock <= kTopBlocks) { return; }
+    if ((position + 1) / kBlock <= top_blocks) { return; }
     row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
     __syncthreads();
     int pos3[3];
@@ -302,7 +303,7 @@ template <int Tok>
 __global__ void __launch_bounds__(kTileThreads, 2)
     qsa_tile_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                           const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                          int tokens, int capacity) {
+                          int tokens, int capacity, int top_blocks) {
     constexpr int kTokensPerThread = Tok / 16;
     constexpr int kRows            = Tok * kHeads;
     constexpr int kParts           = kStageDims / 4;          // float4 loads per row and stage
@@ -319,7 +320,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     const int t0 = blockIdx.x * Tok, b0 = blockIdx.y * kTileBlocks;
     const int start  = *first;
     const int blocks = min((start + min(t0 + Tok, tokens)) / kBlock, capacity);
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const int part = tid % kParts, line = tid / kParts;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const float4* query_src[kQueryLoads];
@@ -328,7 +329,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     for (int l = 0; l < kQueryLoads; ++l) {
         const int row   = line + kLines * l;
         const int token = t0 + row / kHeads;
-        query_ok[l]     = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_ok[l]     = token < tokens && (start + token + 1) / kBlock > top_blocks;
         query_src[l]    = reinterpret_cast<const float4*>(
                            queries + (static_cast<std::int64_t>(t0) * kHeads + row) * kHeadDim) +
                        part;
@@ -425,7 +426,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     for (int k = 0; k < kTokensPerThread; ++k) {
         const int t       = t0 + ty + 16 * k;
         const int visible = min((start + t + 1) / kBlock, capacity);
-        if (t < tokens && visible > kTopBlocks) {
+        if (t < tokens && visible > top_blocks) {
             unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -456,9 +457,10 @@ __global__ void __launch_bounds__(kTileThreads, 2)
 __global__ void __launch_bounds__(kTileThreads, 1)
     qsa_tensor_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                             const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                            int tokens, int capacity) {
+                            int tokens, int capacity, int top_blocks) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 800
-    (void)queries, (void)first, (void)pooled, (void)keys_workspace, (void)tokens, (void)capacity;
+    (void)queries, (void)first, (void)pooled, (void)keys_workspace, (void)tokens, (void)capacity,
+        (void)top_blocks;
     __trap();
 #else
     namespace wmma = nvcuda::wmma;
@@ -469,13 +471,13 @@ __global__ void __launch_bounds__(kTileThreads, 1)
     const int t0 = blockIdx.x * kTensorTokens, b0 = blockIdx.y * kTensorBlocks;
     const int start  = *first;
     const int blocks = min((start + min(t0 + kTensorTokens, tokens)) / kBlock, capacity);
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const float* query_base[2];
     bool query_ok[2];
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         const int token  = t0 + 16 * wm + g + 8 * half;
-        query_ok[half]   = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_ok[half]   = token < tokens && (start + token + 1) / kBlock > top_blocks;
         query_base[half] = queries + static_cast<std::int64_t>(token) * kHeads * kHeadDim + 2 * c;
     }
     const float* key_base[kTiles];
@@ -562,7 +564,7 @@ __global__ void __launch_bounds__(kTileThreads, 1)
     for (int half = 0; half < 2; ++half) {
         const int t       = t0 + 16 * wm + g + 8 * half;
         const int visible = min((start + t + 1) / kBlock, capacity);
-        if (t < tokens && visible > kTopBlocks) {
+        if (t < tokens && visible > top_blocks) {
             unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 #pragma unroll
             for (int n = 0; n < kTiles; ++n) {
@@ -585,14 +587,14 @@ __global__ void __launch_bounds__(kTileThreads, 1)
 }
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
-// order), as orderable keys. A query that sees at most 512 blocks needs none.
+// order), as orderable keys. A query that sees at most `top_blocks` blocks needs none.
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                      const __nv_bfloat16* __restrict__ query_norm, float eps,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
                      int capacity, const int* __restrict__ rope_positions,
-                     std::int32_t pos_tokens, const QsaRope rope) {
+                     std::int32_t pos_tokens, const QsaRope rope, int top_blocks) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int t        = blockIdx.y;
@@ -601,7 +603,7 @@ __global__ void __launch_bounds__(kThreads)
     int pos3[3];
     call_positions(rope_positions, pos_tokens, t, position, pos3);
     const int b0       = blockIdx.x * kScoreBlocks;
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const int tid = threadIdx.x;
 
     // Normalised, rotated query heads: four 128-thread groups.
@@ -664,7 +666,8 @@ __global__ void __launch_bounds__(kThreads)
 
 __global__ void __launch_bounds__(kThreads)
     qsa_select_kernel(const int* __restrict__ first, const unsigned* __restrict__ keys_workspace,
-                      int capacity, int* __restrict__ selected, int* __restrict__ counts) {
+                      int capacity, int* __restrict__ selected, int* __restrict__ counts,
+                      int top_blocks) {
     using Scan = cub::BlockScan<int, kThreads>;
     __shared__ typename Scan::TempStorage scan_storage;
     __shared__ int histogram[256];
@@ -675,19 +678,19 @@ __global__ void __launch_bounds__(kThreads)
     const int t        = blockIdx.x;
     const int position = *first + t;
     const int blocks   = min((position + 1) / kBlock, capacity);
-    int* out           = selected + static_cast<std::int64_t>(t) * kTopBlocks;
+    int* out           = selected + static_cast<std::int64_t>(t) * top_blocks;
     const int tid      = threadIdx.x;
-    if (blocks <= kTopBlocks) {
+    if (blocks <= top_blocks) {
         for (int b = tid; b < blocks; b += kThreads) out[b] = b;
         if (tid == 0) counts[t] = blocks;
         return;
     }
     const unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 
-    // Radix select of the kTopBlocks-th largest key, eight bits at a time from the top.
+    // Radix select of the top_blocks-th largest key, eight bits at a time from the top.
     if (tid == 0) {
         prefix_shared    = 0;
-        remaining_shared = kTopBlocks;
+        remaining_shared = top_blocks;
     }
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int i = tid; i < 256; i += kThreads) histogram[i] = 0;
@@ -740,6 +743,11 @@ __global__ void __launch_bounds__(kThreads)
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa_indexer: ") + message); }
+}
+
+void require_top_blocks(std::int32_t top_blocks) {
+    require(top_blocks >= 1 && top_blocks <= kQsaTopBlocksMax,
+            "top_blocks must be within 1..kQsaTopBlocksMax");
 }
 
 void require_projection(const Tensor& projection) {
@@ -911,12 +919,14 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     }
 }
 
-std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t capacity) {
+std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t capacity,
+                                               std::int32_t top_blocks) {
     require(tokens > 0 && capacity > 0, "tokens and capacity must be positive");
+    require_top_blocks(top_blocks);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {capacity, tokens});
     // The prepared queries of a tiled route, on any device (kTensorMinTokens > kTileMinTokens).
-    if (tokens >= kTileMinTokens && capacity > kTopBlocks) {
+    if (tokens >= kTileMinTokens && capacity > top_blocks) {
         (void)layout.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
     }
     return layout.peak_bytes(1);
@@ -926,7 +936,8 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
                         Tensor& counts, cudaStream_t stream,
-                        const QsaIndexerPositions& positions) {
+                        const QsaIndexerPositions& positions, std::int32_t top_blocks) {
+    require_top_blocks(top_blocks);
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.query_norm, "query_norm must be BF16 [128]");
@@ -936,8 +947,8 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     const std::int32_t tokens = projection.ne[1];
     const auto pos            = require_positions(positions, tokens);
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
-                selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
-            "selected must be contiguous I32 [512, tokens]");
+                selected.ne[0] == top_blocks && selected.ne[1] == tokens,
+            "selected must be contiguous I32 [top_blocks, tokens]");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,
             "counts must be contiguous I32 [tokens]");
@@ -946,7 +957,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     require(capacity <= 65535 * kTileBlocks, "pooled capacity must be at most 4,194,240 blocks");
     auto scope                  = workspace.scope();
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
-    if (capacity > kTopBlocks) {
+    if (capacity > top_blocks) {
         const ScoreRoute route = score_route(tokens, capacity);
         if (route == ScoreRoute::Scalar) {
             const dim3 grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
@@ -957,7 +968,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
-                pos.rope, pos.pos_tokens, rope);
+                pos.rope, pos.pos_tokens, rope, top_blocks);
         } else {
             Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
             auto* const query_kernel =
@@ -965,7 +976,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
             query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-                static_cast<float*>(queries.data), pos.rope, pos.pos_tokens, rope);
+                static_cast<float*>(queries.data), pos.rope, pos.pos_tokens, rope, top_blocks);
             CUDA_CHECK(cudaGetLastError());
             const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;
             const int tile_blocks = route == ScoreRoute::Tensor ? kTensorBlocks : kTileBlocks;
@@ -978,13 +989,13 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
             score_kernel<<<grid, kTileThreads, 0, stream>>>(
                 static_cast<const float*>(queries.data), first,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), tokens,
-                capacity);
+                capacity, top_blocks);
         }
         CUDA_CHECK(cudaGetLastError());
     }
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
         first, static_cast<const unsigned*>(keys.data), capacity, static_cast<int*>(selected.data),
-        static_cast<int*>(counts.data));
+        static_cast<int*>(counts.data), top_blocks);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1000,9 +1011,9 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
-                        Tensor& counts, cudaStream_t stream) {
+                        Tensor& counts, cudaStream_t stream, std::int32_t top_blocks) {
     qsa_indexer_select(projection, first_position, weights, eps, yarn, pooled, workspace, selected,
-                       counts, stream, QsaIndexerPositions{});
+                       counts, stream, QsaIndexerPositions{}, top_blocks);
 }
 
 } // namespace ninfer::ops

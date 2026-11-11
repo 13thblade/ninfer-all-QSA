@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/qsa_budget.h"
 #include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -22,7 +23,9 @@ namespace ninfer::ops {
  *
  *   score_b = sum_{h<4} relu(q_h . K_b),   q_h = rope(groupnorm(q[h], query_norm), p)
  *
- * the min(512, blocks) best blocks, ties to the lower block index. groupnorm is the zero-centred
+ * the min(top_blocks, blocks) best blocks, ties to the lower block index, where `top_blocks`
+ * defaults to the artifact's 512 (kQsaTopBlocksDefault) and may be raised to kQsaTopBlocksMax.
+ * groupnorm is the zero-centred
  * RMSNorm x / sqrt(mean x^2 + eps) * (1 + w) over 128 values; rope rotates the first 64 dims
  * rotate-half at angle fl32(fl32(position) * f_i), f_i = fl32(1e7^(-2i/64)), i < 32, and passes
  * dims 64..127 through. Whenever `yarn.active()` (a YaRN factor above one OR linear position
@@ -49,7 +52,7 @@ namespace ninfer::ops {
  * FP32 [128, 3] the raw keys of the incomplete block before `first_position` (slot = position
  * mod 4). The oracle evaluates in FP64 from the
  * represented inputs (angles as above); pooled keys are compared as FP32, and a selection must
- * equal the oracle's up to blocks whose FP64 scores tie the 512th within 1e-5 relative.
+ * equal the oracle's up to blocks whose FP64 scores tie the top_blocks-th within 1e-5 relative.
  */
 struct QsaIndexerWeights {
     const Tensor* query_norm = nullptr; // BF16 [128]
@@ -98,19 +101,23 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         Tensor& pooled, Tensor& tail, cudaStream_t stream);
 
-[[nodiscard]] std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens,
-                                                             std::int32_t capacity);
+[[nodiscard]] std::size_t qsa_indexer_select_workspace_bytes(
+    std::int32_t tokens, std::int32_t capacity,
+    std::int32_t top_blocks = kQsaTopBlocksDefault);
 
-// Writes each query's selected blocks in increasing order into `selected` I32 [512, tokens] and
-// their number into `counts` I32 [tokens]. Run after qsa_indexer_append for the same tokens.
+// Writes each query's selected blocks in increasing order into `selected` I32 [top_blocks, tokens]
+// and their number into `counts` I32 [tokens]. Run after qsa_indexer_append for the same tokens.
+// `top_blocks` (1..kQsaTopBlocksMax) is fixed for the process so a captured graph replays it.
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
                         Tensor& counts, cudaStream_t stream,
-                        const QsaIndexerPositions& positions);
+                        const QsaIndexerPositions& positions,
+                        std::int32_t top_blocks = kQsaTopBlocksDefault);
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
-                        Tensor& counts, cudaStream_t stream);
+                        Tensor& counts, cudaStream_t stream,
+                        std::int32_t top_blocks = kQsaTopBlocksDefault);
 
 } // namespace ninfer::ops

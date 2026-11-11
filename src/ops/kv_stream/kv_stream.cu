@@ -22,7 +22,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr int kResolveThreads = 1024;
-constexpr int kTopBlocks      = 512;
 constexpr int kHostPage       = kPagedKVPageSize;
 constexpr int kBlocksPerPage  = kHostPage / kKvStreamPageTokens; // 16
 // Blocks one call writes: positions first .. first + 15 span at most five blocks.
@@ -83,7 +82,8 @@ __device__ __forceinline__ unsigned long long* counters(const KvStreamMap& m) {
 
 __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(KvStreamMap m, const int* __restrict__ first_word,
-                   const int* __restrict__ selected, const int* __restrict__ counts, int tokens) {
+                   const int* __restrict__ selected, const int* __restrict__ counts, int tokens,
+                   int selected_stride) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut;
     __shared__ int warp_sums[32];
     __shared__ int read_written[kWrittenBlocks];
@@ -108,7 +108,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         const int p      = first + q;
         const int count  = counts[q];
         const bool tail  = (p + 1) % kKvStreamPageTokens != 0;
-        const int* list  = selected + static_cast<long long>(q) * kTopBlocks;
+        const int* list  = selected + static_cast<long long>(q) * selected_stride;
         const int blocks = count + (tail ? 1 : 0);
         for (int i = threadIdx.x; i < blocks; i += kResolveThreads) {
             const int b = i < count ? list[i] : p / kKvStreamPageTokens;
@@ -363,11 +363,12 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const PagedKVLayerView& pool, cudaStream_t stream) {
     require(map.table != nullptr, "an empty map");
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
-                selected.ne[0] == kTopBlocks && selected.ne[1] > 0,
-            "selected must be contiguous I32 [512, tokens]");
+                selected.ne[0] >= 1 && selected.ne[0] <= kQsaTopBlocksMax && selected.ne[1] > 0,
+            "selected must be contiguous I32 [top_blocks, tokens]");
     const std::int32_t tokens = selected.ne[1];
+    const std::int32_t stride = selected.ne[0];
     require(tokens <= kKvStreamMaxTokens, "a resolved call has at most 16 queries");
-    require(map.slots >= kv_stream_minimum_slots(tokens),
+    require(map.slots >= kv_stream_minimum_slots(tokens, stride + 1),
             "the pool cannot hold the blocks of one call");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,
@@ -377,7 +378,7 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const Planes planes = planes_of(map, host, pool);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         map, static_cast<const int*>(first_position.data), static_cast<const int*>(selected.data),
-        static_cast<const int*>(counts.data), tokens);
+        static_cast<const int*>(counts.data), tokens, stride);
     CUDA_CHECK(cudaGetLastError());
     copy_kernel<<<kCopyBlocks, kCopyThreads, 0, stream>>>(map, planes);
     CUDA_CHECK(cudaGetLastError());

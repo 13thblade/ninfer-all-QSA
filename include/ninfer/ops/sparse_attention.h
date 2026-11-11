@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/qsa_budget.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -21,7 +22,7 @@ namespace ninfer::ops {
  * `G` is the cache's query heads per KV head: 12 in Flash-Next's 24-over-2 geometry, 6 in
  * QSA-27B's 24-over-4. `q` is BF16 [256, G K, tokens] (normalised and rotated) for the
  * consecutive positions `first_position` .., read from a device I32 word so that a call captured
- * in a graph replays at whatever position the word holds; `selected` I32 [512, tokens] and
+ * in a graph replays at whatever position the word holds; `selected` I32 [top_blocks, tokens] and
  * `counts` I32 [tokens] are the indexer's blocks; `cache` is the sequence's paged KV layer of K
  * heads of 256 (every head, or one: a tensor-parallel share of a KV head and its G query heads)
  * holding every selected and tail position, its block table covering every position the caller
@@ -40,6 +41,7 @@ namespace ninfer::ops {
 
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              std::int32_t top_blocks = kQsaTopBlocksDefault);
 
 } // namespace ninfer::ops

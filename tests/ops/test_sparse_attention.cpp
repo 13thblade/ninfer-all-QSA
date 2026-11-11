@@ -1,6 +1,7 @@
 // sparse_softmax_attention against an FP64 oracle over the selected blocks and the query's own
-// incomplete block, through a fragmented paged cache: a full 512-block selection at long context,
-// short contexts where every block is selected, and every tail length 0..3, both for up to eight
+// incomplete block, through a fragmented paged cache: a full selection at long context, at the
+// artifact's budget and at raised ones up to the compile-time cap, short contexts where every
+// block is selected, and every tail length 0..3, both for up to eight
 // queries (positions split over CTAs, partial softmaxes merged) and for wider calls.
 //
 // A BF16 cache is written directly. Every quantized storage is written by kv_cache_append and its
@@ -35,7 +36,8 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kDim = 256, kQHeads = 24, kKvHeads = 2, kTop = 512, kPage = 64;
+constexpr int kDim = 256, kQHeads = 24, kKvHeads = 2, kPage = 64;
+constexpr int kDefaultTop = ops::kQsaTopBlocksDefault;
 
 namespace codec = ninfer::test::quantized_weight::detail;
 
@@ -177,7 +179,7 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
 // `kv_heads` 2 with 12 queries each is Flash-Next's layer; `kv_heads` 4 with 6 each is QSA-27B's;
 // `kv_heads` 1 is a tensor-parallel share of one KV head and its group of query heads.
 int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed,
-        int kv_heads = kKvHeads, int group = 12) {
+        int kv_heads = kKvHeads, int group = 12, int top = kDefaultTop) {
     const int q_heads = group * kv_heads;
     // A bf16p cache is written by the append and holds the BF16 rows unrotated.
     const bool quantized      = storage != KvCacheStorage::BFloat16;
@@ -307,19 +309,19 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
         }
     }
 
-    // Selections: every block when there are at most 512, else 512 distinct random ones.
-    std::vector<int> selected(static_cast<std::size_t>(kTop) * tokens, -1), counts(tokens);
+    // Selections: every block when there are at most `top`, else `top` distinct random ones.
+    std::vector<int> selected(static_cast<std::size_t>(top) * tokens, -1), counts(tokens);
     for (int t = 0; t < tokens; ++t) {
         const int blocks = (first_position + t + 1) / 4;
         std::vector<int> all(blocks);
         std::iota(all.begin(), all.end(), 0);
-        if (blocks > kTop) {
+        if (blocks > top) {
             std::shuffle(all.begin(), all.end(), random);
-            all.resize(kTop);
+            all.resize(top);
             std::sort(all.begin(), all.end());
         }
         counts[t] = static_cast<int>(all.size());
-        std::copy(all.begin(), all.end(), selected.begin() + static_cast<std::ptrdiff_t>(t) * kTop);
+        std::copy(all.begin(), all.end(), selected.begin() + static_cast<std::ptrdiff_t>(t) * top);
     }
     const float scale = 1.0f / 16.0f;
     std::vector<double> expected(q.size());
@@ -327,7 +329,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
         const int p = first_position + t, tail = (p + 1) / 4 * 4;
         std::vector<int> positions;
         for (int i = 0; i < counts[t]; ++i)
-            for (int j = 0; j < 4; ++j) positions.push_back(selected[static_cast<std::size_t>(t) * kTop + i] * 4 + j);
+            for (int j = 0; j < 4; ++j) positions.push_back(selected[static_cast<std::size_t>(t) * top + i] * 4 + j);
         for (int j = tail; j <= p; ++j) positions.push_back(j);
         for (int h = 0; h < q_heads; ++h) {
             const int kv = h / group;
@@ -361,11 +363,12 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     d_counts.copy_from_host(counts.data(), d_counts.bytes());
     Tensor t_q(d_q.data(), DType::BF16, {kDim, q_heads, tokens});
     Tensor t_out(d_out.data(), DType::BF16, {kDim, q_heads, tokens});
-    Tensor t_selected(d_selected.data(), DType::I32, {kTop, tokens});
+    Tensor t_selected(d_selected.data(), DType::I32, {top, tokens});
     Tensor t_counts(d_counts.data(), DType::I32, {tokens});
     const Tensor t_first(d_first.data(), DType::I32, {1});
     WorkspaceArena workspace(ops::sparse_softmax_attention_workspace_bytes(tokens));
-    ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, workspace, t_out, nullptr);
+    ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, workspace, t_out,
+                                  nullptr, top);
     cuda_synchronize();
     const std::string label = std::string("sparse attention ") + storage_name(storage) +
                               " p=" + std::to_string(first_position) + " T=" + std::to_string(tokens) +
@@ -416,6 +419,11 @@ int main() {
         failures += run(storage, 2047, 9, 9205u, 1, 6);
         failures += run(storage, 6001, 8, 9206u, 1, 6);
     }
+    // A raised budget: the split grid and merge cover every split up to the compile-time cap, and
+    // a short context fits the budget outright.
+    failures += run(KvCacheStorage::BFloat16, 5, 4, 9110u, 4, 6, 1024);
+    failures += run(KvCacheStorage::BFloat16, 9000, 1, 9111u, kKvHeads, 12, 1024);
+    failures += run(KvCacheStorage::BFloat16, 9000, 1, 9112u, kKvHeads, 12, ops::kQsaTopBlocksMax);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sparse_softmax_attention\n";
     return failures == 0 ? 0 : 1;
 }

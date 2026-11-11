@@ -42,12 +42,13 @@ namespace {
 
 constexpr int kHeadDim     = 256;
 constexpr int kQueryHeads  = 24; // the full geometry's query heads
-constexpr int kTopBlocks   = 512;
 constexpr int kTile        = 32;
 constexpr int kRowStride   = kHeadDim + 2; // BF16 elements; 129 words per row spreads the banks
 constexpr int kSplitTokens    = 8;
 constexpr int kSplitPositions = 2 * kTile;
-constexpr int kMaxPositions   = 4 * kTopBlocks + 3; // the selected blocks and the query's own
+// The compile-time cap: a runtime selection budget is at most kQsaTopBlocksMax blocks, so the
+// split grid and the partial-softmax workspace are sized for it and stay graph-safe.
+constexpr int kMaxPositions   = kQsaBlockTokens * kQsaTopBlocksMax + 3; // selected blocks + the query's own
 constexpr int kSplits         = (kMaxPositions + kSplitPositions - 1) / kSplitPositions;
 constexpr int kPartialFloats  = kHeadDim + 2; // unnormalised output, running max, running sum
 
@@ -220,7 +221,7 @@ __global__ void __launch_bounds__(Group * 32)
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             KvPlanes planes, const std::int32_t* __restrict__ block_table,
                             float scale, __nv_bfloat16* __restrict__ out,
-                            float* __restrict__ partial, int q_heads) {
+                            float* __restrict__ partial, int q_heads, int top_blocks) {
     using Element = TileElement<Storage>;
     using Pair    = std::conditional_t<std::is_same_v<Element, __half>, __half2, __nv_bfloat162>;
     // bf16p rows decode to the BF16 a bf16 cache holds: neither quantized nor rotated.
@@ -243,7 +244,7 @@ __global__ void __launch_bounds__(Group * 32)
     const int count    = counts[t];
     const int tail_begin = (position + 1) / 4 * 4;
     const int total      = 4 * count + (position + 1 - tail_begin);
-    const int* blocks    = selected + static_cast<std::int64_t>(t) * kTopBlocks;
+    const int* blocks    = selected + static_cast<std::int64_t>(t) * top_blocks;
     const int begin      = Split ? static_cast<int>(blockIdx.z) * kSplitPositions : 0;
     const int end        = Split ? min(total, begin + kSplitPositions) : total;
 
@@ -463,18 +464,18 @@ void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
 template <KvCacheStorage Storage, int Shift, int Group>
 void launch(const __nv_bfloat16* q, const int* first, const int* selected, const int* counts,
             const KvPlanes& planes, const std::int32_t* table, float scale, std::int32_t tokens,
-            float* partial, __nv_bfloat16* out, cudaStream_t stream) {
+            float* partial, __nv_bfloat16* out, cudaStream_t stream, int top_blocks) {
     const int q_heads = planes.heads * Group;
     if (partial == nullptr) {
         sparse_attention_kernel<false, Storage, Shift, Group>
             <<<dim3(tokens, planes.heads), Group * 32, 0, stream>>>(
-                q, first, selected, counts, planes, table, scale, out, nullptr, q_heads);
+                q, first, selected, counts, planes, table, scale, out, nullptr, q_heads, top_blocks);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     sparse_attention_kernel<true, Storage, Shift, Group>
         <<<dim3(tokens, planes.heads, kSplits), Group * 32, 0, stream>>>(
-            q, first, selected, counts, planes, table, scale, out, partial, q_heads);
+            q, first, selected, counts, planes, table, scale, out, partial, q_heads, top_blocks);
     CUDA_CHECK(cudaGetLastError());
     const dim3 grid(tokens, q_heads);
     switch (q_heads) {
@@ -489,6 +490,8 @@ void launch(const __nv_bfloat16* q, const int* first, const int* selected, const
 
 std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
     require(tokens > 0, "tokens must be positive");
+    // The split workspace is sized for kQsaTopBlocksMax, so any runtime budget fits and the
+    // captured graph's shape never changes; `tokens` is split tokens at most.
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::FP32,
                        {kPartialFloats, kQueryHeads, kSplits, std::min(tokens, kSplitTokens)});
@@ -497,7 +500,10 @@ std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
 
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              std::int32_t top_blocks) {
+    require(top_blocks >= 1 && top_blocks <= kQsaTopBlocksMax,
+            "top_blocks must be within 1..kQsaTopBlocksMax");
     require(cache.head_dim == kHeadDim && cache.num_kv_heads >= 1 &&
                 cache.num_kv_heads <= kQueryHeads &&
                 cache.block_table.dtype == DType::I32 && cache.block_table.data != nullptr,
@@ -517,8 +523,8 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
                 first_position.numel() >= 1,
             "first_position must be a device I32 word");
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
-                selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
-            "selected must be contiguous I32 [512, tokens]");
+                selected.ne[0] == top_blocks && selected.ne[1] == tokens,
+            "selected must be contiguous I32 [top_blocks, tokens]");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,
             "counts must be contiguous I32 [tokens]");
@@ -569,12 +575,12 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
             (streamed ? launch<KvCacheStorage::STORAGE, 2, 6>                                      \
                       : launch<KvCacheStorage::STORAGE, 6, 6>)(                                    \
                 q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p, out_p,    \
-                stream);                                                                           \
+                stream, top_blocks);                                                               \
         } else {                                                                                   \
             (streamed ? launch<KvCacheStorage::STORAGE, 2, 12>                                     \
                       : launch<KvCacheStorage::STORAGE, 6, 12>)(                                   \
                 q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p, out_p,    \
-                stream);                                                                           \
+                stream, top_blocks);                                                               \
         }                                                                                          \
         return;
         NINFER_SPARSE_ATTENTION_CASE(BFloat16)

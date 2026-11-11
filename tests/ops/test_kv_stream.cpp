@@ -34,7 +34,8 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kDim = 256, kQHeads = 24, kKvHeads = 2, kTop = 512, kPage = 64, kBlock = 4;
+constexpr int kDim = 256, kQHeads = 24, kKvHeads = 2, kPage = 64, kBlock = 4;
+constexpr int kDefaultTop = ops::kQsaTopBlocksDefault;
 
 const char* storage_name(KvCacheStorage storage) {
     switch (storage) {
@@ -180,21 +181,22 @@ struct Layer {
 // Device inputs of one call of up to 16 (narrow) or `wide` tokens at fixed addresses.
 struct Inputs {
     DeviceBuffer k, v, positions, first, selected, counts, q;
-    explicit Inputs(int capacity)
+    explicit Inputs(int capacity, int top)
         : k(std::size_t(capacity) * kKvHeads * kDim * 2), v(k.bytes),
           positions(std::size_t(capacity) * 4), first(4),
-          selected(std::size_t(kTop) * ops::kKvStreamMaxTokens * 4),
+          selected(std::size_t(top) * ops::kKvStreamMaxTokens * 4),
           counts(std::size_t(ops::kKvStreamMaxTokens) * 4),
           q(std::size_t(ops::kKvStreamMaxTokens) * kQHeads * kDim * 2) {}
 };
 
 class Sequence {
 public:
-    Sequence(Layer& layer, std::uint32_t seed, int wide)
-        : layer_(layer), random_(seed), in_(std::max(wide, ops::kKvStreamMaxTokens)),
+    Sequence(Layer& layer, std::uint32_t seed, int wide, int top)
+        : layer_(layer), random_(seed), in_(std::max(wide, ops::kKvStreamMaxTokens), top),
           out_stream_(std::size_t(ops::kKvStreamMaxTokens) * kQHeads * kDim * 2),
           out_resident_(out_stream_.bytes),
-          workspace_(ops::sparse_softmax_attention_workspace_bytes(ops::kKvStreamMaxTokens)) {}
+          workspace_(ops::sparse_softmax_attention_workspace_bytes(ops::kKvStreamMaxTokens)),
+          top_(top) {}
 
     int position() const { return position_; }
     void rewind(int to) { position_ = to; }
@@ -227,23 +229,23 @@ public:
     }
 
     // Random selections and queries for `t` queries at the current position: recent blocks and
-    // far ones, ascending and distinct, at most 512.
+    // far ones, ascending and distinct, at most 	op.
     void select(int t, cudaStream_t stream) {
-        std::vector<std::int32_t> selected(std::size_t(kTop) * t, -1);
+        std::vector<std::int32_t> selected(std::size_t(top_) * t, -1);
         std::vector<std::int32_t> counts(static_cast<std::size_t>(t));
         for (int q = 0; q < t; ++q) {
             const int complete = (position_ + q + 1) / kBlock;
             std::set<int> chosen;
-            if (complete <= kTop) {
+            if (complete <= top_) {
                 for (int b = 0; b < complete; ++b) chosen.insert(b);
             } else {
                 const int recent = std::min(complete, 96);
                 for (int b = complete - recent; b < complete; ++b) chosen.insert(b);
                 std::uniform_int_distribution<int> any(0, complete - 1);
-                while (int(chosen.size()) < kTop) chosen.insert(any(random_));
+                while (int(chosen.size()) < top_) chosen.insert(any(random_));
             }
             counts[std::size_t(q)] = int(chosen.size());
-            std::copy(chosen.begin(), chosen.end(), selected.begin() + std::ptrdiff_t(q) * kTop);
+            std::copy(chosen.begin(), chosen.end(), selected.begin() + std::ptrdiff_t(q) * top_);
         }
         std::vector<float> q(std::size_t(t) * kQHeads * kDim);
         fill_uniform(q, std::uint32_t(random_()), -1.0f, 1.0f);
@@ -261,7 +263,7 @@ public:
     void streamed(int t, cudaStream_t stream) {
         append_kernels(t, layer_.host_view, stream);
         const Tensor first(in_.first.p, DType::I32, {1});
-        const Tensor selected(in_.selected.p, DType::I32, {kTop, t});
+        const Tensor selected(in_.selected.p, DType::I32, {top_, t});
         const Tensor counts(in_.counts.p, DType::I32, {t});
         ops::kv_stream_resolve(layer_.map, first, selected, counts, layer_.host_view,
                                layer_.pool_view, stream);
@@ -271,11 +273,11 @@ public:
     void attend(int t, const PagedKVLayerView& cache, void* out, cudaStream_t stream) {
         const Tensor q(in_.q.p, DType::BF16, {kDim, kQHeads, t});
         const Tensor first(in_.first.p, DType::I32, {1});
-        const Tensor selected(in_.selected.p, DType::I32, {kTop, t});
+        const Tensor selected(in_.selected.p, DType::I32, {top_, t});
         const Tensor counts(in_.counts.p, DType::I32, {t});
         Tensor result(out, DType::BF16, {kDim, kQHeads, t});
         ops::sparse_softmax_attention(q, first, selected, counts, cache, 1.0f / 16.0f, workspace_,
-                                      result, stream);
+                                      result, stream, top_);
     }
 
     // The resident twin of the call, then the comparison.
@@ -307,6 +309,7 @@ private:
     DeviceBuffer out_stream_, out_resident_;
     WorkspaceArena workspace_;
     int position_ = 0;
+    int top_ = kDefaultTop;
 };
 
 struct Plan {
@@ -314,11 +317,12 @@ struct Plan {
     int length, slots, prompt, steps;
     std::vector<int> widths;
     bool rewrites = false, wide_calls = false, graph = false;
+    int top = kDefaultTop;
 };
 
 int run(KvCacheStorage storage, const Plan& plan, std::uint32_t seed) {
     Layer layer(storage, plan.length, plan.slots);
-    Sequence sequence(layer, seed, 64);
+    Sequence sequence(layer, seed, 64, plan.top);
     std::mt19937 random(seed ^ 0x5bd1e995u);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -397,6 +401,10 @@ int main() {
         {"wide", 26000, ops::kv_stream_minimum_slots(16), 21000, 120, {1, 5, 9, 16}, true, true},
         // Single steps replayed from one captured graph.
         {"graph", 20000, ops::kv_stream_minimum_slots(1), 9000, 120, {1}, false, false, true},
+        // A raised selection budget: every query holds 1024 selected blocks, so the pool must
+        // hold width * 1025 slots and the resolve's stride follows the selection's own width.
+        {"budget", 26000, ops::kv_stream_minimum_slots(1, 1024 + 1), 24000, 120, {1}, false, false,
+         false, 1024},
     };
     int failures = 0;
     std::uint32_t seed = 7300;

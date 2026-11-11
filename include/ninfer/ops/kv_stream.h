@@ -2,6 +2,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/qsa_budget.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -39,8 +40,8 @@ namespace ninfer::ops {
  */
 inline constexpr std::int32_t kKvStreamPageTokens = 4;
 inline constexpr std::int32_t kKvStreamMaxTokens  = 16;
-// The most blocks one query references: its 512 selected blocks and its own incomplete block.
-inline constexpr std::int32_t kKvStreamQueryBlocks = 513;
+// The most blocks one query references: its selected blocks and its own incomplete block.
+inline constexpr std::int32_t kKvStreamQueryBlocks = kQsaTopBlocksDefault + 1;
 
 struct KvStreamMap {
     std::int32_t* table      = nullptr; // [blocks] block -> slot, or -1
@@ -53,9 +54,12 @@ struct KvStreamMap {
     std::int32_t blocks = 0, slots = 0;
 };
 
-// The slots a pool needs so that one call of `tokens` queries always fits.
-[[nodiscard]] constexpr std::int32_t kv_stream_minimum_slots(std::int32_t tokens) noexcept {
-    return tokens * kKvStreamQueryBlocks;
+// The slots a pool needs so that one call of `tokens` queries always fits, each query holding
+// `query_blocks` blocks (its selection plus its own incomplete block).
+[[nodiscard]] constexpr std::int32_t
+kv_stream_minimum_slots(std::int32_t tokens,
+                        std::int32_t query_blocks = kKvStreamQueryBlocks) noexcept {
+    return tokens * query_blocks;
 }
 
 // Device bytes of one map, and the map laid out in `memory` (256-byte aligned, that many bytes).
@@ -65,9 +69,10 @@ struct KvStreamMap {
 // Every block evicted, every slot free, the counters zero. Capturable.
 void kv_stream_reset(const KvStreamMap& map, cudaStream_t stream);
 
-// See above. `selected` I32 [512, tokens] and `counts` I32 [tokens] are the indexer's blocks,
-// `first_position` a device I32 word; `host` the host copy (identity layout), `pool` the device
-// pool (its block_table the map's table). Capturable: every size it launches with is fixed.
+// See above. `selected` I32 [top_blocks, tokens], its width the indexer's budget, and `counts`
+// I32 [tokens] are the indexer's blocks, `first_position` a device I32 word; `host` the host copy
+// (identity layout), `pool` the device pool (its block_table the map's table). Capturable: every
+// size it launches with is fixed; the selection width is read from `selected`.
 void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const Tensor& selected, const Tensor& counts, const PagedKVLayerView& host,
                        const PagedKVLayerView& pool, cudaStream_t stream);
