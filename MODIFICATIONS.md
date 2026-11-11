@@ -14,7 +14,7 @@ authoritative record.
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
 | Fork baseline | `c1d98a69` imports upstream master at `8327e99c98b7` (2026-11-05) |
-| Upstream sync | two merges: `cc415771` took `64bd1115` (137 commits), `ea30b646` took `2207ee04` |
+| Upstream sync | two merges: `cc415771` took `64bd1115` (137 commits), `1c747d57` took `2207ee04` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -57,15 +57,17 @@ offered under the same Apache-2.0 license.
 | `dfc501c5` | 2026-11-11 | tools: add QSA-27B one-shot converter and the external PCIe benchmark driver |
 | `b38838a2` | 2026-11-11 | engine: resolve QSA --kv-resident "auto" from the upstream preset |
 | `99faf43e` | 2026-11-11 | docs: attribute the QSA fork in README and add MODIFICATIONS.md |
-| `75eba4ea` | 2026-11-11 | docs: plan the QSA history window and record the current fork |
-| `e6b88ce3` | 2026-11-11 | ops: take the QSA selection budget at run time |
-| `b3c716c8` | 2026-11-11 | engine: apply --qsa-history-tokens to the QSA selection budget |
-| `89db8d9c` | 2026-11-11 | flags: expose --qsa-history-tokens in all three entry points |
-| `907e8446` | 2026-11-11 | docs: document the QSA history window and mark the plan done |
-| `b9a5c8ee` | 2026-11-11 | engine: raise the QSA history cap to 32K tokens |
-| `b25aa6a4` | 2026-11-11 | serve: log the QSA history window and where it came from |
-| `a9557df0` | 2026-11-11 | ops: size the QSA split grid from the call's budget, not the cap |
-| `a13fabeb` | 2026-11-11 | flags: count the QSA history window in blocks |
+| `2d9a1dde` | 2026-11-11 | docs: plan the QSA history window and record the current fork |
+| `8fb368fe` | 2026-11-11 | ops: take the QSA selection budget at run time |
+| `356c2f6d` | 2026-11-11 | engine: apply --qsa-history-tokens to the QSA selection budget |
+| `34f65aed` | 2026-11-11 | flags: expose --qsa-history-tokens in all three entry points |
+| `a96630c1` | 2026-11-11 | docs: document the QSA history window and mark the plan done |
+| `8c4177f0` | 2026-11-11 | engine: raise the QSA history cap to 32K tokens |
+| `8a0b56a9` | 2026-11-11 | serve: log the QSA history window and where it came from |
+| `a0edc938` | 2026-11-11 | ops: size the QSA split grid from the call's budget, not the cap |
+| `7e02815e` | 2026-11-11 | flags: count the QSA history window in blocks |
+| `14fd1c32` | 2026-11-11 | docs: record the QSA history window and tabulate its measurements |
+| `b7e39f8d` | 2026-11-11 | docs: keep the planning document out of the repository |
 
 ## Change summary
 
