@@ -1521,11 +1521,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                 "qwen38_27b_qsa supports only the model's own MTP speculative backend "
                 "(DFlash/DFlash2/DSpark are not wired to the QSA indexer)");
         }
-        // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns, and
-        // its pool is sized width * (budget + 1) blocks, budget the indexer's selection
-        // width (512 blocks, wider with --qsa-top-blocks). Cap the widest
-        // verification when --kv-resident actually streams (a wider call takes the
-        // staging route).
+        // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns. The pool's
+        // automatic floor is budget + ceil(width / 4) blocks (consecutive verify columns
+        // share their selections); budget is the indexer's selection width, 512 blocks by
+        // default and wider with --qsa-top-blocks. Cap the widest verification when
+        // --kv-resident actually streams (a wider call takes the staging route).
         if (resolved_kv_resident_positions(options) != 0) {
             const std::uint32_t widest = std::max(options.speculative.draft_tokens,
                                                   options.speculative.ngram_draft_tokens);
@@ -1695,18 +1695,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->steering_vectors    = inputs.steering_vectors;
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
-        // Mirror qwen4_exp's stream sizing: a resolve needs width * (budget + 1) slots,
-        // and streaming only pays off while the pool is smaller than the context.
+        // A verification's width queries sit at consecutive positions, so their indexer
+        // selections overlap: the distinct blocks the pool must hold are one query's budget
+        // plus the blocks the call itself writes, ceil(width / 4). MTP raises the H2D traffic
+        // of a resolve (every column reads the same history again), not the resident set.
+        // kv_stream_minimum_slots() keeps its disjoint-selection worst case for direct callers
+        // and tests; the engine's automatic floor assumes the overlapping case. An explicit
+        // --kv-resident larger than this floor is still honoured.
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
+        const std::uint32_t written_blocks =
+            (width + static_cast<std::uint32_t>(ops::kKvStreamPageTokens) - 1U) /
+            static_cast<std::uint32_t>(ops::kKvStreamPageTokens);
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
-            static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
-                static_cast<std::int32_t>(width), static_cast<std::int32_t>(budget) + 1)));
+            budget + written_blocks);
         const std::uint32_t pages = page_count(inputs.capacity);
         if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
             impl->stream_slots  = slots;
@@ -1717,13 +1724,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                       ? inputs.parameters->model.config()
                                             .text.attention->num_key_value_heads
                                       : 0;
+            // The overlapping-selection floor is below the disjoint worst case. Say so once at
+            // startup so an operator can widen --kv-resident if a run ever reports overflow.
+            const std::uint32_t worst_case = static_cast<std::uint32_t>(
+                ops::kv_stream_minimum_slots(static_cast<std::int32_t>(width),
+                                             static_cast<std::int32_t>(budget) + 1));
+            if (width > 1U && slots < worst_case) {
+                impl->stream_warning =
+                    "QSA streamed KV pool of " + std::to_string(slots) +
+                    " blocks assumes verification columns share their indexer selections; "
+                    "disjoint selections would need " + std::to_string(worst_case) +
+                    " blocks. Raise --kv-resident if a call ever reports kv_stream overflow.";
+            }
         } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
             // A wider selection multiplies the slots a resolve must hold. Saying so is the
             // difference between an unexplained loss of streaming and a knob the user can turn.
             impl->stream_warning =
                 "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
-                " tokens: a streamed call holds " + std::to_string(budget + 1U) +
-                " blocks per query, so the " + std::to_string(inputs.capacity) +
+                " tokens: a streamed call holds " + std::to_string(budget + written_blocks) +
+                " blocks (one selection plus the columns written), so the " +
+                std::to_string(inputs.capacity) +
                 "-token context no longer fits the --kv-resident pool and every full-attention "
                 "layer keeps its KV resident; a smaller --max-context or "
                 "--qsa-top-blocks restores streaming";

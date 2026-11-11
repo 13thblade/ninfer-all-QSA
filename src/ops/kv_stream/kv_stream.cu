@@ -368,7 +368,14 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const std::int32_t tokens = selected.ne[1];
     const std::int32_t stride = selected.ne[0];
     require(tokens <= kKvStreamMaxTokens, "a resolved call has at most 16 queries");
-    require(map.slots >= kv_stream_minimum_slots(tokens, stride + 1),
+    // Verification columns are consecutive positions, so their selections overlap: the distinct
+    // blocks a call needs are one query's selection plus the blocks the call itself writes.
+    // kv_stream_minimum_slots() keeps the disjoint worst-case guarantee for direct callers and
+    // tests; the engine's automatic floor and this check use the overlapping case. If a call's
+    // actual union ever exceeds the pool, resolve_kernel records control[3] = 1 (see step 4).
+    const std::int32_t written_blocks =
+        (tokens + kKvStreamPageTokens - 1) / kKvStreamPageTokens;
+    require(map.slots >= stride + written_blocks,
             "the pool cannot hold the blocks of one call");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,

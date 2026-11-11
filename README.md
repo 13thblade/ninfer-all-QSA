@@ -25,7 +25,7 @@
 | `--qsa-top-blocks N` | 每个 token 可见的历史块数，1 块 = 4 token。值越大越接近 dense，但 prefill 时间大致随块数线性增长。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
-`--kv-resident` 的池子至少要容纳 `验证宽度 × (块数 + 1)` 个块。典型用法：
+`--kv-resident` 的自动下限是 `块数 + 向上取整(验证宽度 / 4)` 个块：验证列是连续位置，选块高度重合，开启 MTP 只增加每步从 host 池提取的流量，不增加需常驻的不同块数。显式给更大的值仍会生效。典型用法：
 
 ```bash
 # 启用QSA + 2048 token 注意力窗口 + KV 全驻留
@@ -88,7 +88,7 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over. A wider window moves towards dense, at a prefill cost that grows roughly with the block count. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 
-The `--kv-resident` pool must hold at least `verification width × (blocks + 1)` blocks. Typical use:
+The `--kv-resident` pool's automatic floor is `blocks + ceil(verification width / 4)` blocks: verification columns are consecutive positions whose selections overlap, so MTP raises the H2D traffic of a resolve rather than the distinct blocks that must stay resident. An explicit larger value still takes effect. Typical use:
 
 ```bash
 # QSA on, a 2048-token attention window, every layer's KV resident
