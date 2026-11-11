@@ -165,6 +165,23 @@ int run_tests() {
                               "CLI accepted an invalid --kv-resident");
         }
     }
+    {
+        // --qsa-history-tokens: a multiple of 4 within the ops' 8192-token cap.
+        const auto history = [&](std::vector<std::string> tail) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            return parse(args).qsa_history_tokens;
+        };
+        failures += check(history({}) == 0U && history({"--qsa-history-tokens", "4096"}) == 4096U &&
+                              history({"--qsa-history-tokens", "8192"}) == 8192U &&
+                              history({"--qsa-history-tokens", "4096", "--kv-resident", "16384"}) ==
+                                  4096U,
+                          "CLI did not preserve --qsa-history-tokens");
+        for (const auto* value : {"5003", "8196", "8192x", "-4", ""}) {
+            failures += check(rejects([&] { (void)history({"--qsa-history-tokens", value}); }),
+                              "CLI accepted an invalid --qsa-history-tokens");
+        }
+    }
     for (const auto* share : {"0", "0.25", "1"}) {
         const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-residency", "host", "--expert-dma-share", share,

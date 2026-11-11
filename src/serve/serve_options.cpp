@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
+#include "product/qsa_history_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -223,8 +224,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --qwen38-27b-qsa              Qwen3.8-27B: run the QSA sparse attention branch\n"
            "                                of every full-attention layer; needs the\n"
            "                                artifact's block indexer and one concurrent\n"
-           "                                request; works with the model's own MTP drafts\n"
-           "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
+           "                                request; works with the model's own MTP drafts\n" +
+           std::string(product::kQsaHistoryTokensHelp) +
+                      "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
            "ROUTER (several models, llama.cpp-compatible; give no artifact path)\n"
@@ -1181,6 +1183,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
                                               [&] { return require_value(arg.c_str()); })) {
+            continue;
+        }
+        if (product::parse_qsa_history_tokens_option(arg, options.qsa_history_tokens,
+                                                      [&] { return require_value(arg.c_str()); })) {
             continue;
         }
         if (arg == "--stage-layers") {
