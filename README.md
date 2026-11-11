@@ -1,3 +1,18 @@
+# Ninfer for Qwen3.8-27B-QSA
+
+# 中文
+
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型为Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token只需看到2048个历史token，可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题
+模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
+
+支持Qwen3.8-27B的ViT和MTP，暂不支持Dflash2
+
+后续计划：
+1. 更新正在上传；
+2. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
+3. QSA注意力每token原生仅能看到2048个历史token，损失可能较大，将把它改为可调的；
+4. 提供Dflash2和Dspine草稿的支持。
+
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
