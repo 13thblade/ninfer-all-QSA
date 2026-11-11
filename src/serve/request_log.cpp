@@ -913,6 +913,9 @@ std::string format_server_start_json(
                                                ? Json(*memory.cuda_graph_measured_bytes)
                                                : Json(nullptr)},
              {"kv_payload_bytes", memory.kv_payload_bytes},
+              {"kv_mtp_payload_bytes", memory.kv_mtp_payload_bytes},
+              {"kv_stream_staging_bytes", memory.kv_stream_staging_bytes},
+              {"kv_stream_host_pinned_bytes", memory.kv_stream_host_pinned_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_state_image_bytes", memory.host_state_image_bytes},

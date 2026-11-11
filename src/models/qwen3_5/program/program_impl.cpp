@@ -277,6 +277,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       mtp_attention_window(plan.mtp_attention_window), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      mtp_kv_payload_bytes(plan.persistent.decoder.mtp_kv
+                              ? plan.persistent.decoder.mtp_kv->payload_bytes()
+                              : 0),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, parameters_in, plan,
                              expert_runtime && expert_runtime->elastic() && device_in.size() == 1)),
@@ -1255,6 +1258,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_measured_bytes    = graph_measured_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.kv_mtp_payload_bytes         = mtp_kv_payload_bytes;
+    if (qsa_stream_state.has_value()) {
+        out.kv_stream_staging_bytes     = qsa_stream_state->staging_bytes;
+        out.kv_stream_host_pinned_bytes = qsa_stream_state->host_bytes;
+    }
     out.host_state_image_bytes       = state_images->host_layout().image_bytes;
     out.host_kv_page_group_bytes     = text_host_kv_page_stride;
     out.host_cache_budget_bytes      = context_cache.host_cache_budget_bytes.value_or(0);

@@ -239,16 +239,25 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.features.mtp() && parameters.mtp && !parameters.mtp->rank_attention.empty()) {
         mtp_kv_head_shares = kv_head_shares;
     }
+    // --kv-resident under QSA: the authoritative KV of every full-attention layer lives in
+    // pinned host memory at the full history size, and a wide prefill stages that history into
+    // one shared 64-position device layer before reading it densely. Keep exactly one device
+    // layer instead of sixteen. Neither device pool may shrink below the full history -- the
+    // staging layer holds ceil(F / 64) pages at frontier F, and the MTP pool reads its complete
+    // history on every verification (dense, never streamed) -- and neither needs the Main page
+    // capacity, which grafts and extra lanes push above the history: under stream both pools
+    // are pinned to the logical page count.
+    const std::uint32_t text_page_groups =
+        plan.stream_slots != 0 ? logical_pages : physical_pages;
+    const std::uint32_t mtp_page_groups =
+        plan.stream_slots != 0
+            ? static_cast<std::uint32_t>(
+                  checked_i32(static_cast<std::uint64_t>(logical_pages) + mtp_extra_pages,
+                              "MTP Paged KV physical pages exceed int32"))
+            : mtp_physical_pages;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
         builder_pointers, qwen3_5::DecoderStateSpec{
-                              // --kv-resident under QSA: the authoritative KV of every
-                              // full-attention layer lives in pinned host memory, and a
-                              // wide call reads one shared 64-position device staging
-                              // layer. Keep exactly one device layer instead of sixteen;
-                              // physical/logical page counts stay unchanged, so the block
-                              // table, graph capture and the independent MTP pool do not
-                              // need to be touched.
                               .full_attention_layers = plan.stream_slots != 0
                                                            ? 1U
                                                            : config.full_attention_layers,
@@ -259,8 +268,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .kv_storage         = plan.kv_storage,
                               .enable_mtp         = plan.features.mtp(),
                               .kv_table_rows      = static_cast<std::int32_t>(plan.max_concurrency),
-                              .text_physical_page_groups = physical_pages,
-                              .mtp_physical_page_groups  = mtp_physical_pages,
+                              .text_physical_page_groups = text_page_groups,
+                              .mtp_physical_page_groups  = mtp_page_groups,
                               .text_layer_rank           = std::move(attention_layer_rank),
                               .text_kv_head_shares       = std::move(kv_head_shares),
                               .text_kv_position_ranks    = kv_position_ranks,

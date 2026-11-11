@@ -970,6 +970,8 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
+    // The MTP draft layer's device KV pool alone (part of kv_payload_bytes); zero without MTP.
+    const std::size_t mtp_kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
     // launch of every executable), for comparison with graph_allowance_bytes; empty when no free

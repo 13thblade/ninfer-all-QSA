@@ -613,6 +613,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         }
     }
 
+    if (memory.kv_stream_host_pinned_bytes != 0) {
+        // --kv-resident under QSA: the staging layer and the MTP pool both address the full
+        // history (a wide prefill stages it, a verification reads it densely), so neither can
+        // shrink below the logical page count. The pinned copy is RAM, not VRAM.
+        logger_->info("kv stream | device staging {} | MTP pool {} | pinned host KV {} (RAM)",
+                      product::format_pretty_bytes(memory.kv_stream_staging_bytes),
+                      product::format_pretty_bytes(memory.kv_mtp_payload_bytes),
+                      product::format_pretty_bytes(memory.kv_stream_host_pinned_bytes));
+    }
+
     if (cache.enabled) {
         // Report what was actually pinned, not what was requested: on Windows the host KV cache
         // is clamped against free VRAM at startup (program_impl.h), and can land at zero while

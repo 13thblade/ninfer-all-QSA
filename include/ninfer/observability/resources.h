@@ -91,6 +91,14 @@ struct MemorySummary {
     // than the card holds), which leaves the difference only a lower bound.
     std::optional<std::size_t> cuda_graph_measured_bytes = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // The MTP draft layer's device KV pool (part of kv_payload_bytes; zero without MTP).
+    std::size_t kv_mtp_payload_bytes              = 0;
+    // --kv-resident under QSA: the one device text-KV layer reused as the shared staging copy,
+    // and the authoritative paged KV pinned in host RAM (not VRAM). Wide prefills stage the full
+    // history into the staging layer, and every MTP verification reads the MTP pool's complete
+    // history, so neither device pool shrinks below the logical page count.
+    std::size_t kv_stream_staging_bytes           = 0;
+    std::size_t kv_stream_host_pinned_bytes       = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
