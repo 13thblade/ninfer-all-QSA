@@ -343,16 +343,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("direct grafts require the legacy context cache");
     }
     if (options.qwen38_27b_qsa && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
-        // The sparse branch keeps its per-layer indexer planes, and under --kv-resident the
-        // authoritative pinned KV copy, in per-Program scratch that the Legacy StateImage does
-        // not carry. A catalogued continuation can therefore resume only while it is that
-        // scratch's last writer: one conversation's own next turn, which is the reuse that
-        // matters (a prompt that only grows) and the only one the scratch can support without
-        // being repooled. Keep exactly that much of the catalog:
+        // The sparse branch keeps its per-layer indexer planes per lane, and under
+        // --kv-resident the authoritative pinned KV copy, in per-Program state that the
+        // Legacy StateImage does not carry. A catalogued continuation can therefore resume
+        // only while it still owns the lane admission will give it (the lowest free one):
+        // one conversation's own next turn, which is the reuse that matters (a prompt that
+        // only grows) and the only one the lane's planes can support without being repooled.
+        // Keep exactly that much of the catalog:
         //  - one Device checkpoint slot, no Host or disk tier: a spilled continuation would come
-        //    back beside a scratch another sequence has since overwritten;
+        //    back beside a lane another sequence has since repooled;
         //  - no anchors and no shared prefixes: every one of them restores a state image at a
-        //    frontier the scratch has already passed;
+        //    frontier the lane's planes have already passed;
         //  - no stop-string hold images, for the same reason (a hold rewinds the state).
         // Under the hybrid cache the indexer planes ride in the StateImage (pooled keys, live
         // tail, tail axes), so a snapshot carries the QSA state out and a resume lands it back;
@@ -983,6 +984,41 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             plan_sequences();
         }
     };
+    // --qwen38-27b-qsa: each lane carries its own KV pages and indexer planes beside its
+    // stream state, so a multi-lane request multiplies the per-lane cost. The generic
+    // resolver's failure hint only names --kv-capacity and --max-context, so when the
+    // explicit window cannot be held on every lane, reject earlier with the lane levers
+    // named (plan: an actionable refusal, not a generic OOM).
+    if (options.qwen38_27b_qsa && options.max_concurrency > 1 &&
+        options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        const auto& base       = planner->capacity_curve();
+        SequenceCapacityCurve fitted = base;
+        if (base.state_slots_automatic && base.bytes_per_state_slot != 0) {
+            // Default slots yield to the capacity, as resolve_kv_capacity would do.
+            while (fitted.state_slots > base.minimum_state_slots &&
+                   !kv_capacity_fits(options.kv_capacity, fitted, free_by_rank.front(),
+                                      extra_free)) {
+                fitted.state_slots -= 1;
+                fitted.minimum_device_reservation_bytes -= base.bytes_per_state_slot;
+                for (auto& rank : fitted.extra_ranks) {
+                    rank.minimum_device_reservation_bytes -= rank.bytes_per_state_slot;
+                }
+            }
+        }
+        if (!kv_capacity_fits(options.kv_capacity, fitted, free_by_rank.front(), extra_free)) {
+            std::string hint = "lower --max-context, or lower --max-concurrency";
+            if (!options.kv_resident_positions.has_value()) {
+                hint += ", or add --kv-resident to move each lane's KV copy from device "
+                        "memory to pinned host memory";
+            }
+            throw std::invalid_argument(
+                "the QSA sparse branch keeps each lane's KV pages and indexer planes beside "
+                "its stream state, and the explicit --max-context window does not fit " +
+                std::to_string(options.max_concurrency) +
+                " concurrent lanes after weights; " + hint);
+        }
+    }
     auto resolution = resolve_capacity();
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {

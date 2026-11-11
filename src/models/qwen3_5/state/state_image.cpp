@@ -454,19 +454,22 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
     }
     if (layout.qsa) {
         const QsaStateDeviceLayout& qsa  = *layout.qsa;
-        const std::uint32_t layers       = static_cast<std::uint32_t>(qsa.planes.size());
-        if (qsa.planes.size() != qsa.tail_axes.size() || qsa.blocks == 0 || qsa.tail == 0) {
+        const std::uint32_t lanes        = qsa.lanes;
+        const std::uint32_t layers       = lanes == 0 ? 0U : static_cast<std::uint32_t>(qsa.planes.size()) / lanes;
+        if (lanes == 0 || qsa.planes.size() != qsa.tail_axes.size() ||
+            qsa.planes.size() != static_cast<std::size_t>(lanes) * layers || qsa.blocks == 0 ||
+            qsa.tail == 0) {
             throw std::invalid_argument("StateImage QSA device layout is incomplete");
         }
-        for (std::size_t layer = 0; layer < qsa.planes.size(); ++layer) {
-            const TensorRegion& plane = qsa.planes[layer];
+        for (std::size_t index = 0; index < qsa.planes.size(); ++index) {
+            const TensorRegion& plane = qsa.planes[index];
             if (plane.dtype != DType::FP32 || plane.shape[0] <= 0 ||
                 plane.shape[1] != static_cast<std::int32_t>(qsa.blocks) + 2U * static_cast<std::int32_t>(qsa.tail) ||
-                qsa.tail_axes[layer].dtype != DType::I32 || qsa.tail_axes[layer].shape[0] != 3 ||
-                qsa.tail_axes[layer].shape[1] != 3) {
+                qsa.tail_axes[index].dtype != DType::I32 || qsa.tail_axes[index].shape[0] != 3 ||
+                qsa.tail_axes[index].shape[1] != 3) {
                 throw std::invalid_argument("StateImage QSA device layout has an invalid plane");
             }
-            if (layer != 0 && (qsa.planes[layer].shape[0] != qsa.planes[0].shape[0])) {
+            if (index != 0 && (qsa.planes[index].shape[0] != qsa.planes[0].shape[0])) {
                 throw std::invalid_argument("StateImage QSA device planes differ across layers");
             }
         }
@@ -481,18 +484,18 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
         throw std::invalid_argument("StateImage host layout does not match its device components");
     }
     if (layout.qsa) {
-        // The planes stay on rank 0 with the continuation hidden; the image reads and writes
-        // them through the pool, one shared set, on whatever slot's image is being moved.
+        // The planes stay on rank 0 with the continuation hidden, one shared set per lane; the
+        // image reads and writes them through the pool, on whatever slot's image is being moved.
         qsa_pooled_.reserve(layout.qsa->planes.size());
         qsa_tail_.reserve(layout.qsa->planes.size());
         qsa_tail_axes_.reserve(layout.qsa->planes.size());
-        for (std::size_t layer = 0; layer < layout.qsa->planes.size(); ++layer) {
-            const Tensor region = layout.qsa->planes[layer].bind(backings.front());
+        for (std::size_t index = 0; index < layout.qsa->planes.size(); ++index) {
+            const Tensor region = layout.qsa->planes[index].bind(backings.front());
             qsa_pooled_.push_back(region.slice(1, 0, static_cast<std::int32_t>(layout.qsa->blocks)));
             qsa_tail_.push_back(region.slice(
                 1, static_cast<std::int32_t>(layout.qsa->blocks),
                 static_cast<std::int32_t>(layout.qsa->tail)));
-            qsa_tail_axes_.push_back(layout.qsa->tail_axes[layer].bind(backings.front()));
+            qsa_tail_axes_.push_back(layout.qsa->tail_axes[index].bind(backings.front()));
         }
     }
     if (layout.dflash_local) {
@@ -609,21 +612,28 @@ void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layo
     }
 }
 
-// Visits the shared QSA planes as (rank, device pointer, packed host offset, bytes): every
-// full-attention layer's pooled prefix, live tail and tail axes, pooled first.
+// Visits the shared QSA planes of `qsa_lane` as (rank, device pointer, packed host offset,
+// bytes): every full-attention layer's pooled prefix, live tail and tail axes, pooled first.
 template <class Visit>
-void StateImageDevicePool::for_each_qsa_component(Visit&& visit) const {
+void StateImageDevicePool::for_each_qsa_component(std::uint32_t qsa_lane, Visit&& visit) const {
     if (!host_layout_.spec.qsa) { return; }
-    for (std::uint32_t layer = 0; layer < host_layout_.spec.qsa->layers; ++layer) {
-        visit(std::size_t{0}, qsa_pooled_[layer].data,
+    const std::uint32_t layers = host_layout_.spec.qsa->layers;
+    if (layers == 0 || qsa_pooled_.size() % layers != 0 ||
+        qsa_lane >= qsa_pooled_.size() / layers) {
+        throw std::invalid_argument("StateImage QSA lane is outside its device layout");
+    }
+    const std::size_t lane_base = static_cast<std::size_t>(qsa_lane) * layers;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const std::size_t index = lane_base + layer;
+        visit(std::size_t{0}, qsa_pooled_[index].data,
               host_layout_.qsa_pooled->offset + layer * host_layout_.qsa_pooled_layer_bytes,
-              qsa_pooled_[layer].bytes());
-        visit(std::size_t{0}, qsa_tail_[layer].data,
+              qsa_pooled_[index].bytes());
+        visit(std::size_t{0}, qsa_tail_[index].data,
               host_layout_.qsa_tail->offset + layer * host_layout_.qsa_tail_layer_bytes,
-              qsa_tail_[layer].bytes());
-        visit(std::size_t{0}, qsa_tail_axes_[layer].data,
+              qsa_tail_[index].bytes());
+        visit(std::size_t{0}, qsa_tail_axes_[index].data,
               host_layout_.qsa_tail_axes->offset + layer * host_layout_.qsa_tail_axes_layer_bytes,
-              qsa_tail_axes_[layer].bytes());
+              qsa_tail_axes_[index].bytes());
     }
 }
 
@@ -687,7 +697,8 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
 }
 
 void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView destination,
-                                        RankStreams streams, cudaStream_t qsa_stream) const {
+                                        RankStreams streams, cudaStream_t qsa_stream,
+                                        std::uint32_t qsa_lane) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
     // Each shard's layers land at their global offsets in the one host image.
@@ -732,13 +743,14 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                 v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
         }
     }
-    // The shared QSA planes ride on the caller's own stream when it ordered the call's writes:
-    // a capture must read them before the next call repools them, which the rank 0 stream of a
-    // caller that runs beside the live sequence does not guarantee.
+    // The shared QSA planes of the capturing lane ride on the caller's own stream when it
+    // ordered the call's writes: a capture must read them before the lane's next call repools
+    // them, which the rank 0 stream of a caller that runs beside the live sequence does not
+    // guarantee.
     if (host_layout_.qsa_pooled) {
         const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : stream;
         for_each_qsa_component(
-            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+            qsa_lane, [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     byte_offset(destination.data, offset), device, bytes,
                     cudaMemcpyDeviceToHost, qsa_copy));
@@ -747,7 +759,8 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
 }
 
 void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::int32_t destination,
-                                          RankStreams streams, cudaStream_t qsa_stream) {
+                                          RankStreams streams, cudaStream_t qsa_stream,
+                                          std::uint32_t qsa_lane, bool include_qsa) {
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
@@ -795,12 +808,14 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                 v.bytes(), cudaMemcpyHostToDevice, stream));
         }
     }
-    // The image's QSA region lands in the shared planes; the slot argument names the GDN state's
-    // home, not the QSA state's. The caller orders this stream ahead of the resumed pass.
-    if (host_layout_.qsa_pooled) {
+    // The image's QSA region lands in the destination lane's shared planes; the slot argument
+    // names the GDN state's home, not the QSA state's. The caller orders this stream ahead of
+    // the resumed pass. A checkpoint image staged beside the live lanes keeps its QSA state in
+    // the Host replica and leaves the planes alone.
+    if (include_qsa && host_layout_.qsa_pooled) {
         const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : stream;
         for_each_qsa_component(
-            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+            qsa_lane, [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     device, byte_offset(source.data, offset), bytes, cudaMemcpyHostToDevice,
                     qsa_copy));
@@ -839,7 +854,8 @@ void validate_segments(std::size_t segment_count, std::size_t segment_bytes,
 void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
                                                   std::span<std::byte* const> segments,
                                                   std::size_t segment_bytes, RankStreams streams,
-                                                  bool include_qsa, cudaStream_t qsa_stream) const {
+                                                  bool include_qsa, cudaStream_t qsa_stream,
+                                                  std::uint32_t qsa_lane) const {
     validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
     for_each_host_component(
@@ -857,7 +873,7 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
         const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : streams[0];
         const HoldingDeviceBinding bind(rank_devices_[0]);
         for_each_qsa_component(
-            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+            qsa_lane, [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
                 split_segments(
                     offset, bytes, segment_bytes,
                     [&](std::size_t segment, std::size_t within, std::size_t done,
@@ -873,21 +889,24 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
                                                     std::size_t segment_bytes,
                                                     std::int32_t destination, RankStreams streams,
-                                                    cudaStream_t qsa_stream) {
+                                                    cudaStream_t qsa_stream,
+                                                    std::uint32_t qsa_lane) {
     for (std::uint32_t layer = 0; layer < host_layout_.spec.linear.layers; ++layer) {
         copy_from_host_segments(
             segments, segment_bytes, destination,
             StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, streams,
-            nullptr);
+            nullptr, qsa_lane);
     }
     copy_from_host_segments(segments, segment_bytes, destination,
-                            StateImagePart{.kind = StateImagePart::Kind::Rest}, streams, qsa_stream);
+                            StateImagePart{.kind = StateImagePart::Kind::Rest}, streams, qsa_stream,
+                            qsa_lane);
 }
 
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
                                                     std::size_t segment_bytes,
                                                     std::int32_t destination, StateImagePart part,
-                                                    RankStreams streams, cudaStream_t qsa_stream) {
+                                                    RankStreams streams, cudaStream_t qsa_stream,
+                                                    std::uint32_t qsa_lane) {
     validate_slot(destination, slot_count(),
                   "StateImage segmented H2D destination is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
@@ -907,7 +926,7 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
         const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : streams[0];
         const HoldingDeviceBinding bind(rank_devices_[0]);
         for_each_qsa_component(
-            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+            qsa_lane, [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
                 split_segments(
                     offset, bytes, segment_bytes,
                     [&](std::size_t segment, std::size_t within, std::size_t done,

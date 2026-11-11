@@ -57,23 +57,24 @@ struct SteeringRankLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
-    // --qwen38-27b-qsa: one FP32 plane per full-attention layer on rank 0, holding the
-    // pooled block keys, the incomplete block's tail, and a scratch tail for speculative
-    // verification. Empty without the flag.
+    // --qwen38-27b-qsa: one FP32 plane per (lane, full-attention layer) on rank 0, in
+    // lane-major order, holding the pooled block keys, the incomplete block's tail, and
+    // a scratch tail for speculative verification. Empty without the flag.
     std::vector<TensorLayout> qsa_indexer;
-    // One I32 [3, 3] plane per full-attention layer: interleaved M-RoPE axis
-    // positions of the incomplete block's three tail slots, needed when a
-    // completed block starts inside the previous call's tail.
+    // One I32 [3, 3] plane per (lane, layer): interleaved M-RoPE axis positions of the
+    // incomplete block's three tail slots, needed when a completed block starts inside
+    // the previous call's tail.
     std::vector<TensorLayout> qsa_tail_axes;
-    // --kv-resident under QSA: one device region per full-attention layer holding
-    // the four-token-page KV pool (all K/V and scale planes concatenated), plus
-    // the layer's KvStreamMap words and a shared identity block table for the
+    // --kv-resident under QSA: one device region per (lane, layer) holding the
+    // four-token-page KV pool (all K/V and scale planes concatenated), plus the
+    // (lane, layer)'s KvStreamMap words and a shared identity block table for the
     // pinned host copy. Empty when streaming is off.
     std::vector<TensorLayout> qsa_stream_pool;
     std::vector<TensorLayout> qsa_stream_map;
     std::optional<TensorLayout> qsa_stream_identity;
-    // The verification's indexer projections (BF16 [640, layers * record_width]) and its
-    // first position (I32 [1]), both at stable addresses for captured decode graphs.
+    // The verification's indexer projections (BF16 [640, lanes * layers * record_width],
+    // (lane, layer) blocks in layer-major order) and its first position (I32 [lanes]),
+    // both at stable addresses for captured decode graphs.
     std::optional<TensorLayout> qsa_index_records;
     std::optional<TensorLayout> qsa_first_position;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.

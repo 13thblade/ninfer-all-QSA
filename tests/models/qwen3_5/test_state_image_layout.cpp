@@ -45,28 +45,32 @@ q36::StateImageDeviceLayout plan(bool dflash) {
     return q36::plan_state_image_device_pool(builder, spec);
 }
 
-q36::StateImageDeviceLayout plan_qsa() {
+q36::StateImageDeviceLayout plan_qsa(std::uint32_t lanes = 1) {
     q36::StateImageSpec spec = base_spec();
     spec.qsa                 = q36::QsaStateSpec{.layers = 3, .head_dim = 16, .blocks = 7, .tail = 3};
     ninfer::LayoutBuilder builder;
     q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     // As startup.cpp does: the shared indexer planes live on rank 0 (pooled prefix, live tail
-    // and scratch tail in one combined plane per layer, plus the tail axes), and the image's QSA
-    // region binds them.
+    // and scratch tail in one combined plane per (lane, layer), plus the tail axes), and the
+    // image's QSA region binds them in lane-major order (lane * layers + layer).
     std::vector<ninfer::TensorRegion> planes;
     std::vector<ninfer::TensorRegion> axes;
-    for (std::uint32_t layer = 0; layer < spec.qsa->layers; ++layer) {
-        (void)layer;
-        planes.push_back(builder.add_tensor(
-            ninfer::DType::FP32,
-            {spec.qsa->head_dim,
-             static_cast<std::int32_t>(spec.qsa->blocks + 2U * spec.qsa->tail)},
-            256, "QSA indexer pooled keys, tail and scratch"));
-        axes.push_back(builder.add_tensor(ninfer::DType::I32, {3, 3}, 256,
-                                          "QSA indexer tail M-RoPE axes"));
+    for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+        for (std::uint32_t layer = 0; layer < spec.qsa->layers; ++layer) {
+            (void)lane;
+            (void)layer;
+            planes.push_back(builder.add_tensor(
+                ninfer::DType::FP32,
+                {spec.qsa->head_dim,
+                 static_cast<std::int32_t>(spec.qsa->blocks + 2U * spec.qsa->tail)},
+                256, "QSA indexer pooled keys, tail and scratch"));
+            axes.push_back(builder.add_tensor(ninfer::DType::I32, {3, 3}, 256,
+                                              "QSA indexer tail M-RoPE axes"));
+        }
     }
     layout.qsa = q36::QsaStateDeviceLayout{.planes    = std::move(planes),
                                            .tail_axes = std::move(axes),
+                                           .lanes     = lanes,
                                            .blocks    = spec.qsa->blocks,
                                            .tail      = spec.qsa->tail};
     return layout;
@@ -131,6 +135,26 @@ int main() {
            "QSA StateImage work does not add one pooled, tail and axes copy per layer");
     expect(qsa.host.image_bytes >= qsa_work.payload_bytes,
            "QSA StateImage host image is smaller than its payload");
+
+    // Two lanes: the device binding gains a second set of shared planes in lane-major order,
+    // while the image itself still holds one lane's worth of state (captured out of, and
+    // restored into, the named lane's planes).
+    const q36::StateImageDeviceLayout qsa_two = plan_qsa(2);
+    const auto qsa_two_work                   = q36::state_image_transfer_work(qsa_two.host);
+    expect(qsa_two.qsa && qsa_two.qsa->lanes == 2 && qsa_two.qsa->planes.size() == 6 &&
+               qsa_two.qsa->tail_axes.size() == 6,
+           "two-lane QSA device layout binds one plane and tail axes per (lane, layer)");
+    expect(qsa_two.host.spec.qsa && qsa_two.host.qsa_pooled && qsa_two.host.qsa_tail &&
+               qsa_two.host.qsa_tail_axes &&
+               qsa_two.host.qsa_pooled->bytes == 3 * qsa_two.host.qsa_pooled_layer_bytes,
+           "a two-lane image still holds one lane's pooled state");
+    const std::uint64_t qsa_two_bytes =
+        std::uint64_t(qsa_two.host.qsa_pooled_layer_bytes + qsa_two.host.qsa_tail_layer_bytes +
+                      qsa_two.host.qsa_tail_axes_layer_bytes) *
+        qsa_two.host.spec.qsa->layers;
+    expect(qsa_two_work.payload_bytes == common_work.payload_bytes + qsa_two_bytes &&
+               qsa_two_work.copy_operations == common_work.copy_operations + 3 * 3,
+           "two-lane QSA StateImage work is still one lane's worth of QSA state");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -54,12 +54,16 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                          std::uint32_t lane) {
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     card.set_qsa_indexer(execution.qsa_indexer);
+    // --qwen38-27b-qsa: a single-sequence call binds the one lane the sparse branch
+    // scores, appends and reads on.
+    card.set_sequence_lanes(std::span<const std::uint32_t>(&lane, 1));
     card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
@@ -106,7 +110,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent, state.lane);
     card.set_readout(state.readout_count);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -140,7 +144,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent, state.lane);
     card.set_readout(state.readout_count);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -1020,68 +1024,86 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                                                   compute_streams[state_images->shard(shard).rank]);
         }
 
-        // --qwen38-27b-qsa: a verification pooled into a scratch tail, so the live
-        // indexer state is still at the pre-verification frontier. Re-pool exactly
-        // the accepted columns: rejected drafts never enter pooled/tail, and the
-        // blocks they completed are overwritten with the accepted prefix here.
+        // --qwen38-27b-qsa: a verification pooled into its lane's scratch tail, so the
+        // live indexer state is still at the pre-verification frontier. Per lane,
+        // re-pool exactly the accepted columns: rejected drafts never enter pooled/tail,
+        // and the blocks they completed are overwritten with the accepted prefix here.
         if (qsa_indexer_state && qsa_indexer_state->record_width != 0) {
-            if (lanes.size() != 1) {
-                throw std::logic_error("QSA speculative commit admits one lane");
-            }
             qwen3_5::QsaIndexerState& qsa = *qsa_indexer_state;
             const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
-            const std::uint32_t committed = cancelled[0] ? 0U : accepted_tokens[0];
-            if (committed > qsa.record_width) {
-                throw std::logic_error("QSA speculative commit exceeds its record width");
-            }
-            if (committed != 0) {
-                const float eps = parameters.model.config().text.rms_norm_eps;
-                std::uint32_t full = 0;
-                for (const auto& block : parameters.text.layers) {
-                    const auto* attention =
-                        std::get_if<execution::AttentionParameters>(&block.mixer);
-                    if (attention == nullptr || !attention->qsa) { continue; }
-                    const execution::QsaIndexerParameters& index = *attention->qsa;
-                    qwen3_5::QsaIndexerLayerState& state = qsa.layers.at(full);
-                    const Tensor projection = qsa.records.slice(
-                        1, static_cast<std::int32_t>(full * qsa.record_width),
-                        static_cast<std::int32_t>(committed));
-                    const ops::QsaIndexerWeights weights{&index.query_norm, &index.key_norm,
-                                                         &index.key_pre_norm};
-                    // The accepted verification columns are text tokens, so their
-                    // three axes are equal: leave rope_positions null but keep the
-                    // persistent tail axis plane in step with the live tail.
-                    const ops::QsaIndexerPositions positions{nullptr, &state.tail_axes, nullptr};
-                    ops::qsa_indexer_append(projection, qsa.first_position, weights, eps, rope_yarn,
-                                            state.pooled, state.tail, stream, positions);
-                    ++full;
+            const std::uint32_t layers = qsa.lane_states[0].layers.size();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint32_t lane      = lanes[row];
+                const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
+                if (committed > qsa.record_width) {
+                    throw std::logic_error("QSA speculative commit exceeds its record width");
                 }
-                if (full != qsa.layers.size()) {
-                    throw std::logic_error("QSA speculative commit found an unexpected layer count");
+                const Tensor first_position(
+                    static_cast<std::byte*>(qsa.first_position.data) +
+                        lane * sizeof(std::int32_t),
+                    DType::I32, {1});
+                if (committed != 0) {
+                    const float eps = parameters.model.config().text.rms_norm_eps;
+                    qwen3_5::QsaIndexerLaneState& lane_state = qsa.lane_states[lane];
+                    std::uint32_t full = 0;
+                    for (const auto& block : parameters.text.layers) {
+                        const auto* attention =
+                            std::get_if<execution::AttentionParameters>(&block.mixer);
+                        if (attention == nullptr || !attention->qsa) { continue; }
+                        const execution::QsaIndexerParameters& index = *attention->qsa;
+                        qwen3_5::QsaIndexerLayerState& state = lane_state.layers.at(full);
+                        // The (lane, layer)'s record region, layer-major over the lanes.
+                        const std::int32_t region = static_cast<std::int32_t>(
+                            (static_cast<std::uint64_t>(lane) * static_cast<std::uint64_t>(layers) +
+                             static_cast<std::uint64_t>(full)) *
+                            static_cast<std::uint64_t>(qsa.record_width));
+                        const Tensor projection = qsa.records.slice(
+                            1, region, static_cast<std::int32_t>(committed));
+                        const ops::QsaIndexerWeights weights{&index.query_norm, &index.key_norm,
+                                                             &index.key_pre_norm};
+                        // The accepted verification columns are text tokens, so their
+                        // three axes are equal: leave rope_positions null but keep the
+                        // persistent tail axis plane in step with the live tail.
+                        const ops::QsaIndexerPositions positions{nullptr, &state.tail_axes,
+                                                                nullptr};
+                        ops::qsa_indexer_append(projection, first_position, weights, eps,
+                                                rope_yarn, state.pooled, state.tail, stream,
+                                                positions);
+                        ++full;
+                    }
+                    if (full != layers) {
+                        throw std::logic_error(
+                            "QSA speculative commit found an unexpected layer count");
+                    }
                 }
-            }
-            // --kv-resident: the verification already wrote its N columns into
-            // the pinned host copy and resolved them into the device pool. The
-            // rejected tail must not stay resident in KvStreamMap, or a later
-            // narrow call could read stale bytes instead of re-copying from the
-            // host copy. Commit is not a captured graph, so reading the staged
-            // first position back to the host is safe here.
-            if (qsa.stream != nullptr && committed < qsa.record_width) {
-                std::int32_t first_host = 0;
-                CUDA_CHECK(cudaMemcpyAsync(&first_host, qsa.first_position.data,
-                                           sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                                           stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                const std::int32_t first_block =
-                    (first_host + static_cast<std::int32_t>(committed)) /
-                    ops::kKvStreamPageTokens;
-                const std::int32_t end_block =
-                    (first_host + static_cast<std::int32_t>(qsa.record_width) - 1) /
-                        ops::kKvStreamPageTokens +
-                    1;
-                if (end_block > first_block) {
-                    for (const auto& layer : qsa.stream->layers) {
-                        ops::kv_stream_evict(layer.map, first_block, end_block, stream);
+                // --kv-resident: the verification already wrote its N columns into the
+                // lane's pinned host copy and resolved them into the lane's device
+                // pool. The rejected tail must not stay resident in the lane's
+                // KvStreamMap, or a later narrow call could read stale bytes instead of
+                // re-copying from the host copy. Commit is not a captured graph, so
+                // reading the staged first position back to the host is safe here.
+                if (qsa.stream != nullptr && committed < qsa.record_width) {
+                    std::int32_t first_host = 0;
+                    CUDA_CHECK(cudaMemcpyAsync(&first_host, first_position.data,
+                                               sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                               stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    const std::int32_t first_block =
+                        (first_host + static_cast<std::int32_t>(committed)) /
+                        ops::kKvStreamPageTokens;
+                    const std::int32_t end_block =
+                        (first_host + static_cast<std::int32_t>(qsa.record_width) - 1) /
+                            ops::kKvStreamPageTokens +
+                        1;
+                    if (end_block > first_block) {
+                        for (std::uint32_t layer = 0; layer < qsa.stream->layers; ++layer) {
+                            ops::kv_stream_evict(
+                                qsa.stream->layer_states[
+                                    static_cast<std::size_t>(lane) * qsa.stream->layers +
+                                    static_cast<std::size_t>(layer)]
+                                    .map,
+                                first_block, end_block, stream);
+                        }
                     }
                 }
             }
@@ -1444,7 +1466,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            0};
+            0,
+            sequence.lane};
         // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
         // The chunk function takes the events itself: they are a view into the landing batch, and
         // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
@@ -1967,6 +1990,10 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
         std::array<LanePass, kMaximumConcurrency> passes{};
         std::vector<execution::PrefillSegment> pass_segments;
         pass_segments.reserve(segments);
+        // --qwen38-27b-qsa: the row-bound KV view of each segment, in segment order;
+        // the sparse branch appends and reads each part through its own.
+        std::vector<qwen3_5::PagedKVCacheView> qsa_views;
+        if (qsa_indexer_state.has_value()) { qsa_views.reserve(segments); }
         std::int32_t column = 0;
         std::size_t outputs = 0;
         bool logprobs       = false;
@@ -1988,10 +2015,14 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
             if (request.readout_tokens.size() > kMaximumReadoutTokens) {
                 throw std::logic_error("readout token ids exceed the round buffer");
             }
+            const qwen3_5::PagedKVCacheView row_view =
+                qsa_indexer_state.has_value() ? text_kv_view(sequence)
+                                              : qwen3_5::PagedKVCacheView();
             if (pass.prompt != 0) {
                 pass_segments.push_back(execution::PrefillSegment{
                     .ids                    = std::span<const int>(staged.prompt.token_ids)
                                                   .subspan(staged.cursor, pass.prompt),
+                    .lane                   = lane,
                     .begin                  = staged.cursor,
                     .kv_table_row           = kv_row,
                     .state_source_slot      = pass.selectors.source,
@@ -2002,6 +2033,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
                     .readout = branched ? std::span<const std::int32_t>{}
                                         : std::span<const std::int32_t>(request.readout_tokens),
                 });
+                if (qsa_indexer_state.has_value()) { qsa_views.push_back(row_view); }
                 column += static_cast<std::int32_t>(pass.prompt);
                 pass.prompt_end = column;
                 if (!branched) { ++outputs; }
@@ -2021,6 +2053,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
                     }
                     pass_segments.push_back(execution::PrefillSegment{
                         .ids                    = std::span<const int>(branch.tokens),
+                        .lane                   = lane,
                         .begin                  = staged.prompt_tokens,
                         .kv_table_row           = kv_row,
                         .state_source_slot      = block_source,
@@ -2029,6 +2062,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
                         .sampling               = sampling,
                         .readout = std::span<const std::int32_t>(branch.readout_tokens),
                     });
+                    if (qsa_indexer_state.has_value()) { qsa_views.push_back(row_view); }
                     column += static_cast<std::int32_t>(branch.tokens.size());
                     ++outputs;
                 }
@@ -2067,6 +2101,9 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
         card.set_steering(steering.get());
         card.set_rope_yarn(rope_yarn);
         card.set_qsa_indexer(qsa_indexer_state ? &*qsa_indexer_state : nullptr);
+        if (qsa_indexer_state.has_value()) {
+            card.set_qsa_kv_views(std::span<const qwen3_5::PagedKVCacheView>(qsa_views));
+        }
         card.set_fast_prefill_kernel(fast_prefill_kernel);
         card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);
         timing.pause();

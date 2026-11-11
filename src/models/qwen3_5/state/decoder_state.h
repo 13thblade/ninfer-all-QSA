@@ -15,13 +15,13 @@ namespace ninfer::models::qwen3_5 {
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
 
-// The QSA-27B block indexer state of one full-attention layer, one copy on rank 0: the
-// sequence's pooled block keys by block, and the raw keys of the incomplete block before
-// a call's first position. Under QSA one Program runs one sequence at a time; the context
-// cache retains that sequence's continuation, so the planes are still the ones the last
-// prefill and every decode since wrote. A prefill that starts at position zero (a root
-// request) repools them from block zero and overwrites the whole state, which is why the
-// catalog keeps only the scratch's last writer (ProgramImpl::qsa_scratch_owner).
+// The QSA-27B block indexer state of one full-attention layer, one copy per concurrent
+// sequence (lane) on rank 0: the sequence's pooled block keys by block, and the raw keys
+// of the incomplete block before a call's first position. Each lane's planes are written
+// only by the calls that run on that lane, so every lane's state coexists: a prefill that
+// starts at position zero (a root request) repools its lane's planes from block zero and
+// leaves the other lanes untouched, and a continuation's planes survive until a new
+// sequence is admitted onto the same lane (and then belong to it).
 struct QsaIndexerLayerState {
     Tensor pooled; // FP32 [indexer_head_dim, blocks]
     Tensor tail;   // FP32 [indexer_head_dim, compress_ratio - 1]
@@ -39,21 +39,30 @@ struct QsaIndexerLayerState {
 
 struct QsaStreamState;
 
+// The indexer state of one concurrent sequence: one layer state per full-attention
+// layer, in the compact layer order attn_mix receives.
+struct QsaIndexerLaneState {
+    std::vector<QsaIndexerLayerState> layers;
+};
+
 struct QsaIndexerState {
     std::uint32_t indexer_head_dim = 0;
     std::uint32_t compress_ratio   = 0;
     std::uint32_t blocks           = 0; // pooled slots: capacity / compress_ratio + 1
-    // The widest speculative verification, in columns. Zero without speculation. One
-    // full-attention layer owns `record_width` columns of `records` at a fixed stride,
-    // so a captured graph writes its projection at a stable address.
+    std::uint32_t lanes            = 1; // concurrent sequences
+    // The widest speculative verification, in columns. Zero without speculation. Each
+    // (lane, layer) owns `record_width` columns of `records` at a fixed stride, so a
+    // captured graph writes its projection at a stable address.
     std::uint32_t record_width = 0;
-    // BF16 [query_rows + key_rows, layers * record_width]: the verification's indexer
-    // projection of every column, kept for commit() to replay the accepted prefix.
+    // BF16 [query_rows + key_rows, lanes * layers * record_width], (lane, layer) blocks
+    // in layer-major order: the verification's indexer projection of every column, kept
+    // for commit() to replay the accepted prefix.
     Tensor records;
-    // I32 [1]: the verification's first position, staged for the same replay.
+    // I32 [lanes]: the verification's first position, one word per lane, staged for the
+    // same replay.
     Tensor first_position;
-    // One per full-attention layer, in the compact layer order attn_mix receives.
-    std::vector<QsaIndexerLayerState> layers;
+    // One per concurrent lane.
+    std::vector<QsaIndexerLaneState> lane_states;
     // Non-owning: the Program's streamed-KV state, null when --kv-resident is
     // off. Hanging it off the indexer state lets run_qsa reach both without
     // threading a second pointer through every TextContext construction site.
@@ -73,23 +82,28 @@ struct QsaStreamLayerState {
 };
 
 struct QsaStreamState {
+    std::uint32_t lanes  = 1;
+    std::uint32_t layers = 0; // full-attention layers carrying a streamed copy
     std::uint32_t slots  = 0;
     std::uint32_t blocks = 0;
     std::uint32_t pages  = 0;
     std::uint32_t heads  = 0;
     std::uint32_t width  = 0;
-    Tensor identity; // device I32 [pages], 0..pages-1
-    std::vector<QsaStreamLayerState> layers;
+    Tensor identity; // device I32 [pages], 0..pages-1, shared by every lane
+    // One per (lane, layer), indexed lane * layers + layer.
+    std::vector<QsaStreamLayerState> layer_states;
     // The one remaining device text-KV layer, reused as a fully resident
     // 64-position staging copy shared by every QSA layer. `stage()` fills it
     // from that layer's pinned host copy before a wide call reads it.
     PagedKVLayerView staging;
-    // Which QSA layer currently owns the staging bytes, and the position
-    // frontier they cover. A narrow call appends to host and invalidates it
-    // (matching qwen4_exp's kv_staged / kv_staged_end).
+    // Which (lane, layer) currently owns the staging bytes, and the position
+    // frontier they cover. A narrow call appends to its host copy and
+    // invalidates the cache (matching qwen4_exp's kv_staged / kv_staged_end).
+    std::int32_t  staged_lane  = -1;
     std::int32_t  staged_layer = -1;
     std::uint32_t staged_end   = 0;
-    // Host pinned and device staging bytes, reported at startup.
+    // Host pinned (every lane, every layer) and device staging bytes, reported
+    // at startup.
     std::uint64_t host_bytes    = 0;
     std::uint64_t staging_bytes = 0;
 };

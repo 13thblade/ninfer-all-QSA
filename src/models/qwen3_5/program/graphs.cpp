@@ -340,11 +340,19 @@ void ProgramImpl::prepare_graphs() {
     // --qwen38-27b-qsa: every captured graph binds the sparse branch's row-bound view
     // to the capture's own row; the gate pins row 0, so replay reads that row's
     // published table. An MTP verification graph needs the same binding.
+    // A captured graph is single-row: with QSA, multi-concurrency programs never
+    // capture (graphs are off above one concurrency), so the sparse branch's one
+    // part runs row 0 on lane 0, through row 0's view.
     qwen3_5::PagedKVCacheView qsa_kv;
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    std::vector<std::uint32_t> qsa_lanes;
     if (qsa_indexer_state.has_value()) {
         qsa_kv = decoder->text_kv.execution_view(
             text_kv_addresses->execution_row(text_capture_allocations.front()));
+        qsa_kv_views.push_back(qsa_kv);
+        qsa_lanes.push_back(0);
     }
+    const std::span<const std::uint32_t> qsa_sequence_lanes(qsa_lanes.data(), qsa_lanes.size());
 
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles =
@@ -355,7 +363,7 @@ void ProgramImpl::prepare_graphs() {
             execution_core(true),  decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
             *ordinary_host_egress, state_images->continuation_hidden_store(),
-            qsa_kv};
+            qsa_kv,                qsa_kv_views, qsa_sequence_lanes};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1, 0);
         device.synchronize();
@@ -408,7 +416,7 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store(),
-                                                 qsa_kv};
+                                                 qsa_kv, qsa_kv_views, qsa_sequence_lanes};
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);
             device.synchronize();
@@ -457,7 +465,7 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store(),
-                                                 qsa_kv};
+                                                 qsa_kv, qsa_kv_views, qsa_sequence_lanes};
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);
             device.synchronize();

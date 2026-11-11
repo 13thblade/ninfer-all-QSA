@@ -48,6 +48,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.set_steering(state.execution.steering);
         card.set_rope_yarn(state.execution.rope_yarn);
         card.set_qsa_indexer(state.execution.qsa_indexer);
+        // --qwen38-27b-qsa: the sparse branch's per-row lane and KV view bindings;
+        // empty without the flag.
+        card.set_sequence_lanes(state.sequence_lanes);
+        card.set_qsa_kv_views(state.qsa_kv_views);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -657,10 +661,20 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         if (structured_round) { structured_round->publish(); }
         arm_logprobs(logprobs);
 
-        // --qwen38-27b-qsa: the sparse branch reads the sequence's row through its
-        // bound execution view; the gate pins the one lane's row, so the view never changes.
+        // --qwen38-27b-qsa: the sparse branch reads each row's sequence through its
+        // bound execution view; admission pins row r to lanes[r], so the views and
+        // lanes travel with the round's membership.
         qwen3_5::PagedKVCacheView qsa_kv;
-        if (qsa_indexer_state.has_value()) { qsa_kv = text_kv_view(active_sequence(lanes.front())); }
+        std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+        std::span<const std::uint32_t> sequence_lanes;
+        if (qsa_indexer_state.has_value()) {
+            qsa_kv_views.reserve(lanes.size());
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                qsa_kv_views.push_back(text_kv_view(active_sequence(lanes[row])));
+            }
+            qsa_kv = qsa_kv_views.front();
+            sequence_lanes = lanes;
+        }
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
@@ -673,7 +687,9 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *ordinary_host_ingress,
             *ordinary_host_egress,
             state_images->continuation_hidden_store(),
-            qsa_kv};
+            qsa_kv,
+            qsa_kv_views,
+            sequence_lanes};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -883,11 +899,19 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         arm_logprobs(logprobs);
         qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
-        // --qwen38-27b-qsa: the target verification of the one lane reads and appends
-        // the sequence's row through its bound execution view.
+        // --qwen38-27b-qsa: each row's target verification reads and appends the
+        // sequence's row through its bound execution view; admission pins row r to
+        // lanes[r], so the views and lanes travel with the round's membership.
         qwen3_5::PagedKVCacheView qsa_kv;
+        std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+        std::span<const std::uint32_t> sequence_lanes;
         if (qsa_indexer_state.has_value()) {
-            qsa_kv = text_kv_view(active_sequence(lanes.front()));
+            qsa_kv_views.reserve(lanes.size());
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                qsa_kv_views.push_back(text_kv_view(active_sequence(lanes[row])));
+            }
+            qsa_kv = qsa_kv_views.front();
+            sequence_lanes = lanes;
         }
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
@@ -901,7 +925,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             *mtp_host_ingress,
             *mtp_host_egress,
             state_images->continuation_hidden_store(),
-            qsa_kv};
+            qsa_kv,
+            qsa_kv_views,
+            sequence_lanes};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

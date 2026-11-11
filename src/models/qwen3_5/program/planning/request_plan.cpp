@@ -283,12 +283,14 @@ std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner
                                                  const PreparedPromptData& prompt) const {
     if (!valid_continuation(owner)) { return 0; }
     const std::uint32_t index = ContractAccess::index(owner);
-    // --qwen38-27b-qsa: the indexer planes and the pinned KV copy are one scratch set per
-    // Program, so a continuation is only resumable while it is that scratch's last writer. This
-    // is what limits the sparse branch to a conversation extending its own prefix; a different
-    // conversation's prefill repools the scratch from block zero.
-    if (qsa_indexer_state.has_value() &&
-        !owns_qsa_scratch(index, continuation_slots[index].generation)) {
+    // --qwen38-27b-qsa (Legacy cache): each lane's indexer planes and pinned KV copy are
+    // carried by that lane, not by the Legacy StateImage, so a continuation is only resumable
+    // while it still owns the lane the engine will admit it to (the lowest free one): any
+    // sequence admitted to the lane since repooled its planes from block zero. Under the
+    // hybrid cache the image carries the QSA region and a restore lands it in the
+    // destination lane, so the resume is self-contained and needs no such gate.
+    if (qsa_indexer_state.has_value() && !qsa_cache_carries_indexer_state() &&
+        !owns_qsa_lane(lowest_free_lane(), index, continuation_slots[index].generation)) {
         return 0;
     }
     const SequenceState& sequence = continuation_states[index];
@@ -508,9 +510,9 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_identity_tag = capture_identity_tag();
     }
     // --qwen38-27b-qsa takes no captures: every one of them is a StateImage at a frontier the
-    // Program's shared indexer planes cannot rewind to, so a resume from it would score the
-    // history with another sequence's blocks. The endpoint the catalog keeps is the one the
-    // scratch still covers (matched_prefix_tokens).
+    // lane's indexer planes cannot rewind to, so a resume from it would score the history with
+    // another sequence's blocks. The endpoint the catalog keeps is the one the continuation's
+    // own lane still covers (matched_prefix_tokens).
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled &&
         !qsa_indexer_state.has_value()) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,

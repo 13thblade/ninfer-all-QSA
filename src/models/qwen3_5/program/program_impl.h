@@ -1038,24 +1038,39 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
-    // --qwen38-27b-qsa: each full-attention layer's indexer pooled keys and tail, rank 0.
+    // --qwen38-27b-qsa: each lane's indexer pooled keys and tail, rank 0, one set per
+    // concurrent sequence.
     std::optional<qwen3_5::QsaIndexerState> qsa_indexer_state;
-    // --kv-resident: the pinned host KV copies (owned here) and the per-layer
-    // pool / residency map views. Empty when streaming is off.
+    // --kv-resident: the pinned host KV copies (owned here, one per lane and layer) and the
+    // per-(lane, layer) pool / residency map views. Empty when streaming is off.
     std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
     std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
-    // --qwen38-27b-qsa: the continuation that last wrote the Program's shared QSA scratch (the
-    // indexer planes and, under --kv-resident, the pinned KV copy). Those planes are one instance
-    // per Program, not part of any StateImage, so a continuation can resume only while it is that
-    // scratch's last writer: any other sequence's prefill repools it from block zero, and any
-    // restore at an earlier frontier would read scores that belong to a longer history.
-    // `kNoQsaScratchOwner` with generation zero, which no live slot carries, means none.
-    static constexpr std::uint32_t kNoQsaScratchOwner = 0xFFFFFFFFU;
-    std::uint32_t qsa_scratch_owner                  = kNoQsaScratchOwner;
-    std::uint64_t qsa_scratch_generation             = 0;
-    [[nodiscard]] bool owns_qsa_scratch(std::uint32_t continuation_index,
-                                       std::uint64_t generation) const noexcept {
-        return qsa_scratch_owner == continuation_index && qsa_scratch_generation == generation;
+    // --qwen38-27b-qsa (Legacy cache): the continuation that last wrote each lane's QSA
+    // planes (the indexer state and, under --kv-resident, that lane's pinned KV copy). The
+    // Legacy StateImage carries no QSA region, so a catalogued continuation can resume its
+    // prefix only on the lane that still holds its planes: the engine admits to the lowest
+    // free lane, and a prefill starting at position zero repools the assigned lane from
+    // block zero. `kNoQsaLaneOwner`, which no live slot carries, means none. Under the
+    // hybrid cache the image carries the QSA region and a restore lands it in the
+    // destination lane, so no gate applies there (the tracking stays current anyway).
+    static constexpr std::uint32_t kNoQsaLaneOwner = 0xFFFFFFFFU;
+    std::array<std::uint32_t, kMaximumConcurrency> qsa_lane_owner{};
+    std::array<std::uint64_t, kMaximumConcurrency> qsa_lane_generation{};
+    [[nodiscard]] bool owns_qsa_lane(std::uint32_t lane, std::uint32_t continuation_index,
+                                     std::uint64_t generation) const noexcept {
+        return lane < max_concurrency && qsa_lane_owner[lane] == continuation_index &&
+               qsa_lane_generation[lane] == generation;
+    }
+    [[nodiscard]] bool qsa_cache_carries_indexer_state() const noexcept {
+        return context_cache.enabled && context_cache.mode == ContextCacheMode::Hybrid;
+    }
+    // The lowest lane with no active continuation: the one admission would take next.
+    // `kNoQsaLaneOwner` when every lane is taken.
+    [[nodiscard]] std::uint32_t lowest_free_lane() const noexcept {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (active_continuations[lane] >= continuation_capacity) { return lane; }
+        }
+        return kNoQsaLaneOwner;
     }
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;

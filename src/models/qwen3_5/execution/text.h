@@ -104,6 +104,9 @@ enum class SegmentOutput : std::uint8_t {
 struct PrefillSegment {
     // The segment's tokens: a lane's prompt up to its frontier, or one branch's own tokens.
     std::span<const int> ids;
+    // The lane the segment runs on: its indexer state, KV row and stream pool
+    // (QSA only; 0 otherwise).
+    std::uint32_t lane                  = 0;
     // The absolute position of ids[0]; a branch continues its read's prompt frontier.
     std::uint32_t begin                 = 0;
     std::int32_t kv_table_row           = 0;
@@ -180,6 +183,20 @@ public:
     // --qwen38-27b-qsa: the full-attention layers' block indexer state; null keeps every
     // layer on its dense path.
     void set_qsa_indexer(qwen3_5::QsaIndexerState* state) noexcept { qsa_indexer_ = state; }
+
+    // --qwen38-27b-qsa: the lane of each part of the next sparse call, in part order: the
+    // rows of a decode/verify batch, the segments of a batched prefill, or one element for
+    // a single-sequence call. Each part scores, appends and reads through its lane's
+    // indexer state and stream pool.
+    void set_sequence_lanes(std::span<const std::uint32_t> lanes) {
+        sequence_lanes_.assign(lanes.begin(), lanes.end());
+    }
+
+    // --qwen38-27b-qsa: one row-bound KV view per part of the next sparse call, in part
+    // order; empty keeps the single-sequence view the constructor took.
+    void set_qsa_kv_views(std::span<const qwen3_5::PagedKVCacheView> views) {
+        qsa_kv_views_.assign(views.begin(), views.end());
+    }
 
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
@@ -495,6 +512,12 @@ private:
     // --qwen38-27b-qsa: the full-attention layers' block indexer state (rank 0); null keeps
     // every layer on its dense path.
     qwen3_5::QsaIndexerState* qsa_indexer_ = nullptr;
+    // --qwen38-27b-qsa: the lane of each part of the current sparse call, in part order;
+    // empty for a call the sparse branch does not serve.
+    std::vector<std::uint32_t> sequence_lanes_;
+    // --qwen38-27b-qsa: the row-bound KV view of each part of the current sparse call, in
+    // part order; empty falls back to the single-sequence view `kv_`.
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views_;
     // A tensor-parallel pass: the rank whose share is being issued, and where its output
     // projections write their FP32 partial instead of adding to the residual.
     std::size_t tensor_rank_  = 0;

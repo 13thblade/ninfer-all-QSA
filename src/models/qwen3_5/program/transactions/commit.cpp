@@ -120,14 +120,21 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         const ActiveExclusiveBaseline baseline = active_exclusive_baseline();
         active_continuations[lane]             = *continuation_index;
         SequenceState& sequence                = continuation_states[*continuation_index];
-        if (qsa_indexer_state.has_value()) {
-            // A root prefill repools the shared scratch from block zero and a reused one continues
-            // it from the frontier this continuation already covers: either way the scratch is
-            // this continuation's from here on, and every other continuation's is stale.
-            qsa_scratch_owner      = *continuation_index;
-            qsa_scratch_generation = continuation_slots[*continuation_index].generation;
-        }
         sequence.lane                          = lane;
+        if (qsa_indexer_state.has_value()) {
+            // A resume from a prefix reads the assigned lane's QSA planes, so it may only land
+            // on a lane that still holds this continuation's own state: the gate in
+            // matched_prefix_tokens steers it there, and this is the backstop.
+            const std::uint64_t generation = continuation_slots[*continuation_index].generation;
+            if (details.reuse != ReusePath::Root &&
+                !owns_qsa_lane(lane, *continuation_index, generation)) {
+                throw std::logic_error(
+                    "QSA continuation resumed from a prefix on a lane that does not hold "
+                    "its indexer state");
+            }
+            qsa_lane_owner[lane]      = *continuation_index;
+            qsa_lane_generation[lane] = generation;
+        }
         transaction.root_continuation_index.reset();
         start_sequence(lane, sequence, transaction);
         credit_active_ownership_transfers(baseline);
@@ -429,7 +436,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.destination,
                     0,
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0};
+                                         : 0,
+                    sequence.lane};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);

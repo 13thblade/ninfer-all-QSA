@@ -452,14 +452,14 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
         throw std::invalid_argument(
             "session persistence does not support the DFlash/DFlash2 backends");
     }
-    if (qsa_indexer_state.has_value()) {
-        // The snapshot carries a StateImage and the KV chain; the indexer planes (and the pinned
-        // KV copy under --kv-resident) are Program scratch that a restored session would have to
-        // repool, which needs the hidden states of a whole prefill. In-memory retention is the
-        // only reuse the sparse branch has.
+    if (qsa_indexer_state.has_value() && !qsa_cache_carries_indexer_state()) {
+        // QSA under the Legacy cache: the Legacy image carries no QSA region, and the lane's
+        // indexer planes (and the pinned KV copy under --kv-resident) are Program state a
+        // restored session would have to repool, which needs the hidden states of a whole
+        // prefill. In-memory retention is the only reuse the sparse branch has there.
         throw std::invalid_argument(
-            "session persistence does not support the QSA sparse branch: its indexer state is "
-            "not part of a StateImage");
+            "session persistence does not support the QSA sparse branch under the Legacy cache: "
+            "its indexer state is not part of a StateImage");
     }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
 
@@ -642,7 +642,12 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
     for (std::size_t index = 0; index < unique_states.size(); ++index) {
         const StateImageHandle image  = unique_states[index];
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
-        if (state_store->residency(image) == StateReplicaResidency::HostOnly) {
+        // Under QSA the image's QSA region is trustworthy only in its Host slab, captured at
+        // publish from the capturing lane's planes: the shared device planes now hold whatever
+        // the last writer repooled, so a Device read would take another sequence's state.
+        // image_index guarantees a Host replica exists for every image here.
+        if (state_store->residency(image) == StateReplicaResidency::HostOnly ||
+            qsa_indexer_state.has_value()) {
             const std::optional<qwen3_5::HostStateImageConstView> view =
                 state_store->host_view(image);
             if (!view || view->data == nullptr) {
@@ -982,18 +987,25 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     try {
         // Every restored image prefers a Device slot and falls back to a HostOnly replica, the
         // shape a demoted checkpoint has, when the Device pool is occupied.
-        const auto stage_image =
-            [&](const std::uint8_t* payload) -> std::optional<StateImageHandle> {
+        // Under QSA the endpoint image's QSA region lands in the destination lane's planes:
+        // free_row is the idle lane the restored session will resume on, the lowest free one,
+        // and the gate in matched_prefix_tokens admits it back there. Anchor images keep
+        // their QSA state in the Host replica and leave the planes alone.
+        const bool qsa = qsa_indexer_state.has_value();
+        const auto stage_image = [&](const std::uint8_t* payload, bool include_qsa)
+            -> std::optional<StateImageHandle> {
             const qwen3_5::HostStateImageConstView view{
                 reinterpret_cast<const std::byte*>(payload), &state_layout};
             std::optional<StateImageHandle> handle = state_store->reserve_reset(streams);
             if (handle) {
-                state_images->copy_from_host(view, state_store->physical_slot(*handle), streams);
+                state_images->copy_from_host(
+                    view, state_store->physical_slot(*handle), streams, nullptr,
+                    qsa ? static_cast<std::uint32_t>(*free_row) : 0U, include_qsa);
                 return handle;
             }
             return state_store->adopt_host_image(view);
         };
-        state = stage_image(image_payloads[static_cast<std::size_t>(endpoint_image)]);
+        state = stage_image(image_payloads[static_cast<std::size_t>(endpoint_image)], qsa);
         if (!state) {
             throw std::invalid_argument(
                 "session snapshot does not fit the free state capacity; evict other sessions "
@@ -1005,7 +1017,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
         const auto upload_image = [&](std::int32_t index) {
             const auto position = static_cast<std::size_t>(index);
             if (index == endpoint_image || extra_images[position]) { return; }
-            extra_images[position] = stage_image(image_payloads[position]);
+            extra_images[position] = stage_image(image_payloads[position], false);
         };
         if (rewrite_valid != 0) { upload_image(rewrite_image); }
         for (const SnapshotAnchor& anchor : anchors) {
@@ -1064,14 +1076,15 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
         }
         sequence.state = ActiveStateBinding{.read = *state, .write = *state};
         state.reset();
-        // The QSA hybrid image carries the shared indexer planes' state: when the endpoint image
-        // staged onto a Device slot, its QSA region landed in those planes, so the restored
-        // continuation is the scratch's last writer until a later materialization repools it. A
-        // HostOnly replica leaves the planes holding whatever sequence pooled them last.
+        // Under QSA the endpoint image's QSA region landed in the destination lane's planes
+        // when it staged onto a Device slot, so from here the restored continuation is that
+        // lane's last writer, until a later admission repools it. A HostOnly replica leaves
+        // the planes holding whatever sequence wrote them last, and ownership does not move.
         if (qsa_indexer_state.has_value() && state_images->host_layout().spec.qsa &&
             state_store->residency(sequence.state.read) != StateReplicaResidency::HostOnly) {
-            qsa_scratch_owner      = *slot_index;
-            qsa_scratch_generation = continuation_slots[*slot_index].generation;
+            qsa_lane_owner[static_cast<std::uint32_t>(*free_row)]      = *slot_index;
+            qsa_lane_generation[static_cast<std::uint32_t>(*free_row)] =
+                continuation_slots[*slot_index].generation;
         }
         sequence.kv.emplace(SequenceKVBundle{.text = *text_address, .backend = backend_address});
         text_address.reset();

@@ -183,11 +183,11 @@ holds: its own next turn. `src/runtime/engine/model_instance.cpp`
 (`normalize_engine_options`) collapses the cache to one Legacy device slot and
 one private continuation, refuses Hybrid (falls back to Legacy), and rejects any
 host/disk tier, shared prefix, long anchor or stop-hold image under the flag.
-`src/models/qwen3_5/program/program_impl.h` records the scratch's last writer in
-`qsa_scratch_owner` / `qsa_scratch_generation`;
-`src/models/qwen3_5/program/transactions/commit.cpp` sets those on
+`src/models/qwen3_5/program/program_impl.h` records the owner of each lane in
+`qsa_lane_owner` / `qsa_lane_generation`;
+`src/models/qwen3_5/program/transactions/commit.cpp` sets the admitted lane on
 `start_request`, and `src/models/qwen3_5/program/planning/request_plan.cpp`
-gates `matched_prefix_tokens` and lane admission on them (only a resident
+gates `matched_prefix_tokens` on the lane a continuation owns (only a resident
 `SessionEndpoint` is resumable, and QSA rewrite checkpoints are dropped).
 `src/models/qwen3_5/program/storage/session_snapshot.cpp` refuses snapshot
 persistence for the sparse branch because the indexer planes are not in a

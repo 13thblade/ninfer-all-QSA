@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
+#include "core/host_memory.h"
 #include "core/paged_kv_storage.h"
 #include "core/startup.h"
 #include "core/device.h"
@@ -643,27 +644,37 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (!plan.persistent.qsa_indexer.empty()) {
-        // The planes need no initialization: a prefill starting at position zero repools them
-        // from block zero, and one resuming a catalogued continuation continues from a state that
-        // continuation's own prefill and decodes left in place.
-        const auto& qsa        = parameters.model.config().text.qsa.value();
-        const std::uint32_t blocks = capacity / qsa.indexer_compress_ratio + 1U;
-        const auto tail = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
-        QsaIndexerState& state = qsa_indexer_state.emplace();
-        state.indexer_head_dim = qsa.indexer_head_dim;
-        state.compress_ratio   = qsa.indexer_compress_ratio;
-        state.blocks           = blocks;
-        state.layers.reserve(plan.persistent.qsa_indexer.size());
-        if (plan.persistent.qsa_tail_axes.size() != plan.persistent.qsa_indexer.size()) {
-            throw std::logic_error("QSA indexer tail axis planes do not match the layers");
+        // The planes need no initialization: a prefill starting at position zero repools its
+        // lane's planes from block zero, and a lane resuming a catalogued continuation
+        // continues from a state that continuation's own prefill and decodes left in place.
+        const auto& qsa             = parameters.model.config().text.qsa.value();
+        const std::uint32_t blocks  = capacity / qsa.indexer_compress_ratio + 1U;
+        const auto tail             = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        const std::uint32_t layers  = parameters.model.config().text.full_attention_layers;
+        QsaIndexerState& state      = qsa_indexer_state.emplace();
+        state.indexer_head_dim      = qsa.indexer_head_dim;
+        state.compress_ratio        = qsa.indexer_compress_ratio;
+        state.blocks                = blocks;
+        state.lanes                 = max_concurrency;
+        if (plan.persistent.qsa_tail_axes.size() != plan.persistent.qsa_indexer.size() ||
+            plan.persistent.qsa_indexer.size() !=
+                static_cast<std::size_t>(max_concurrency) * layers) {
+            throw std::logic_error("QSA indexer planes do not match the lanes and layers");
         }
-        for (std::size_t layer = 0; layer < plan.persistent.qsa_indexer.size(); ++layer) {
-            const Tensor region = plan.persistent.qsa_indexer[layer].bind(backing);
-            state.layers.push_back(QsaIndexerLayerState{
-                region.slice(1, 0, static_cast<std::int32_t>(blocks)),
-                region.slice(1, static_cast<std::int32_t>(blocks), tail),
-                region.slice(1, static_cast<std::int32_t>(blocks) + tail, tail),
-                plan.persistent.qsa_tail_axes[layer].bind(backing)});
+        state.lane_states.reserve(max_concurrency);
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            QsaIndexerLaneState& lane_state = state.lane_states.emplace_back();
+            lane_state.layers.reserve(layers);
+            const std::size_t lane_base = static_cast<std::size_t>(lane) * layers;
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                const Tensor region =
+                    plan.persistent.qsa_indexer[lane_base + layer].bind(backing);
+                lane_state.layers.push_back(QsaIndexerLayerState{
+                    region.slice(1, 0, static_cast<std::int32_t>(blocks)),
+                    region.slice(1, static_cast<std::int32_t>(blocks), tail),
+                    region.slice(1, static_cast<std::int32_t>(blocks) + tail, tail),
+                    plan.persistent.qsa_tail_axes[lane_base + layer].bind(backing)});
+            }
         }
         if (plan.persistent.qsa_index_records) {
             state.records        = plan.persistent.qsa_index_records->bind(backing);
@@ -673,10 +684,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
     }
     if (plan.stream_slots != 0) {
-        // --kv-resident: an authoritative pinned host copy per QSA layer, a
-        // device pool of 4-token pages, and a residency map. The host planes use
-        // an identity block table; the pool's table is the map's `table` pointer,
-        // which kv_stream_resolve requires. Captured graphs keep all addresses.
+        // --kv-resident: an authoritative pinned host copy per (lane, QSA layer), a
+        // device pool of 4-token pages, and a residency map, per (lane, layer). The
+        // host planes use an identity block table; the pool's table is the map's
+        // `table` pointer, which kv_stream_resolve requires.
         const auto kv = paged_kv_storage_layout(plan.kv_storage, kD256KVCacheHeadDim);
         const std::array<std::pair<std::int32_t, DType>, 4> planes{{
             {kv.key.data_leading_extent, kv.key.data_dtype},
@@ -714,7 +725,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             host_bytes += static_cast<std::uint64_t>(leading) * kPagedKVPageSize * heads * pages *
                           dtype_size(dtype);
         }
+        const std::uint32_t stream_layers =
+            parameters.model.config().text.full_attention_layers;
         QsaStreamState& stream = qsa_stream_state.emplace();
+        stream.lanes  = max_concurrency;
+        stream.layers = stream_layers;
         stream.slots  = plan.stream_slots;
         stream.blocks = plan.stream_blocks;
         stream.pages  = plan.stream_pages;
@@ -726,27 +741,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemcpy(stream.identity.data, identity_host.data(),
                               identity_host.size() * sizeof(std::int32_t),
                               cudaMemcpyHostToDevice));
-        if (plan.persistent.qsa_stream_pool.size() != plan.persistent.qsa_indexer.size() ||
-            plan.persistent.qsa_stream_map.size() != plan.persistent.qsa_indexer.size()) {
-            throw std::logic_error("QSA KV stream planes do not match the layers");
+        const std::size_t stream_regions = static_cast<std::size_t>(stream.lanes) * stream.layers;
+        if (plan.persistent.qsa_stream_pool.size() != stream_regions ||
+            plan.persistent.qsa_stream_map.size() != stream_regions) {
+            throw std::logic_error("QSA KV stream planes do not match the lanes and layers");
         }
-        stream.layers.reserve(plan.persistent.qsa_stream_pool.size());
-        for (std::size_t layer = 0; layer < plan.persistent.qsa_stream_pool.size(); ++layer) {
-            qsa_stream_host.push_back(
-                std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(host_bytes)));
-            const Tensor pool_region = plan.persistent.qsa_stream_pool[layer].bind(backing);
-            const Tensor map_region = plan.persistent.qsa_stream_map[layer].bind(backing);
-            const ops::KvStreamMap map = ops::kv_stream_map(
-                map_region.data, static_cast<std::int32_t>(plan.stream_blocks), slots);
-            QsaStreamLayerState state{};
-            state.map  = map;
-            state.host = make_view(qsa_stream_host.back()->data(), kPagedKVPageSize, pages,
-                                   stream.identity);
-            state.pool = make_view(pool_region.data, ops::kKvStreamPageTokens, slots,
-                                   Tensor(map.table, DType::I32,
-                                          {static_cast<std::int32_t>(plan.stream_blocks)}));
-            ops::kv_stream_reset(map, device.stream);
-            stream.layers.push_back(state);
+        // The pinned host copies are the streaming RAM cost: every lane, every layer. A failure
+        // mid-allocation would surface as a bare cudaHostAlloc error, so check the budget first.
+        const std::uint64_t host_total =
+            host_bytes * static_cast<std::uint64_t>(stream_regions);
+        if (const auto available = available_host_memory_bytes();
+            available && host_total > *available) {
+            throw std::runtime_error(
+                "QSA streamed KV pins " + std::to_string((host_total + (1ULL << 20) - 1) >> 20) +
+                " MiB of host memory (" + std::to_string(stream.lanes) + " lanes x " +
+                std::to_string(stream.layers) + " layers); the host has " +
+                std::to_string((*available + (1ULL << 20) - 1) >> 20) +
+                " MiB available. Lower --max-context or --max-concurrency, or run without "
+                "--kv-resident");
+        }
+        stream.layer_states.reserve(stream_regions);
+        for (std::uint32_t lane = 0; lane < stream.lanes; ++lane) {
+            for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
+                qsa_stream_host.push_back(
+                    std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(host_bytes)));
+                const std::size_t index = static_cast<std::size_t>(lane) * stream.layers + layer;
+                const Tensor pool_region = plan.persistent.qsa_stream_pool[index].bind(backing);
+                const Tensor map_region = plan.persistent.qsa_stream_map[index].bind(backing);
+                const ops::KvStreamMap map = ops::kv_stream_map(
+                    map_region.data, static_cast<std::int32_t>(plan.stream_blocks), slots);
+                QsaStreamLayerState layer_state{};
+                layer_state.map  = map;
+                layer_state.host = make_view(qsa_stream_host.back()->data(), kPagedKVPageSize, pages,
+                                             stream.identity);
+                layer_state.pool = make_view(pool_region.data, ops::kKvStreamPageTokens, slots,
+                                             Tensor(map.table, DType::I32,
+                                                    {static_cast<std::int32_t>(plan.stream_blocks)}));
+                ops::kv_stream_reset(map, device.stream);
+                stream.layer_states.push_back(layer_state);
+            }
         }
         if (qsa_indexer_state.has_value()) {
             qsa_indexer_state->stream = &*qsa_stream_state;
@@ -767,7 +800,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         staging.num_kv_heads = static_cast<std::int32_t>(plan.stream_heads);
         staging.storage      = plan.kv_storage;
         stream.staging       = staging;
-        stream.host_bytes    = host_bytes * static_cast<std::uint64_t>(stream.layers.size());
+        stream.host_bytes    = host_total;
         stream.staging_bytes = 0;
         for (std::size_t i = 0; i < kv_pool.plane_count() && i < 4; ++i) {
             stream.staging_bytes += kv_pool.plane(i).bytes();
@@ -793,7 +826,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);
-    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        lane_epochs[lane] = 1;
+        qsa_lane_owner[lane]      = kNoQsaLaneOwner;
+        qsa_lane_generation[lane] = 0;
+    }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         SequenceState& sequence = continuation_states[index];
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
@@ -1113,6 +1150,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 nullptr,
                 state_slot,
                 state_slot,
+                0,
                 0,
                 0};
             mark_workspace_usage(workspace_plan.text_prefill);

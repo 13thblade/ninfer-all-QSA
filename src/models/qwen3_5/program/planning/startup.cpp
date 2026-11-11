@@ -276,43 +276,50 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .mtp_kv_head_shares        = std::move(mtp_kv_head_shares),
                               .invariant_attention       = plan.invariant_attention,
                           });
-    // The QSA block indexer's per-layer state, on rank 0: the pooled block keys by block
-    // (one slot per block the capacity can complete, plus one), the incomplete block's
-    // tail, and a scratch tail for speculative verification, in one FP32 plane per layer.
+    // The QSA block indexer's per-(lane, layer) state, on rank 0, in lane-major order:
+    // the pooled block keys by block (one slot per block the capacity can complete,
+    // plus one), the incomplete block's tail, and a scratch tail for speculative
+    // verification, in one FP32 plane per (lane, layer).
     if (plan.qsa) {
         const auto& qsa        = config.qsa.value();
+        const std::uint32_t lanes  = plan.max_concurrency;
         const std::uint32_t blocks = plan.capacity / qsa.indexer_compress_ratio + 1U;
-        const std::int32_t rows   = dimension(qsa.indexer_head_dim);
-        const std::int32_t tail   = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
-        const std::int32_t cols   = static_cast<std::int32_t>(blocks) + 2 * tail;
-        out.qsa_indexer.reserve(config.full_attention_layers);
-        out.qsa_tail_axes.reserve(config.full_attention_layers);
-        for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
-            out.qsa_indexer.push_back(add_tensor(
-                builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys, tail and scratch"));
-            out.qsa_tail_axes.push_back(add_tensor(
-                builder, DType::I32, {3, 3}, "QSA indexer tail M-RoPE axes"));
+        const std::int32_t rows    = dimension(qsa.indexer_head_dim);
+        const std::int32_t tail    = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        const std::int32_t cols    = static_cast<std::int32_t>(blocks) + 2 * tail;
+        out.qsa_indexer.reserve(static_cast<std::size_t>(lanes) * config.full_attention_layers);
+        out.qsa_tail_axes.reserve(static_cast<std::size_t>(lanes) * config.full_attention_layers);
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+                out.qsa_indexer.push_back(add_tensor(
+                    builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys, tail and scratch"));
+                out.qsa_tail_axes.push_back(add_tensor(
+                    builder, DType::I32, {3, 3}, "QSA indexer tail M-RoPE axes"));
+            }
         }
         // A speculative verification writes its indexer projection at a stable address so
         // the captured decode graph can replay it, and commit() re-pools only the accepted
-        // columns into the live state. The stride is the widest verification width.
+        // columns into the live state. The stride is the widest verification width, once
+        // per (lane, layer) in layer-major order.
         if (plan.speculative_backend == SpeculativeBackend::Mtp) {
             const std::uint32_t record_width = widest_verify_window(plan) + 1U;
             const std::int32_t projection_rows = dimension(
                 (qsa.indexer_n_heads + 1U) * qsa.indexer_head_dim);
             const std::int32_t record_columns = checked_i32(
-                static_cast<std::uint64_t>(config.full_attention_layers) * record_width,
+                static_cast<std::uint64_t>(lanes) * config.full_attention_layers * record_width,
                 "QSA indexer record columns");
             out.qsa_index_records = add_tensor(
                 builder, DType::BF16, {projection_rows, record_columns},
                 "QSA indexer verification projections");
-            out.qsa_first_position =
-                add_tensor(builder, DType::I32, {1}, "QSA indexer verification first position");
+            out.qsa_first_position = add_tensor(
+                builder, DType::I32, {static_cast<std::int32_t>(lanes)},
+                "QSA indexer verification first position");
         }
         if (plan.stream_slots != 0) {
-            // One device pool of 4-token pages per QSA layer, one KvStreamMap per
-            // layer, and a shared identity block table for the pinned host copy.
-            // The host planes themselves are PinnedHostBuffers owned by ProgramImpl.
+            // One device pool of 4-token pages per (lane, QSA layer), one KvStreamMap per
+            // (lane, layer), and a shared identity block table for the pinned host copy.
+            // The host planes themselves are PinnedHostBuffers owned by ProgramImpl, one
+            // per (lane, layer).
             const auto kv = paged_kv_storage_layout(plan.kv_storage, kD256KVCacheHeadDim);
             const std::array<std::pair<std::int32_t, DType>, 4> planes{{
                 {kv.key.data_leading_extent, kv.key.data_dtype},
@@ -331,13 +338,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 ops::kv_stream_map_bytes(static_cast<std::int32_t>(plan.stream_blocks),
                                          static_cast<std::int32_t>(plan.stream_slots)),
                 "QSA KV stream map");
-            out.qsa_stream_pool.reserve(config.full_attention_layers);
-            out.qsa_stream_map.reserve(config.full_attention_layers);
-            for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
-                out.qsa_stream_pool.push_back(builder.add_tensor(
-                    DType::I8, {pool_words}, 256, "QSA KV stream device pool"));
-                out.qsa_stream_map.push_back(builder.add_tensor(
-                    DType::I8, {map_words}, 256, "QSA KV stream residency map"));
+            const std::size_t stream_regions =
+                static_cast<std::size_t>(plan.max_concurrency) * config.full_attention_layers;
+            out.qsa_stream_pool.reserve(stream_regions);
+            out.qsa_stream_map.reserve(stream_regions);
+            for (std::uint32_t lane = 0; lane < plan.max_concurrency; ++lane) {
+                for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+                    out.qsa_stream_pool.push_back(builder.add_tensor(
+                        DType::I8, {pool_words}, 256, "QSA KV stream device pool"));
+                    out.qsa_stream_map.push_back(builder.add_tensor(
+                        DType::I8, {map_words}, 256, "QSA KV stream residency map"));
+                }
             }
             out.qsa_stream_identity = add_tensor(
                 builder, DType::I32, {static_cast<std::int32_t>(plan.stream_pages)},
@@ -392,12 +403,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
     if (state_image_spec.qsa) {
-        // The image's QSA region binds the shared indexer planes on rank 0: each layer's pooled
-        // prefix and live tail from its combined plane, plus the tail axes. The speculative
-        // scratch half and the verification records stay out of the image.
+        // The image's QSA region binds the shared indexer planes on rank 0, all lanes in
+        // lane-major order: each (lane, layer)'s pooled prefix and live tail from its
+        // combined plane, plus the tail axes. The speculative scratch half and the
+        // verification records stay out of the image; a capture and a restore name the
+        // lane their planes belong to.
         out.state_images.qsa = qwen3_5::QsaStateDeviceLayout{
             .planes    = out.qsa_indexer,
             .tail_axes = out.qsa_tail_axes,
+            .lanes     = plan.max_concurrency,
             .blocks    = state_image_spec.qsa->blocks,
             .tail      = state_image_spec.qsa->tail,
         };
@@ -1541,8 +1555,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             "qsa_top_blocks requires qwen38_27b_qsa (the QSA sparse attention branch)");
     }
     // --qwen38-27b-qsa: the sparse path keeps one rank-0 copy of every full-attention
-    // layer's indexer state and runs one sequence at a time, so it admits only what that
-    // single copy can serve.
+    // layer's indexer state per concurrent sequence (lane), so several sequences run
+    // side by side, each on its own planes.
     if (options.qwen38_27b_qsa) {
         if (!parameters.model.config().text.qsa) {
             throw std::invalid_argument(
@@ -1551,9 +1565,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.devices.size() > 1 || options.tensor_parallel) {
             throw std::invalid_argument(
                 "qwen38_27b_qsa runs on one device without tensor parallelism");
-        }
-        if (options.max_concurrency != 1) {
-            throw std::invalid_argument("qwen38_27b_qsa serves one concurrent request");
         }
         // --vision is supported: a multimodal prefill supplies axis-major [T,3]
         // M-RoPE positions, which run_qsa forwards to the indexer's append/select
@@ -2143,6 +2154,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
         .steering_vectors           = !options.control_vectors.empty(),
     };
+    // --qwen38-27b-qsa: a captured decode graph bakes the lane's QSA state pointers and its
+    // row-bound KV views, but a multi-lane replay batch is an arbitrary subset of lanes, so no
+    // single capture can serve it. QSA with more than one lane runs without CUDA graphs.
+    if (inputs.qsa && inputs.max_concurrency > 1) {
+        inputs.use_cuda_graph = false;
+    }
     // --qwen38-27b-qsa: the QSA indexer state now rides in the StateImage (the pooled block keys,
     // the live tail and the tail axes), so the cache may serve two shapes: the Legacy
     // single-conversation live continuation (one Device checkpoint slot, nothing else) and the

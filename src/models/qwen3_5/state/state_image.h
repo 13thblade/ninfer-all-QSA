@@ -79,13 +79,16 @@ struct StateImageShard {
     std::int32_t conv_channels  = 0;
 };
 
-// The QSA indexer planes an image's QSA region copies: every full-attention layer's combined
-// pooled/tail/scratch plane and tail axes, in compact layer order. The image takes the pooled
-// prefix and the live tail of each combined plane; the scratch half stays out, as do the
-// verification records.
+// The QSA indexer planes an image's QSA region copies: one lane's worth of every
+// full-attention layer's combined pooled/tail/scratch plane and tail axes, in
+// lane-major order (lane * layers + layer). The image holds one lane's state: it is
+// captured out of (and restored into) the shared planes of the `qsa_lane` the caller
+// names. The image takes the pooled prefix and the live tail of each combined plane;
+// the scratch half stays out, as do the verification records.
 struct QsaStateDeviceLayout {
-    std::vector<TensorRegion> planes; // FP32 [head_dim, blocks + 2*tail], one per layer
-    std::vector<TensorRegion> tail_axes; // I32 [3, 3], one per layer
+    std::vector<TensorRegion> planes; // FP32 [head_dim, blocks + 2*tail], one per (lane, layer)
+    std::vector<TensorRegion> tail_axes; // I32 [3, 3], one per (lane, layer)
+    std::uint32_t lanes  = 1;
     std::uint32_t blocks = 0;
     std::uint32_t tail   = 0;
 };
@@ -93,8 +96,9 @@ struct QsaStateDeviceLayout {
 struct StateImageDeviceLayout {
     // One shard per rank that holds Linear Attention layers, in layer order, and each shard's pool.
     // The continuation hidden and the DFlash local state stay on rank 0. The QSA indexer planes
-    // are one shared set on rank 0: a snapshot carries them out with the image that captured
-    // them, and a restore lands them back before the resumed pass reads them.
+    // are one shared set per lane on rank 0: a snapshot carries the capturing lane's planes out
+    // with the image that captured them, and a restore lands them into the destination lane
+    // before the resumed pass reads them.
     std::vector<StateImageShard> shards;
     std::vector<LinearAttentionStatePoolLayout> linear;
     TensorRegion continuation_hidden;
@@ -239,38 +243,46 @@ public:
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
     // Each shard's copies go on the stream of the rank that holds it; the continuation hidden and
-    // the DFlash local state are rank 0's. The QSA indexer planes are the shared set, not a
-    // per-slot copy: `zero_slot`, `zero_all` and `copy_slot` leave them untouched.
+    // the DFlash local state are rank 0's. The QSA indexer planes are the shared per-lane set,
+    // not a per-slot copy: `zero_slot`, `zero_all` and `copy_slot` leave them untouched.
     void zero_slot(std::int32_t slot, RankStreams streams = {});
     void zero_all(RankStreams streams = {});
     void copy_slot(std::int32_t source, std::int32_t destination, RankStreams streams = {});
     void copy_dflash_local(std::int32_t source, std::int32_t destination,
                            RankStreams streams = {});
     // The image's QSA region rides on `qsa_stream` when given, else rank 0's stream: a capture
-    // must run on the stream that ordered the call's own writes to the shared planes.
+    // must run on the stream that ordered the call's own writes to the shared planes. The
+    // region takes and lands the planes of `qsa_lane` (the capturing lane on the way out,
+    // the destination lane on the way in). `include_qsa` leaves the QSA region where it is,
+    // for an image staged for a checkpoint rather than a live lane: its QSA state stays in
+    // the Host replica, and the planes keep whatever the destination lane's own sequence
+    // last wrote.
     void copy_to_host(std::int32_t source, HostStateImageView destination, RankStreams streams = {},
-                      cudaStream_t qsa_stream = nullptr) const;
+                      cudaStream_t qsa_stream = nullptr, std::uint32_t qsa_lane = 0) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,
-                        RankStreams streams = {}, cudaStream_t qsa_stream = nullptr);
+                        RankStreams streams = {}, cudaStream_t qsa_stream = nullptr,
+                        std::uint32_t qsa_lane = 0, bool include_qsa = true);
     // Segmented host images: the packed host image byte o lives at
     // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
     // `include_qsa` leaves the QSA region to a caller that captured it on its own stream first.
     void copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
                                std::size_t segment_bytes, RankStreams streams = {},
-                               bool include_qsa = true, cudaStream_t qsa_stream = nullptr) const;
+                               bool include_qsa = true, cudaStream_t qsa_stream = nullptr,
+                               std::uint32_t qsa_lane = 0) const;
     void copy_from_host_segments(std::span<const std::byte* const> segments,
                                  std::size_t segment_bytes, std::int32_t destination,
-                                 RankStreams streams = {}, cudaStream_t qsa_stream = nullptr);
+                                 RankStreams streams = {}, cudaStream_t qsa_stream = nullptr,
+                                 std::uint32_t qsa_lane = 0);
     // One part of the image, so a restore can land the state a forward pass reads first ahead of
     // the rest. The QSA region belongs to the Rest part.
     void copy_from_host_segments(std::span<const std::byte* const> segments,
                                  std::size_t segment_bytes, std::int32_t destination,
                                  StateImagePart part, RankStreams streams,
-                                 cudaStream_t qsa_stream = nullptr);
-    // The image's QSA region as (device pointer, packed host offset, bytes) per layer, pooled
-    // first, then tail, then tail axes.
+                                 cudaStream_t qsa_stream = nullptr, std::uint32_t qsa_lane = 0);
+    // The image's QSA region as (device pointer, packed host offset, bytes) per layer of
+    // `qsa_lane`, pooled first, then tail, then tail axes.
     template <class Visit>
-    void for_each_qsa_component(Visit&& visit) const;
+    void for_each_qsa_component(std::uint32_t qsa_lane, Visit&& visit) const;
 
 private:
     void validate_host_layout(const StateImageHostLayout* layout, const std::byte* data) const;

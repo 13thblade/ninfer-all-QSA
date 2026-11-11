@@ -31,7 +31,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent, state.lane);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
@@ -98,6 +98,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
         card.set_steering(state.execution.steering);
         card.set_rope_yarn(state.execution.rope_yarn);
         card.set_qsa_indexer(state.execution.qsa_indexer);
+        // --qwen38-27b-qsa: the sparse branch's per-row lane and KV view bindings;
+        // empty without the flag.
+        card.set_sequence_lanes(state.sequence_lanes);
+        card.set_qsa_kv_views(state.qsa_kv_views);
         card.set_mtp_attention_window(state.execution.mtp_attention_window);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);

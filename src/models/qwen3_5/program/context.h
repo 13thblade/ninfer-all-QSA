@@ -87,6 +87,9 @@ struct PrefillContext {
     // state_destination_slot at every chunk, because a checkpoint may fork the destination slot
     // between chunks of one step and decode rounds rewrite the shared frame controls.
     std::int32_t dflash_kv_table_row = 0;
+    // The sequence's lane: the QSA sparse branch's per-lane indexer state, KV row and
+    // stream pool (0 otherwise).
+    std::uint32_t lane = 0;
     // Takes the per-model-layer events of a Host restore still landing, which the chunk's first
     // pass over the layer stack waits on; empty once taken or landed. The events are a view into
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
@@ -115,6 +118,11 @@ struct OrdinaryBatchContext {
     // --qwen38-27b-qsa: the sequence's row-bound execution view for the sparse branch's
     // explicit KV append and attention; empty without the flag.
     qwen3_5::PagedKVCacheView qsa_kv;
+    // --qwen38-27b-qsa: one row-bound execution view per batch row, in row order; empty
+    // without the flag.
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    // --qwen38-27b-qsa: the lane of each batch row, in row order; empty without the flag.
+    std::span<const std::uint32_t> sequence_lanes;
 };
 
 struct MtpBatchContext {
@@ -128,6 +136,11 @@ struct MtpBatchContext {
     // --qwen38-27b-qsa: the one sequence's row-bound execution view, for the sparse
     // branch's explicit KV append and attention during target verification.
     qwen3_5::PagedKVCacheView qsa_kv;
+    // --qwen38-27b-qsa: one row-bound execution view per batch row, in row order; empty
+    // without the flag.
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    // --qwen38-27b-qsa: the lane of each batch row, in row order; empty without the flag.
+    std::span<const std::uint32_t> sequence_lanes;
 };
 
 struct DFlashBatchContext {
@@ -186,7 +199,8 @@ struct TargetVerifyFrameView {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                          std::uint32_t lane);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);

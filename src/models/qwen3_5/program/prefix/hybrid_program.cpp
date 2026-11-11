@@ -794,7 +794,8 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     for (const pc::NodeRef node : host_only) { hybrid_->restore_block(node, destination(kBlock)); }
     if (tail_restore) { hybrid_->restore_tail(quote.snapshot, destination(tail)); }
     if (image_restore) {
-        hybrid_->restore_image(quote.snapshot, state_store->physical_slot(*transaction.state));
+        hybrid_->restore_image(quote.snapshot, state_store->physical_slot(*transaction.state),
+                               quote.destination);
         transaction.state_restored = true;
     }
     hybrid_->submit_restore();
@@ -878,14 +879,9 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                                     state_store->physical_slot(state), compute_streams);
             state_store->activate_copied(state);
         }
-        // --qwen38-27b-qsa: from here the shared indexer planes belong to this continuation: a
-        // root prefill repools them from block zero, and a Host restore landed the snapshot's
-        // copy in them ahead of the prelude. Every other continuation's scratch is stale from
-        // this point (the hybrid admission, like a materialization commit, owns the scratch).
-        if (qsa_indexer_state.has_value()) {
-            qsa_scratch_owner      = *continuation;
-            qsa_scratch_generation = continuation_slots[*continuation].generation;
-        }
+        // --qwen38-27b-qsa: the destination lane's indexer planes are the continuation's from
+        // here: a root prefill repools them from block zero, and a Host restore already
+        // landed the snapshot's copy in them ahead of the prelude.
 
         // KV: cached full pages are shared; a partial tail is copied into a private page.
         const auto activate = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
@@ -1343,7 +1339,8 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             lane.tap_frontier = tap.frontier;
         }
         (void)hybrid_->start_snapshot_host_write(published.snapshot, lane.superseded_tap,
-                                                 device.stream, device.transfer_stream);
+                                                 device.stream, device.transfer_stream,
+                                                 sequence.lane);
     }
 }
 
@@ -1763,7 +1760,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                                                 pc::Supersession::Endpoint);
                         (void)hybrid_->start_snapshot_host_write(
                             published.snapshot, lane_state.superseded_tap, device.stream,
-                            device.transfer_stream);
+                            device.transfer_stream, sequence.lane);
                     } else {
                         state_store->thaw(image);
                     }

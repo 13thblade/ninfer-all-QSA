@@ -611,6 +611,14 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           product::format_pretty_count(
                               static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)));
         }
+        if (engine.max_concurrency > 1) {
+            // The sparse branch scores, appends and reads each part through its own lane's
+            // indexer state and stream pool. A captured graph bakes those per-lane pointers
+            // and the row-bound KV views in, so a multi-lane replay would touch lanes it does
+            // not own; QSA runs without CUDA graphs above one concurrency.
+            logger_->info("qsa | CUDA graphs off | concurrency {} needs per-lane replay",
+                          engine.max_concurrency);
+        }
     }
 
     if (memory.kv_stream_host_pinned_bytes != 0) {
