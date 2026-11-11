@@ -640,8 +640,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (!plan.persistent.qsa_indexer.empty()) {
-        // One sequence at a time with the context cache off: a new prefill repools from
-        // block zero and overwrites the state, so the planes need no initialization.
+        // The planes need no initialization: a prefill starting at position zero repools them
+        // from block zero, and one resuming a catalogued continuation continues from a state that
+        // continuation's own prefill and decodes left in place.
         const auto& qsa        = parameters.model.config().text.qsa.value();
         const std::uint32_t blocks = capacity / qsa.indexer_compress_ratio + 1U;
         const auto tail = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);

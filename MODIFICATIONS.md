@@ -77,6 +77,7 @@ offered under the same Apache-2.0 license.
 | `3c146938` | 2026-11-11 | docs: state the perplexity metric honestly and split it by depth |
 | `d655dae4` | 2026-11-12 | engine: size the streamed KV pool from one selection, not the verification width |
 | `779a875e` | 2026-11-12 | engine: run QSA prefills as dense attention over the complete KV |
+| `939c81f8` | 2026-11-12 | engine: reuse a QSA conversation's own continuation as a live KV prefix |
 
 The early web-edit README commits on `origin/master` (`5afa9ae7` through
 `087692d9`) are folded into `0dd7caa3` and are not listed individually; they
@@ -84,7 +85,7 @@ only rewrote the README's opening, which the local version has since replaced.
 
 ## Change summary
 
-Relative to upstream master (`2207ee04`) this fork carries **48 modified
+Relative to upstream master (`2207ee04`) this fork carries **50 modified
 upstream files and 10 new files**, and deletes no upstream file.
 `docs/qsa-port.md` was a fork-only document, removed by `3fb7f647`, so it does
 not appear in the lists below.
@@ -174,12 +175,32 @@ tokens: prefill 1,610 -> 1,930 tok/s at 512 blocks and 772 -> 1,920 at 4,096
 blocks, now independent of the window; teacher-forced perplexity 3.91997 is
 identical to dense attention. `README.md` tabulates both routes.
 
+**Single-session KV prefix reuse (legacy live continuation).** Under
+`--qwen38-27b-qsa` the block indexer planes and, under `--kv-resident`, the
+authoritative pinned KV copy live in per-`Program` scratch that no `StateImage`
+carries, so the context cache can retain only the conversation that scratch still
+holds: its own next turn. `src/runtime/engine/model_instance.cpp`
+(`normalize_engine_options`) collapses the cache to one Legacy device slot and
+one private continuation, refuses Hybrid (falls back to Legacy), and rejects any
+host/disk tier, shared prefix, long anchor or stop-hold image under the flag.
+`src/models/qwen3_5/program/program_impl.h` records the scratch's last writer in
+`qsa_scratch_owner` / `qsa_scratch_generation`;
+`src/models/qwen3_5/program/transactions/commit.cpp` sets those on
+`start_request`, and `src/models/qwen3_5/program/planning/request_plan.cpp`
+gates `matched_prefix_tokens` and lane admission on them (only a resident
+`SessionEndpoint` is resumable, and QSA rewrite checkpoints are dropped).
+`src/models/qwen3_5/program/storage/session_snapshot.cpp` refuses snapshot
+persistence for the sparse branch because the indexer planes are not in a
+`StateImage`. The result is a single-conversation live KV prefix: a turn that
+extends its own history prefills only the new tokens, and an endpoint-only hit
+reuses the resident KV without re-scoring.
+
 **Documentation.** `README.md` keeps the Chinese description, adds an English
 counterpart, and states the fork's attribution in both languages. This file is
 the record of the fork's changes; untouched files remain exactly as upstream,
 credited in `CONTRIBUTORS.md` and the git history.
 
-## Modified files (48)
+## Modified files (50)
 
 ### Root (1)
 
@@ -203,7 +224,7 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `include/ninfer/ops/rope.h`
 - `include/ninfer/ops/sparse_attention.h`
 
-### src/models/qwen3_5 (21)
+### src/models/qwen3_5 (23)
 
 - `src/models/qwen3_5/config.cpp`
 - `src/models/qwen3_5/config.h`
@@ -217,6 +238,7 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `src/models/qwen3_5/program/graphs.cpp`
 - `src/models/qwen3_5/program/planning/startup.cpp`
 - `src/models/qwen3_5/program/planning/startup.h`
+- `src/models/qwen3_5/program/planning/request_plan.cpp`
 - `src/models/qwen3_5/program/prefill.cpp`
 - `src/models/qwen3_5/program/program.cpp`
 - `src/models/qwen3_5/program/program.h`
@@ -224,6 +246,7 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `src/models/qwen3_5/program/program_impl.h`
 - `src/models/qwen3_5/program/speculative/mtp.cpp`
 - `src/models/qwen3_5/program/transactions/commit.cpp`
+- `src/models/qwen3_5/program/storage/session_snapshot.cpp`
 - `src/models/qwen3_5/state/decoder_state.h`
 - `src/models/qwen3_5/weights.h`
 

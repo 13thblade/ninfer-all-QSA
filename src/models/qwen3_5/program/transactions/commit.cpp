@@ -120,6 +120,13 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         const ActiveExclusiveBaseline baseline = active_exclusive_baseline();
         active_continuations[lane]             = *continuation_index;
         SequenceState& sequence                = continuation_states[*continuation_index];
+        if (qsa_indexer_state.has_value()) {
+            // A root prefill repools the shared scratch from block zero and a reused one continues
+            // it from the frontier this continuation already covers: either way the scratch is
+            // this continuation's from here on, and every other continuation's is stale.
+            qsa_scratch_owner      = *continuation_index;
+            qsa_scratch_generation = continuation_slots[*continuation_index].generation;
+        }
         sequence.lane                          = lane;
         transaction.root_continuation_index.reset();
         start_sequence(lane, sequence, transaction);

@@ -17,9 +17,11 @@ inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
 
 // The QSA-27B block indexer state of one full-attention layer, one copy on rank 0: the
 // sequence's pooled block keys by block, and the raw keys of the incomplete block before
-// a call's first position. Under QSA one Program runs one sequence at a time with the
-// context cache off, so a single copy per layer serves every request: a new prefill
-// repools from block zero and overwrites the whole state.
+// a call's first position. Under QSA one Program runs one sequence at a time; the context
+// cache retains that sequence's continuation, so the planes are still the ones the last
+// prefill and every decode since wrote. A prefill that starts at position zero (a root
+// request) repools them from block zero and overwrites the whole state, which is why the
+// catalog keeps only the scratch's last writer (ProgramImpl::qsa_scratch_owner).
 struct QsaIndexerLayerState {
     Tensor pooled; // FP32 [indexer_head_dim, blocks]
     Tensor tail;   // FP32 [indexer_head_dim, compress_ratio - 1]

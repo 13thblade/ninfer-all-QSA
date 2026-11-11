@@ -282,7 +282,16 @@ std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<con
 std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,
                                                  const PreparedPromptData& prompt) const {
     if (!valid_continuation(owner)) { return 0; }
-    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    const std::uint32_t index = ContractAccess::index(owner);
+    // --qwen38-27b-qsa: the indexer planes and the pinned KV copy are one scratch set per
+    // Program, so a continuation is only resumable while it is that scratch's last writer. This
+    // is what limits the sparse branch to a conversation extending its own prefix; a different
+    // conversation's prefill repools the scratch from block zero.
+    if (qsa_indexer_state.has_value() &&
+        !owns_qsa_scratch(index, continuation_slots[index].generation)) {
+        return 0;
+    }
+    const SequenceState& sequence = continuation_states[index];
     const std::uint32_t tokens    = shared_token_prefix(prompt.token_ids, sequence.ledger);
     // Same tokens are not the same history when an earlier turn re-rendered (a stripped
     // reasoning block, media at another place): the identity chain has to agree as well.
@@ -498,7 +507,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag = capture_identity_tag();
     }
-    if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
+    // --qwen38-27b-qsa takes no captures: every one of them is a StateImage at a frontier the
+    // Program's shared indexer planes cannot rewind to, so a resume from it would score the
+    // history with another sequence's blocks. The endpoint the catalog keeps is the one the
+    // scratch still covers (matched_prefix_tokens).
+    if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled &&
+        !qsa_indexer_state.has_value()) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
                                      bool long_anchor, SharedCandidateEvidence evidence) {
@@ -690,6 +704,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                                      ? runtime::PrivateSourceMode::Retain
                                                      : runtime::PrivateSourceMode::ConsumeToActive;
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+        // --qwen38-27b-qsa: only the resident endpoint is resumable. An anchor or a rewrite
+        // checkpoint sits below the frontier the shared indexer planes have already passed, and
+        // the planes cannot be rewound to it (the engine plans no such checkpoint for the
+        // sparse branch; this guards the plan if one ever appears).
+        if (qsa_indexer_state.has_value() &&
+            selected.kind != runtime::CheckpointKind::SessionEndpoint) {
+            return std::nullopt;
+        }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
@@ -782,11 +804,15 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    // --qwen38-27b-qsa: a rewrite checkpoint restore rewinds the state below the frontier the
+    // shared indexer planes already cover, and the plan captures no replacement checkpoint for
+    // it, so the requested rewrite boundary is dropped rather than planned.
+    const bool wants_rewrite = desired.has_value() && !qsa_indexer_state.has_value();
     const bool can_retain_rewrite =
-        desired && source != nullptr &&
+        wants_rewrite && source != nullptr &&
         plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
         can_retain_rewrite_checkpoint(prompt, *desired, *source, plan->reuse, plan->reuse_base);
-    if (!base.summary.publish_continuation || !desired) {
+    if (!base.summary.publish_continuation || !desired || !wants_rewrite) {
         plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
     } else if (can_retain_rewrite) {
         plan->rewrite_disposition = RewriteCheckpointDisposition::RetainExisting;

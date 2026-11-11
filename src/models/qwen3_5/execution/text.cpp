@@ -1847,8 +1847,9 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
             CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            // QSA keeps one stream copy with the context cache off, so a prefill
-            // starting at position zero begins a fresh sequence.
+            // One stream copy per Program: a prefill starting at position zero is a root request and
+            // begins a fresh sequence, so the residency map starts empty. A prefill that resumes a
+            // catalogued continuation starts past zero and keeps the map its own decodes filled.
             if (first_host == 0) {
                 ops::kv_stream_reset(stream_layer->map, stream);
                 qsa_stream->staged_layer = -1;

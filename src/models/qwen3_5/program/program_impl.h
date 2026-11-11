@@ -1042,6 +1042,19 @@ public:
     // pool / residency map views. Empty when streaming is off.
     std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
     std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
+    // --qwen38-27b-qsa: the continuation that last wrote the Program's shared QSA scratch (the
+    // indexer planes and, under --kv-resident, the pinned KV copy). Those planes are one instance
+    // per Program, not part of any StateImage, so a continuation can resume only while it is that
+    // scratch's last writer: any other sequence's prefill repools it from block zero, and any
+    // restore at an earlier frontier would read scores that belong to a longer history.
+    // `kNoQsaScratchOwner` with generation zero, which no live slot carries, means none.
+    static constexpr std::uint32_t kNoQsaScratchOwner = 0xFFFFFFFFU;
+    std::uint32_t qsa_scratch_owner                  = kNoQsaScratchOwner;
+    std::uint64_t qsa_scratch_generation             = 0;
+    [[nodiscard]] bool owns_qsa_scratch(std::uint32_t continuation_index,
+                                       std::uint64_t generation) const noexcept {
+        return qsa_scratch_owner == continuation_index && qsa_scratch_generation == generation;
+    }
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;

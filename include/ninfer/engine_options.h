@@ -519,8 +519,10 @@ struct EngineOptions {
     // instead of the model's native dense attention. Unset keeps the native dense path for
     // every model. Refused for an artifact without the indexer, for several devices, tensor
     // parallelism, more than one concurrent request, and for a speculative backend other
-    // than the artifact's own MTP head. Turns the context cache off (the indexer state is
-    // not snapshot-able yet). MTP verification replays the indexer tail on commit.
+    // than the artifact's own MTP head. The context cache retains one conversation, the one
+    // whose prefix the indexer planes still hold, so a turn that extends its own history
+    // prefills only the new tokens; the Hybrid prefix cache is refused under the flag. MTP
+    // verification replays the indexer tail on commit.
     bool qwen38_27b_qsa              = false;
     // Qwen3.8-27B-QSA with qwen38_27b_qsa: how many history blocks (four tokens each) each
     // query may look back over, 1 to 65536. Zero keeps the artifact's own budget, 512 blocks

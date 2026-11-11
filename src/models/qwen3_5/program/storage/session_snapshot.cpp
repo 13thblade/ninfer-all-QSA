@@ -452,6 +452,15 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
         throw std::invalid_argument(
             "session persistence does not support the DFlash/DFlash2 backends");
     }
+    if (qsa_indexer_state.has_value()) {
+        // The snapshot carries a StateImage and the KV chain; the indexer planes (and the pinned
+        // KV copy under --kv-resident) are Program scratch that a restored session would have to
+        // repool, which needs the hidden states of a whole prefill. In-memory retention is the
+        // only reuse the sparse branch has.
+        throw std::invalid_argument(
+            "session persistence does not support the QSA sparse branch: its indexer state is "
+            "not part of a StateImage");
+    }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
 
     // The ledger frontier is not validated: abort salvage publishes without advancing it, and a

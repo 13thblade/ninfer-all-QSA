@@ -2105,9 +2105,18 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
         .steering_vectors           = !options.control_vectors.empty(),
     };
-    // The QSA indexer state is not in a StateImage yet, so a continuation could not restore it:
-    // the context cache stays off under the flag.
-    if (inputs.qsa) { inputs.context_cache.enabled = false; }
+    // --qwen38-27b-qsa: the indexer planes (and, under --kv-resident, the pinned KV copy) live in
+    // per-Program scratch that no StateImage carries, so the catalog retains exactly one
+    // conversation: the one that scratch still holds. engine/model_instance.cpp normalizes the
+    // options to that shape; the Program refuses any other one instead of resuming a
+    // continuation whose scores belong to another sequence (matched_prefix_tokens).
+    if (inputs.qsa &&
+        (inputs.context_cache.max_shared_prefixes != 0 ||
+         inputs.context_cache.max_long_anchors_per_continuation.value_or(0) != 0 ||
+         inputs.context_cache.host_state_slots != 0 ||
+         inputs.context_cache.host_kv_capacity_bytes != 0)) {
+        throw std::logic_error("Qwen3.8-27B-QSA context cache options are not normalized");
+    }
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.
     const std::uint64_t minimum_pages64 =
