@@ -11,8 +11,7 @@
 支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文。
 
 后续计划：
-1. QSA目前只允许一条序列（--max-concurrency 1），考虑增加并发支持；
-2. 提供Dflash2和Dspine草稿的支持。
+1. 提供Dflash2和Dspine草稿的支持。
 
 ## 旗标
 
@@ -20,7 +19,7 @@
 
 | 旗标 | 作用 | 取值 | 默认 |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 仍对该层完整 KV 做 dense 因果注意力）。要求 artifact 自带 indexer；只能用单卡、不开张量并行、`--max-concurrency 1`，投机后端只能是模型自带的 MTP。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
+| `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 仍对该层完整 KV 做 dense 因果注意力）。要求 artifact 自带 indexer；只能用单卡、不开张量并行，投机后端只能是模型自带的 MTP。并发解码支持到 `--max-concurrency 8`（每条序列各自持有索引器状态与流式 KV；并发 > 1 时关闭 CUDA graphs，decode 走非捕获路径）。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
 | `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
@@ -67,8 +66,7 @@ This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This mo
 It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts.
 
 Planned work:
-1. QSA serves one sequence at a time (`--max-concurrency 1`); we plan to add concurrent serving.
-2. Add support for DFlash2 and DSpine drafting.
+1. Add support for DFlash2 and DSpine drafting.
 
 ## Flags
 
@@ -76,7 +74,7 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 
 | Flag | What it does | Values | Default |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill still attends densely over the layer's complete KV). Needs the artifact's indexer, one device, no tensor parallelism, `--max-concurrency 1`, and either no speculative backend or the model's own MTP. Without it the model runs its native dense attention throughout. | boolean switch | off |
+| `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill still attends densely over the layer's complete KV). Needs the artifact's indexer, one device, no tensor parallelism, and either no speculative backend or the model's own MTP. Concurrent decode supports up to `--max-concurrency 8` (each sequence keeps its own indexer state and streamed KV; above one concurrency, CUDA graphs are off and decode runs uncaptured). Without it the model runs its native dense attention throughout. | boolean switch | off |
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 

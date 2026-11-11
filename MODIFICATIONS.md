@@ -180,9 +180,10 @@ identical to dense attention. `README.md` tabulates both routes.
 authoritative pinned KV copy live in per-`Program` scratch that no `StateImage`
 carries, so the context cache can retain only the conversation that scratch still
 holds: its own next turn. `src/runtime/engine/model_instance.cpp`
-(`normalize_engine_options`) collapses the cache to one Legacy device slot and
-one private continuation, refuses Hybrid (falls back to Legacy), and rejects any
-host/disk tier, shared prefix, long anchor or stop-hold image under the flag.
+(`normalize_engine_options`) collapses the Legacy cache to one device slot and
+one private continuation, and rejects any host/disk tier, shared prefix, long
+anchor or stop-hold image under the flag; a Hybrid cache falls through to the
+generic normalization because the indexer planes then ride in the `StateImage`.
 `src/models/qwen3_5/program/program_impl.h` records the owner of each lane in
 `qsa_lane_owner` / `qsa_lane_generation`;
 `src/models/qwen3_5/program/transactions/commit.cpp` sets the admitted lane on
@@ -190,10 +191,42 @@ host/disk tier, shared prefix, long anchor or stop-hold image under the flag.
 gates `matched_prefix_tokens` on the lane a continuation owns (only a resident
 `SessionEndpoint` is resumable, and QSA rewrite checkpoints are dropped).
 `src/models/qwen3_5/program/storage/session_snapshot.cpp` refuses snapshot
-persistence for the sparse branch because the indexer planes are not in a
-`StateImage`. The result is a single-conversation live KV prefix: a turn that
+persistence on the Legacy branch, where the indexer planes are not in a
+`StateImage`; under the hybrid cache the QSA payload always comes from the
+host image. The result is a single-conversation live KV prefix: a turn that
 extends its own history prefills only the new tokens, and an endpoint-only hit
 reuses the resident KV without re-scoring.
+
+**Concurrent serving (per-lane QSA state).** The sparse branch ran one
+sequence per Program: a single scalar first position, one indexer state and
+one streamed-KV state. `src/models/qwen3_5/execution/text.cpp` (`run_qsa`)
+now splits a call into one part per sequence lane — the rows of a
+decode/verify batch, the segments of a batched prefill, or the whole
+single-sequence call — and each part scores, appends and reads through its
+own lane's indexer state, row-bound KV view and stream pool, on unmodified
+single-sequence ops. A wide prefill part reads through its own causal
+envelope (the call's widest one was a causality bug for multi-lane
+prefills), and only a Verify-phase call with a wide width touches the record
+planes. `state/decoder_state.h` carries one `QsaIndexerLaneState` per lane
+and shards `records` / `first_position` per (lane, layer) / lane;
+`QsaStreamState` carries one (host, pool, map) per (lane, layer) with the
+identity table and the staging layer shared, and the staged cache invalidates
+on lane change as well as layer change. Decodes, verifies, MTP rounds,
+batched prefills and captured graphs bind the per-row lanes and row-bound
+views (`sequence_lanes` / `qsa_kv_views`, `PrefillContext.lane`,
+`PrefillSegment.lane`); a captured graph is single-row and CUDA graphs stay
+off for QSA above one concurrency (named by a startup log line), a per-row
+lane indirection inside the captured kernels being the follow-up. Speculative
+commit re-pools the accepted prefix per lane and evicts the rejected tail
+from the lane's stream map. `program/planning/startup.cpp` drops the
+one-concurrency gate (the general bound of eight lanes holds);
+`src/runtime/engine/model_instance.cpp` refuses an explicit `--max-context`
+window that cannot fit every lane with the flags to lower named, and
+`program/program_impl.cpp` checks the stream state's pinned host budget
+against available RAM at construction. `tests/models/qwen3_5/
+test_state_image_layout.cpp` gains a two-lane layout case. GPU-dependent
+acceptance (single-lane byte identity, multi-lane correctness, decode
+throughput, fairness) is unrun.
 
 **Documentation.** `README.md` keeps the Chinese description, adds an English
 counterpart, and states the fork's attribution in both languages. This file is
