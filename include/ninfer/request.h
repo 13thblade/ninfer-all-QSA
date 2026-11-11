@@ -672,7 +672,6 @@ struct GenerationResult {
     std::string session_digest;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
-    KvStreamDiagnostics kv_stream;
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;

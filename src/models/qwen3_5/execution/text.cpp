@@ -1841,7 +1841,6 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                         staging_planes[i]->data == nullptr) { continue; }
                     const std::size_t bytes =
                         static_cast<std::size_t>(used) * host_planes[i]->nb[3];
-                    qsa_stream->h2d_bytes += bytes;
                     CUDA_CHECK(cudaMemcpyAsync(
                         staging_planes[i]->data, host_planes[i]->data,
                         bytes, cudaMemcpyHostToDevice, stream));

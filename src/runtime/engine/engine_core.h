@@ -1502,11 +1502,6 @@ private:
         request->terminal_reason.reset();
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
-        // --kv-resident under QSA: drain the streamed-KV PCIe counters once at
-        // the request boundary (kv_stream_counters synchronizes its stream).
-        if constexpr (requires { instance_.program->take_kv_stream_diagnostics(); }) {
-            result.kv_stream = instance_.program->take_kv_stream_diagnostics();
-        }
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }

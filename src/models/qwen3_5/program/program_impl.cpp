@@ -1322,23 +1322,4 @@ void ProgramImpl::reset_memory_peaks() noexcept {
 }
 
 
-// TEMPORARY PCIe measurement hook (removed after the 512K test).
-ninfer::KvStreamDiagnostics ProgramImpl::take_kv_stream_diagnostics() {
-    ninfer::KvStreamDiagnostics out;
-    if (!qsa_stream_state.has_value()) { return out; }
-    for (const auto& layer : qsa_stream_state->layers) {
-        const ops::KvStreamCounters c = ops::kv_stream_counters(layer.map, device.stream);
-        out.calls   += c.calls;
-        out.lookups += c.lookups;
-        out.copies  += c.copies;
-        out.overflow = out.overflow || c.overflow;
-        // The counters are cumulative; drain them so each request reports its
-        // own PCIe traffic. QSA disables the context cache, so a fresh prefill
-        // repopulates the pool on the next request anyway.
-        ops::kv_stream_reset(layer.map, device.stream);
-    }
-    out.h2d_bytes = std::exchange(qsa_stream_state->h2d_bytes, std::uint64_t{0});
-    return out;
-}
-
 } // namespace ninfer::models::qwen3_5::detail

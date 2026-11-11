@@ -90,8 +90,6 @@ struct QsaStreamState {
     // Host pinned and device staging bytes, reported at startup.
     std::uint64_t host_bytes    = 0;
     std::uint64_t staging_bytes = 0;
-    // Wide-call host->staging PCIe bytes since the last request boundary.
-    std::uint64_t h2d_bytes = 0;
 };
 
 struct DecoderStateSpec {
