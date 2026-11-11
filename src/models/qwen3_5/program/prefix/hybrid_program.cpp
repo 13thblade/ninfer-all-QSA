@@ -248,6 +248,14 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     // one returns exactly one page to each pool. Pages this admission must newly take: the fork
     // entitlement beyond the shared full blocks, plus one per block or tail restored from Host.
     const auto fits = [&](const pc::MatchCandidate* candidate, std::span<const pc::NodeRef> path) {
+        // --qwen38-27b-qsa: a snapshot's QSA indexer state is captured out of the shared device
+        // planes, which the next call repools, so the Host replica is its only restorable copy.
+        // A snapshot without one cannot resume: a shallower candidate or the root takes its
+        // place instead of scoring the history with the live sequence's blocks.
+        if (candidate != nullptr && qsa_indexer_state.has_value() &&
+            index.snapshot(candidate->snapshot).host != pc::CopyState::Resident) {
+            return false;
+        }
         const std::uint32_t frontier = candidate != nullptr ? candidate->frontier : 0U;
         const std::uint32_t restored =
             candidate != nullptr ? candidate->host_only_blocks +
@@ -737,7 +745,16 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
         }
     }
     const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
-    const bool image_restore = reuse != 0 && snapshot.device_slot == pc::kNoId;
+    // --qwen38-27b-qsa: a snapshot's QSA state lives in its Host replica (the shared device
+    // planes hold the live sequence's), so a QSA image restores from the Host whenever the
+    // replica is there, even beside a Device slot. An image the restore must take from the Host
+    // but that has no Host replica cannot resume; the admission re-plans toward a shallower
+    // source or the root.
+    const bool qsa_host_image = qsa_indexer_state.has_value() &&
+                                snapshot.host == pc::CopyState::Resident;
+    const bool image_restore = reuse != 0 &&
+        (snapshot.device_slot == pc::kNoId || qsa_host_image);
+    if (image_restore && snapshot.host != pc::CopyState::Resident) { return false; }
     const bool backend_pool  = backend_kv_pages != nullptr;
     const auto restored = static_cast<std::uint32_t>(host_only.size()) + (tail_restore ? 1U : 0U);
     const std::uint32_t text_need = quote.text_kv_page_entitlement - full + restored;
@@ -860,6 +877,14 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             state_images->copy_slot(state_store->physical_slot(image),
                                     state_store->physical_slot(state), compute_streams);
             state_store->activate_copied(state);
+        }
+        // --qwen38-27b-qsa: from here the shared indexer planes belong to this continuation: a
+        // root prefill repools them from block zero, and a Host restore landed the snapshot's
+        // copy in them ahead of the prelude. Every other continuation's scratch is stale from
+        // this point (the hybrid admission, like a materialization commit, owns the scratch).
+        if (qsa_indexer_state.has_value()) {
+            qsa_scratch_owner      = *continuation;
+            qsa_scratch_generation = continuation_slots[*continuation].generation;
         }
 
         // KV: cached full pages are shared; a partial tail is copied into a private page.

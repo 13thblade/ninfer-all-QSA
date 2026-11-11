@@ -383,6 +383,16 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
         state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
                                            segments, host_layout_.slab_bytes,
                                            on_every_rank(transfer));
+        if (state_pool_->host_layout().spec.qsa) {
+            // The image's QSA region reads the shared indexer planes, which this lane's next
+            // call repools past the tap frontier: the block the frontier cuts and the live tail
+            // are exactly what the next append overwrites. Hold the producer at the capture
+            // point until the copy lands, so that append cannot race the snapshot's read.
+            cudaEvent_t qsa_done = take_event();
+            CUDA_CHECK(cudaEventRecord(qsa_done, transfer));
+            CUDA_CHECK(cudaStreamWaitEvent(producer, qsa_done, 0));
+            spare_events_.push_back(qsa_done);
+        }
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
             write_scratch_.clear();

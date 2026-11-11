@@ -1064,6 +1064,15 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
         }
         sequence.state = ActiveStateBinding{.read = *state, .write = *state};
         state.reset();
+        // The QSA hybrid image carries the shared indexer planes' state: when the endpoint image
+        // staged onto a Device slot, its QSA region landed in those planes, so the restored
+        // continuation is the scratch's last writer until a later materialization repools it. A
+        // HostOnly replica leaves the planes holding whatever sequence pooled them last.
+        if (qsa_indexer_state.has_value() && state_images->host_layout().spec.qsa &&
+            state_store->residency(sequence.state.read) != StateReplicaResidency::HostOnly) {
+            qsa_scratch_owner      = *slot_index;
+            qsa_scratch_generation = continuation_slots[*slot_index].generation;
+        }
         sequence.kv.emplace(SequenceKVBundle{.text = *text_address, .backend = backend_address});
         text_address.reset();
         backend_address.reset();

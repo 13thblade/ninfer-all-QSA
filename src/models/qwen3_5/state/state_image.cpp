@@ -68,11 +68,20 @@ bool same_optional_region(const std::optional<LayoutRegion>& left,
     return left.has_value() == right.has_value() && (!left || same_region(*left, *right));
 }
 
+bool same_qsa_spec(const std::optional<QsaStateSpec>& left,
+                   const std::optional<QsaStateSpec>& right) noexcept {
+    if (left.has_value() != right.has_value()) { return false; }
+    if (!left) { return true; }
+    return left->layers == right->layers && left->head_dim == right->head_dim &&
+           left->blocks == right->blocks && left->tail == right->tail;
+}
+
 bool same_host_layout(const StateImageHostLayout& left,
                       const StateImageHostLayout& right) noexcept {
     return same_linear_spec(left.spec.linear, right.spec.linear) &&
            left.spec.hidden == right.spec.hidden &&
            same_dflash_spec(left.spec.dflash_local, right.spec.dflash_local) &&
+           same_qsa_spec(left.spec.qsa, right.spec.qsa) &&
            same_region(left.linear_conv, right.linear_conv) &&
            left.linear_conv_layer_bytes == right.linear_conv_layer_bytes &&
            same_region(left.linear_recurrent, right.linear_recurrent) &&
@@ -81,6 +90,12 @@ bool same_host_layout(const StateImageHostLayout& left,
            same_optional_region(left.dflash_local_k, right.dflash_local_k) &&
            same_optional_region(left.dflash_local_v, right.dflash_local_v) &&
            left.dflash_local_layer_bytes == right.dflash_local_layer_bytes &&
+           same_optional_region(left.qsa_pooled, right.qsa_pooled) &&
+           left.qsa_pooled_layer_bytes == right.qsa_pooled_layer_bytes &&
+           same_optional_region(left.qsa_tail, right.qsa_tail) &&
+           left.qsa_tail_layer_bytes == right.qsa_tail_layer_bytes &&
+           same_optional_region(left.qsa_tail_axes, right.qsa_tail_axes) &&
+           left.qsa_tail_axes_layer_bytes == right.qsa_tail_axes_layer_bytes &&
            left.image_bytes == right.image_bytes;
 }
 
@@ -97,6 +112,10 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     if (spec.dflash_local && (spec.dflash_local->layers == 0 || spec.dflash_local->kv_heads <= 0 ||
                               spec.dflash_local->head_dim <= 0)) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
+    }
+    if (spec.qsa && (spec.qsa->layers == 0 || spec.qsa->head_dim <= 0 || spec.qsa->blocks == 0 ||
+                     spec.qsa->tail == 0)) {
+        throw std::invalid_argument("StateImage host QSA geometry is invalid");
     }
 
     LayoutBuilder builder;
@@ -133,6 +152,28 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local K");
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
+    }
+    if (spec.qsa) {
+        const Tensor pooled_slot(nullptr, DType::FP32,
+                                 {spec.qsa->head_dim, static_cast<std::int32_t>(spec.qsa->blocks)});
+        const Tensor tail_slot(nullptr, DType::FP32,
+                               {spec.qsa->head_dim, static_cast<std::int32_t>(spec.qsa->tail)});
+        const Tensor axes_slot(nullptr, DType::I32, {3, 3});
+        host.qsa_pooled_layer_bytes = pooled_slot.bytes();
+        host.qsa_pooled = builder.add(
+            checked_mul(host.qsa_pooled_layer_bytes, spec.qsa->layers,
+                        "StateImage host QSA pooled bytes overflow"),
+            kStateImageAlignment, "StateImage host QSA pooled keys");
+        host.qsa_tail_layer_bytes = tail_slot.bytes();
+        host.qsa_tail = builder.add(
+            checked_mul(host.qsa_tail_layer_bytes, spec.qsa->layers,
+                        "StateImage host QSA tail bytes overflow"),
+            kStateImageAlignment, "StateImage host QSA tail keys");
+        host.qsa_tail_axes_layer_bytes = axes_slot.bytes();
+        host.qsa_tail_axes = builder.add(
+            checked_mul(host.qsa_tail_axes_layer_bytes, spec.qsa->layers,
+                        "StateImage host QSA tail axes bytes overflow"),
+            kStateImageAlignment, "StateImage host QSA tail axes");
     }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
@@ -239,9 +280,24 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
             payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
             "StateImage transfer payload overflow");
     }
+    if (layout.qsa_pooled) {
+        if (!layout.spec.qsa || !layout.qsa_tail || !layout.qsa_tail_axes) {
+            throw std::invalid_argument("StateImage QSA transfer layout is incomplete");
+        }
+        for (const std::size_t layer_bytes :
+             {layout.qsa_pooled_layer_bytes, layout.qsa_tail_layer_bytes,
+              layout.qsa_tail_axes_layer_bytes}) {
+            payload = checked_add(
+                payload,
+                checked_mul(layer_bytes, layout.spec.qsa->layers,
+                            "StateImage transfer payload overflow"),
+                "StateImage transfer payload overflow");
+        }
+    }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
-        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
+        (layout.spec.qsa ? 3ULL * layout.spec.qsa->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -396,8 +452,48 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
             .head_dim = layout.dflash_local->head_dim,
         };
     }
+    if (layout.qsa) {
+        const QsaStateDeviceLayout& qsa  = *layout.qsa;
+        const std::uint32_t layers       = static_cast<std::uint32_t>(qsa.planes.size());
+        if (qsa.planes.size() != qsa.tail_axes.size() || qsa.blocks == 0 || qsa.tail == 0) {
+            throw std::invalid_argument("StateImage QSA device layout is incomplete");
+        }
+        for (std::size_t layer = 0; layer < qsa.planes.size(); ++layer) {
+            const TensorRegion& plane = qsa.planes[layer];
+            if (plane.dtype != DType::FP32 || plane.shape[0] <= 0 ||
+                plane.shape[1] != static_cast<std::int32_t>(qsa.blocks) + 2U * static_cast<std::int32_t>(qsa.tail) ||
+                qsa.tail_axes[layer].dtype != DType::I32 || qsa.tail_axes[layer].shape[0] != 3 ||
+                qsa.tail_axes[layer].shape[1] != 3) {
+                throw std::invalid_argument("StateImage QSA device layout has an invalid plane");
+            }
+            if (layer != 0 && (qsa.planes[layer].shape[0] != qsa.planes[0].shape[0])) {
+                throw std::invalid_argument("StateImage QSA device planes differ across layers");
+            }
+        }
+        device_spec.qsa = QsaStateSpec{
+            .layers   = layers,
+            .head_dim = qsa.planes.front().shape[0],
+            .blocks   = qsa.blocks,
+            .tail     = qsa.tail,
+        };
+    }
     if (!same_host_layout(host_layout_, plan_host_state_image(device_spec))) {
         throw std::invalid_argument("StateImage host layout does not match its device components");
+    }
+    if (layout.qsa) {
+        // The planes stay on rank 0 with the continuation hidden; the image reads and writes
+        // them through the pool, one shared set, on whatever slot's image is being moved.
+        qsa_pooled_.reserve(layout.qsa->planes.size());
+        qsa_tail_.reserve(layout.qsa->planes.size());
+        qsa_tail_axes_.reserve(layout.qsa->planes.size());
+        for (std::size_t layer = 0; layer < layout.qsa->planes.size(); ++layer) {
+            const Tensor region = layout.qsa->planes[layer].bind(backings.front());
+            qsa_pooled_.push_back(region.slice(1, 0, static_cast<std::int32_t>(layout.qsa->blocks)));
+            qsa_tail_.push_back(region.slice(
+                1, static_cast<std::int32_t>(layout.qsa->blocks),
+                static_cast<std::int32_t>(layout.qsa->tail)));
+            qsa_tail_axes_.push_back(layout.qsa->tail_axes[layer].bind(backings.front()));
+        }
     }
     if (layout.dflash_local) {
         if (layout.dflash_local->lane_capacity != linear_.front()->slot_count()) {
@@ -513,6 +609,24 @@ void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layo
     }
 }
 
+// Visits the shared QSA planes as (rank, device pointer, packed host offset, bytes): every
+// full-attention layer's pooled prefix, live tail and tail axes, pooled first.
+template <class Visit>
+void StateImageDevicePool::for_each_qsa_component(Visit&& visit) const {
+    if (!host_layout_.spec.qsa) { return; }
+    for (std::uint32_t layer = 0; layer < host_layout_.spec.qsa->layers; ++layer) {
+        visit(std::size_t{0}, qsa_pooled_[layer].data,
+              host_layout_.qsa_pooled->offset + layer * host_layout_.qsa_pooled_layer_bytes,
+              qsa_pooled_[layer].bytes());
+        visit(std::size_t{0}, qsa_tail_[layer].data,
+              host_layout_.qsa_tail->offset + layer * host_layout_.qsa_tail_layer_bytes,
+              qsa_tail_[layer].bytes());
+        visit(std::size_t{0}, qsa_tail_axes_[layer].data,
+              host_layout_.qsa_tail_axes->offset + layer * host_layout_.qsa_tail_axes_layer_bytes,
+              qsa_tail_axes_[layer].bytes());
+    }
+}
+
 // Visits the Device components of one slot as (rank, device pointer, packed host offset, bytes):
 // every Linear Attention layer from the shard that holds it, then the rest on rank 0.
 template <class Visit>
@@ -573,7 +687,7 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
 }
 
 void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView destination,
-                                        RankStreams streams) const {
+                                        RankStreams streams, cudaStream_t qsa_stream) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
     // Each shard's layers land at their global offsets in the one host image.
@@ -618,10 +732,22 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                 v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
         }
     }
+    // The shared QSA planes ride on the caller's own stream when it ordered the call's writes:
+    // a capture must read them before the next call repools them, which the rank 0 stream of a
+    // caller that runs beside the live sequence does not guarantee.
+    if (host_layout_.qsa_pooled) {
+        const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : stream;
+        for_each_qsa_component(
+            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    byte_offset(destination.data, offset), device, bytes,
+                    cudaMemcpyDeviceToHost, qsa_copy));
+            });
+    }
 }
 
 void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::int32_t destination,
-                                          RankStreams streams) {
+                                          RankStreams streams, cudaStream_t qsa_stream) {
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
@@ -669,6 +795,17 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                 v.bytes(), cudaMemcpyHostToDevice, stream));
         }
     }
+    // The image's QSA region lands in the shared planes; the slot argument names the GDN state's
+    // home, not the QSA state's. The caller orders this stream ahead of the resumed pass.
+    if (host_layout_.qsa_pooled) {
+        const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : stream;
+        for_each_qsa_component(
+            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    device, byte_offset(source.data, offset), bytes, cudaMemcpyHostToDevice,
+                    qsa_copy));
+            });
+    }
 }
 
 namespace {
@@ -700,9 +837,9 @@ void validate_segments(std::size_t segment_count, std::size_t segment_bytes,
 } // namespace
 
 void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
-                                                 std::span<std::byte* const> segments,
-                                                 std::size_t segment_bytes,
-                                                 RankStreams streams) const {
+                                                  std::span<std::byte* const> segments,
+                                                  std::size_t segment_bytes, RankStreams streams,
+                                                  bool include_qsa, cudaStream_t qsa_stream) const {
     validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
     for_each_host_component(
@@ -716,24 +853,41 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
                                                cudaMemcpyDeviceToHost, streams[rank]));
                 });
         });
+    if (include_qsa && host_layout_.qsa_pooled) {
+        const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : streams[0];
+        const HoldingDeviceBinding bind(rank_devices_[0]);
+        for_each_qsa_component(
+            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+                split_segments(
+                    offset, bytes, segment_bytes,
+                    [&](std::size_t segment, std::size_t within, std::size_t done,
+                        std::size_t count) {
+                        CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within,
+                                                   static_cast<const std::byte*>(device) + done, count,
+                                                   cudaMemcpyDeviceToHost, qsa_copy));
+                    });
+            });
+    }
 }
 
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
-                                                   std::size_t segment_bytes,
-                                                   std::int32_t destination, RankStreams streams) {
+                                                    std::size_t segment_bytes,
+                                                    std::int32_t destination, RankStreams streams,
+                                                    cudaStream_t qsa_stream) {
     for (std::uint32_t layer = 0; layer < host_layout_.spec.linear.layers; ++layer) {
         copy_from_host_segments(
             segments, segment_bytes, destination,
-            StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, streams);
+            StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, streams,
+            nullptr);
     }
     copy_from_host_segments(segments, segment_bytes, destination,
-                            StateImagePart{.kind = StateImagePart::Kind::Rest}, streams);
+                            StateImagePart{.kind = StateImagePart::Kind::Rest}, streams, qsa_stream);
 }
 
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
-                                                   std::size_t segment_bytes,
-                                                   std::int32_t destination, StateImagePart part,
-                                                   RankStreams streams) {
+                                                    std::size_t segment_bytes,
+                                                    std::int32_t destination, StateImagePart part,
+                                                    RankStreams streams, cudaStream_t qsa_stream) {
     validate_slot(destination, slot_count(),
                   "StateImage segmented H2D destination is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
@@ -749,6 +903,21 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
                                                cudaMemcpyHostToDevice, streams[rank]));
                 });
         });
+    if (part.kind == StateImagePart::Kind::Rest && host_layout_.qsa_pooled) {
+        const cudaStream_t qsa_copy = qsa_stream != nullptr ? qsa_stream : streams[0];
+        const HoldingDeviceBinding bind(rank_devices_[0]);
+        for_each_qsa_component(
+            [&](std::size_t, void* device, std::size_t offset, std::size_t bytes) {
+                split_segments(
+                    offset, bytes, segment_bytes,
+                    [&](std::size_t segment, std::size_t within, std::size_t done,
+                        std::size_t count) {
+                        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(device) + done,
+                                                   segments[segment] + within, count,
+                                                   cudaMemcpyHostToDevice, qsa_copy));
+                    });
+            });
+    }
 }
 
 } // namespace ninfer::models::qwen3_5

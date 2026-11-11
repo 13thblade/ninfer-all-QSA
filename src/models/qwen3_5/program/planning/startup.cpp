@@ -366,8 +366,37 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             };
         }
     }
+    if (plan.qsa && plan.context_cache.enabled &&
+        plan.context_cache.mode == ContextCacheMode::Hybrid) {
+        // The hybrid snapshot carries the QSA indexer state out of the shared device planes:
+        // every StateImage slot's host slab holds the pooled block keys, the live tail and the
+        // tail axes. The Legacy cache keeps the continuation live on the device, so its images
+        // carry no QSA region and cost nothing there.
+        const auto& qsa = config.qsa.value();
+        state_image_spec.qsa = qwen3_5::QsaStateSpec{
+            .layers   = config.full_attention_layers,
+            .head_dim = dimension(qsa.indexer_head_dim),
+            .blocks   = plan.capacity / qsa.indexer_compress_ratio + 1U,
+            .tail     = qsa.indexer_compress_ratio - 1,
+        };
+    }
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
+    if (state_image_spec.qsa) {
+        // The image's QSA region binds the shared indexer planes on rank 0: each layer's pooled
+        // prefix and live tail from its combined plane, plus the tail axes. The speculative
+        // scratch half and the verification records stay out of the image.
+        out.state_images.qsa = qwen3_5::QsaStateDeviceLayout{
+            .planes    = out.qsa_indexer,
+            .tail_axes = out.qsa_tail_axes,
+            .blocks    = state_image_spec.qsa->blocks,
+            .tail      = state_image_spec.qsa->tail,
+        };
+    }
+    if (plan.qsa && plan.context_cache.enabled &&
+        plan.context_cache.mode == ContextCacheMode::Hybrid && !out.state_images.qsa) {
+        throw std::logic_error("QSA hybrid state image is missing the QSA indexer region");
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         // A stage records only the GDN layers it holds, in its own device's memory; a
         // tensor-parallel rank only its heads.
@@ -2105,11 +2134,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
         .steering_vectors           = !options.control_vectors.empty(),
     };
-    // --qwen38-27b-qsa: the indexer planes (and, under --kv-resident, the pinned KV copy) live in
-    // per-Program scratch that no StateImage carries, so the catalog retains exactly one
-    // conversation: the one that scratch still holds. engine/model_instance.cpp normalizes the
-    // options to that shape; the Program refuses any other one instead of resuming a
-    // continuation whose scores belong to another sequence (matched_prefix_tokens).
+    // --qwen38-27b-qsa: the QSA indexer state now rides in the StateImage (the pooled block keys,
+    // the live tail and the tail axes), so the cache may serve two shapes: the Legacy
+    // single-conversation live continuation (one Device checkpoint slot, nothing else) and the
+    // Hybrid snapshot tree, whose images carry the QSA region. engine/model_instance.cpp
+    // normalizes the options to one of the two; the Program refuses any other shape instead of
+    // resuming a continuation whose scores belong to another sequence (matched_prefix_tokens).
     if (inputs.qsa &&
         (inputs.context_cache.max_shared_prefixes != 0 ||
          inputs.context_cache.max_long_anchors_per_continuation.value_or(0) != 0 ||

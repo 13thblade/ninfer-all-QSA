@@ -342,25 +342,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // A direct graft lives in a pinned Legacy shared-prefix slot; the hybrid tree has none.
         throw std::invalid_argument("direct grafts require the legacy context cache");
     }
-    if (options.qwen38_27b_qsa && cache.enabled) {
+    if (options.qwen38_27b_qsa && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
         // The sparse branch keeps its per-layer indexer planes, and under --kv-resident the
-        // authoritative pinned KV copy, in per-Program scratch that no StateImage carries. A
-        // catalogued continuation can therefore resume only while it is that scratch's last
-        // writer: one conversation's own next turn, which is the reuse that matters (a prompt
-        // that only grows) and the only one the scratch can support without being repooled.
-        // Keep exactly that much of the catalog:
+        // authoritative pinned KV copy, in per-Program scratch that the Legacy StateImage does
+        // not carry. A catalogued continuation can therefore resume only while it is that
+        // scratch's last writer: one conversation's own next turn, which is the reuse that
+        // matters (a prompt that only grows) and the only one the scratch can support without
+        // being repooled. Keep exactly that much of the catalog:
         //  - one Device checkpoint slot, no Host or disk tier: a spilled continuation would come
         //    back beside a scratch another sequence has since overwritten;
         //  - no anchors and no shared prefixes: every one of them restores a state image at a
         //    frontier the scratch has already passed;
         //  - no stop-string hold images, for the same reason (a hold rewinds the state).
-        // The hybrid cache serves snapshots out of StateImages, and the sparse branch's indexer
-        // planes are not in any StateImage: a resumed snapshot would score the history with
-        // another sequence's blocks. The checkpoint catalog's resident continuation needs no
-        // snapshot, so the hybrid request falls back to it rather than corrupting output.
-        if (cache.mode == ContextCacheMode::Hybrid) {
-            cache.mode = ContextCacheMode::Legacy;
-        }
+        // Under the hybrid cache the indexer planes ride in the StateImage (pooled keys, live
+        // tail, tail axes), so a snapshot carries the QSA state out and a resume lands it back;
+        // that shape falls through to the generic hybrid normalization below.
         if (cache.host_cache_budget_bytes || cache.host_cache_auto) {
             throw std::invalid_argument(
                 "the QSA sparse branch cannot spill its one conversation to a Host cache: the "
