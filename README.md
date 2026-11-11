@@ -3,7 +3,9 @@
 # 中文
 
 本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型为Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token只需看到2048个历史token，可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题
+
 模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
+模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
 支持Qwen3.8-27B的ViT和MTP，暂不支持Dflash2
 
