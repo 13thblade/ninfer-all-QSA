@@ -50,6 +50,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -1579,7 +1581,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (qsa_layer) {
         // The sparse branch leaves `a` ungated; the dense branch's in-Op gate is absent.
-        run_qsa(*p.qsa, h, input_basis, qn, kn, v, a, cache_positions, rope_for_op, fidx, T, s);
+        run_qsa(*p.qsa, h, input_basis, qn, kn, v, a, cache_positions, rope_for_op, fidx, T,
+                ph, s);
     } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1679,7 +1682,7 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                           const Tensor& qn, const Tensor& kn, const Tensor& value,
                           const Tensor& attention, const Tensor& positions,
                           const Tensor& rope_positions, int full_attention_index,
-                          std::int32_t total, cudaStream_t stream) {
+                          std::int32_t total, Phase phase, cudaStream_t stream) {
     // The flag's gate admits one sequence per program. An MTP verification is one row of
     // N consecutive columns of that sequence, which the indexer's N-token Ops already
     // score column by column; a multi-sequence batch would need a state copy per row.
@@ -1789,15 +1792,38 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         ops::kv_cache_append(k_span, v_span, call_positions, layer, stream);
     }
     const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
+    // Unconditional on both routes: append pools this call's indexer keys into the layer's
+    // persistent state, which every later decode/verify selection scores against. Skipping it
+    // for a dense prefill would leave the prompt's blocks without scores.
     ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
                             state.pooled, *append_tail, stream, indexer_positions);
+
+    // A wide prefill already has this layer's COMPLETE KV in `read`: either the fully resident
+    // layer view or the staging copy that stage() filled from the pinned host layer. Selecting
+    // and gathering K blocks from it pays for the whole copy and then reads each query's window
+    // again with no cross-query tile reuse. Decode/verify must keep the sparse route: their
+    // stream pool holds only the blocks resolve() brought in. Text-only calls only: a 3-D
+    // M-RoPE prompt needs the indexer's interleaved axes, which the dense Op does not take.
+    static const bool dense_prefill_opt = [] {
+        const char* setting = std::getenv("NINFER_QSA_DENSE_PREFILL");
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+    }();
+    const bool dense_prefill =
+        phase == Phase::Prefill && dense_prefill_opt && active_causal_attention_envelope_ != nullptr &&
+        call_positions.is_contiguous() && indexer_positions.rope_positions == nullptr &&
+        (qsa_stream == nullptr || T > static_cast<std::int32_t>(qsa_stream->width));
+
     auto scope = work_.scope();
-    Tensor selected =
-        workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);
-    Tensor counts = workspace::vector(work_, DType::I32, T);
-    ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_, state.pooled,
-                            work_, selected, counts, stream, indexer_positions,
-                            static_cast<std::int32_t>(qsa.block_budget));
+    Tensor selected{};
+    Tensor counts{};
+    if (!dense_prefill) {
+        selected =
+            workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);
+        counts = workspace::vector(work_, DType::I32, T);
+        ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_,
+                                state.pooled, work_, selected, counts, stream, indexer_positions,
+                                static_cast<std::int32_t>(qsa.block_budget));
+    }
     PagedKVLayerView read = layer;
     bool wide_stream_call = false;
     std::int32_t first_host = 0;
@@ -1855,10 +1881,23 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
             read = qsa_stream->staging;
         }
     }
-    ops::sparse_softmax_attention(
-        q_span, first, selected, counts, read,
-        static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-        work_, a_span, stream, static_cast<std::int32_t>(qsa.block_budget));
+    const float scale =
+        static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim)));
+    if (dense_prefill) {
+        // `read` is a complete, identity-mapped paged KV layer. The cached Op reads it without
+        // appending K/V (run_qsa already did), leaves `a_span` ungated just as the sparse Op
+        // does, and lets attn_merge_output apply the gate once. Prefill is not a captured graph,
+        // so switching the route here leaves every decode/verify graph untouched.
+        ops::causal_softmax_attention_cached(
+            q_span, call_positions,
+            {dimension(config_.attention->head_dim),
+             dimension(config_.attention->num_attention_heads),
+             dimension(config_.attention->num_key_value_heads)},
+            scale, read, *active_causal_attention_envelope_, work_, a_span, stream);
+    } else {
+        ops::sparse_softmax_attention(q_span, first, selected, counts, read, scale, work_, a_span,
+                                      stream, static_cast<std::int32_t>(qsa.block_budget));
+    }
     if (wide_stream_call) {
         const std::int32_t first_block = first_host / ops::kKvStreamPageTokens;
         const std::int32_t end_block =

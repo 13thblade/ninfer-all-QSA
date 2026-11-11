@@ -285,14 +285,16 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    // The QSA-27B sparse branch of attn_mix for a layer carrying the block indexer: the
-    // indexer's rows of the normalized residual, the explicit KV append, the indexer's pool
-    // and select, and the sparse attention over the selected blocks and the call's own
-    // incomplete block, writing its ungated output into `attention`.
+    // The QSA-27B branch of attn_mix for a layer carrying the block indexer: the indexer's
+    // rows of the normalized residual, the explicit KV append, the indexer's persistent pool,
+    // and the attention itself, writing its ungated output into `attention`. A prefill call
+    // already has the layer's complete KV (resident or staged), so it takes the read-only dense
+    // causal route; decode/verify keep the sparse route because their stream pool holds only
+    // the selected blocks. `qsa_indexer_append` runs on both routes.
     void run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden, InputBasis basis,
                  const Tensor& qn, const Tensor& kn, const Tensor& value, const Tensor& attention,
                  const Tensor& positions, const Tensor& rope_positions, int full_attention_index,
-                 std::int32_t total, cudaStream_t stream);
+                 std::int32_t total, Phase phase, cudaStream_t stream);
     // Position-split attention's second half on a rank: the merge of every rank's partial for its
     // query heads, gated by the gates attn_mix kept, and its share of the output projection.
     void attn_merge_output(const BlockParameters& weights, Tensor& x,

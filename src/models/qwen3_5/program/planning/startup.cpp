@@ -713,6 +713,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             static_cast<std::int32_t>(qsa.block_budget)));
                         scratch(layout, ops::sparse_softmax_attention_workspace_bytes(
                                             last, static_cast<std::int32_t>(qsa.block_budget)));
+                        // The hybrid prefill route calls the read-only dense causal Op over the
+                        // layer's complete KV, so this stage needs that Op's transient capacity
+                        // too. The layout keeps the peak of its scratch allocations, so the
+                        // sparse decode/verify stages do not pay for both at once.
+                        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                            {dimension(share.attention->head_dim),
+                                             dimension(share.attention->num_attention_heads),
+                                             dimension(share.attention->num_key_value_heads)},
+                                            plan.kv_storage, envelope, batch_size, min_width,
+                                            max_width));
                     } else {
                         scratch(layout,
                                 ops::causal_softmax_attention_workspace_capacity_bytes(
