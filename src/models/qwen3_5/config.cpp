@@ -2,6 +2,7 @@
 
 #include "artifact/schema.h"
 #include "models/qwen3_5/draft_config.h"
+#include "ninfer/ops/qsa_budget.h"
 
 #include <algorithm>
 #include <cmath>
@@ -159,9 +160,10 @@ TextConfig text(const Json& value, bool mtp) {
         out.gdn = gdn;
     }
     // QSA-27B carries a learned block indexer on its full-attention layers. Stock
-    // artifacts have none of these fields and keep dense full attention. The four
-    // values are the geometry ninfer::ops::qsa_indexer implements (4-token blocks,
-    // a 2048-token budget = 512 selected blocks).
+    // artifacts have none of these fields and keep dense full attention. The geometry is
+    // the one ninfer::ops::qsa_indexer implements: 4-token blocks and four 128-dim heads.
+    // The budget is the artifact's own selection width, which the range the ops compile in
+    // bounds; --qsa-history-tokens may widen the selection at run time without touching it.
     static constexpr const char* qsa_fields[] = {
         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"};
     bool has_qsa = false;
@@ -175,10 +177,12 @@ TextConfig text(const Json& value, bool mtp) {
         QsaConfig qsa{dimension(value, "indexer_n_heads"), dimension(value, "indexer_head_dim"),
                       dimension(value, "indexer_compress_ratio"), dimension(value, "indexer_budget")};
         if (qsa.indexer_n_heads != 4 || qsa.indexer_head_dim != 128 ||
-            qsa.indexer_compress_ratio != 4 || qsa.indexer_budget != 2048 ||
-            qsa.indexer_budget % qsa.indexer_compress_ratio != 0) {
+            qsa.indexer_compress_ratio != static_cast<std::uint32_t>(ops::kQsaBlockTokens) ||
+            qsa.indexer_budget == 0 || qsa.indexer_budget % qsa.indexer_compress_ratio != 0 ||
+            qsa.block_budget() > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)) {
             throw ArtifactError(
-                "QSA indexer geometry must be 4 heads x 128, ratio 4, budget 2048");
+                "QSA indexer geometry must be 4 heads x 128 with 4-token blocks and a budget "
+                "of at most 2048 blocks");
         }
         if (out.full_attention_layers == 0) {
             throw ArtifactError("QSA indexer needs full-attention layers");

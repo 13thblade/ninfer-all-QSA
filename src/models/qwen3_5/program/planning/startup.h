@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -204,6 +205,10 @@ struct SequencePlanImpl {
     std::uint32_t stream_blocks             = 0;
     std::uint32_t stream_pages              = 0;
     std::uint32_t stream_heads              = 0;
+    // A QSA history window wider than the artifact's whose stream pool no longer fits the
+    // context, so streaming is off and every full-attention layer stays resident. Planning has
+    // no observer, so the engine publishes this. Empty otherwise.
+    std::string stream_warning;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;

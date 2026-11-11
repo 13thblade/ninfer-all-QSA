@@ -709,7 +709,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                 static_cast<std::int32_t>(qsa.block_budget), last);
                         (void)workspace::matrix(layout, DType::I32, 1, last);
                         scratch(layout, ops::qsa_indexer_select_workspace_bytes(
-                                            last, static_cast<std::int32_t>(blocks)));
+                                            last, static_cast<std::int32_t>(blocks),
+                                            static_cast<std::int32_t>(qsa.block_budget)));
                         scratch(layout, ops::sparse_softmax_attention_workspace_bytes(last));
                     } else {
                         scratch(layout,
@@ -1484,6 +1485,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // --qsa-history-tokens widens the QSA indexer's selection. Without the sparse branch it has
+    // no effect, so it is refused rather than silently dropped.
+    if (options.qsa_history_tokens != 0 && !options.qwen38_27b_qsa) {
+        throw std::invalid_argument(
+            "qsa_history_tokens requires qwen38_27b_qsa (the QSA sparse attention branch)");
+    }
     // --qwen38-27b-qsa: the sparse path keeps one rank-0 copy of every full-attention
     // layer's indexer state and runs one sequence at a time, so it admits only what that
     // single copy can serve.
@@ -1514,8 +1521,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                 "(DFlash/DFlash2/DSpark are not wired to the QSA indexer)");
         }
         // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns, and
-        // its pool is sized width * 513 blocks. Cap the widest verification when
-        // --kv-resident actually streams (a wider call takes the staging route).
+        // its pool is sized width * (budget + 1) blocks, budget the indexer's selection
+        // width (512 blocks, wider with --qsa-history-tokens). Cap the widest
+        // verification when --kv-resident actually streams (a wider call takes the
+        // staging route).
         if (resolved_kv_resident_positions(options) != 0) {
             const std::uint32_t widest = std::max(options.speculative.draft_tokens,
                                                   options.speculative.ngram_draft_tokens);
@@ -1685,14 +1694,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->steering_vectors    = inputs.steering_vectors;
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
-        // Mirror qwen4_exp's stream sizing: a resolve needs width * 513 slots,
+        // Mirror qwen4_exp's stream sizing: a resolve needs width * (budget + 1) slots,
         // and streaming only pays off while the pool is smaller than the context.
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
+        const std::uint32_t budget =
+            inputs.parameters->text.qsa_block_budget != 0
+                ? inputs.parameters->text.qsa_block_budget
+                : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
-            static_cast<std::uint32_t>(
-                ops::kv_stream_minimum_slots(static_cast<std::int32_t>(width))));
+            static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
+                static_cast<std::int32_t>(width), static_cast<std::int32_t>(budget) + 1)));
         const std::uint32_t pages = page_count(inputs.capacity);
         if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
             impl->stream_slots  = slots;
@@ -1703,6 +1716,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                       ? inputs.parameters->model.config()
                                             .text.attention->num_key_value_heads
                                       : 0;
+        } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
+            // A wider selection multiplies the slots a resolve must hold. Saying so is the
+            // difference between an unexplained loss of streaming and a knob the user can turn.
+            impl->stream_warning =
+                "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
+                " tokens: a streamed call holds " + std::to_string(budget + 1U) +
+                " blocks per query, so the " + std::to_string(inputs.capacity) +
+                "-token context no longer fits the --kv-resident pool and every full-attention "
+                "layer keeps its KV resident; a smaller --max-context or "
+                "--qsa-history-tokens restores streaming";
         }
     }
     impl->persistent          = persistent_layout(*impl);

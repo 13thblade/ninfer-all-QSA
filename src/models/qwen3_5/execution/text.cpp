@@ -1796,7 +1796,8 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), T);
     Tensor counts = workspace::vector(work_, DType::I32, T);
     ops::qsa_indexer_select(index, first, weights, config_.rms_norm_eps, rope_yarn_, state.pooled,
-                            work_, selected, counts, stream, indexer_positions);
+                            work_, selected, counts, stream, indexer_positions,
+                            static_cast<std::int32_t>(qsa.block_budget));
     PagedKVLayerView read = layer;
     bool wide_stream_call = false;
     std::int32_t first_host = 0;
@@ -1857,7 +1858,7 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     ops::sparse_softmax_attention(
         q_span, first, selected, counts, read,
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-        work_, a_span, stream);
+        work_, a_span, stream, static_cast<std::int32_t>(qsa.block_budget));
     if (wide_stream_call) {
         const std::int32_t first_block = first_host / ops::kKvStreamPageTokens;
         const std::int32_t end_block =

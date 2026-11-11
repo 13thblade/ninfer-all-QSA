@@ -522,6 +522,14 @@ struct EngineOptions {
     // than the artifact's own MTP head. Turns the context cache off (the indexer state is
     // not snapshot-able yet). MTP verification replays the indexer tail on commit.
     bool qwen38_27b_qsa              = false;
+    // Qwen3.8-27B-QSA with qwen38_27b_qsa: how many history tokens each query may look back
+    // over, a multiple of four that reaches at most 8192 (2048 selected blocks). Zero keeps
+    // the artifact's own budget, 2048 tokens over 512 blocks, which every artifact trained
+    // with. Raising it only widens the indexer's selection and the blocks the sparse
+    // attention reads; the artifact, the scoring formula and the indexer's training are
+    // untouched. A --kv-resident stream pool must then hold that many more blocks, so a
+    // wider window can leave a context too large to stream.
+    std::uint32_t qsa_history_tokens = 0;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

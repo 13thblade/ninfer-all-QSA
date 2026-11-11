@@ -18,6 +18,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/expert_admission.h"
+#include "ninfer/ops/qsa_budget.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
 #include "runtime/contract/rope_scaling.h"
@@ -133,6 +134,15 @@ void validate_options(const EngineOptions& options) {
         (options.rope_yarn || options.rope_yarn_factor > 1.0F)) {
         throw std::invalid_argument(
             "Engine rope_scaling_factor excludes rope_yarn and rope_yarn_factor");
+    }
+    // --qsa-history-tokens: a whole number of 4-token blocks, within the ops' compile-time cap.
+    constexpr std::uint32_t kQsaBlockTokens = static_cast<std::uint32_t>(ops::kQsaBlockTokens);
+    constexpr std::uint32_t kQsaMaxTokens =
+        static_cast<std::uint32_t>(ops::kQsaTopBlocksMax) * kQsaBlockTokens;
+    if (options.qsa_history_tokens % kQsaBlockTokens != 0 ||
+        options.qsa_history_tokens > kQsaMaxTokens) {
+        throw std::invalid_argument("Engine qsa_history_tokens must be a multiple of 4, at most " +
+                                    std::to_string(kQsaMaxTokens));
     }
 }
 
@@ -483,7 +493,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+    : model(std::move(source)), parameters(*model, options.qsa_history_tokens),
       steering(load_engine_steering(options, model->config().text)),
       frontend(models::qwen3_5::make_frontend(
           model->resources(),
@@ -982,6 +992,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // Publishing that shape to the options the Engine keeps — and to the frontend grid built
     // before the plan existed — keeps the reported options, the ResourceManager and the Program
     // on the same capacity instead of a silently divergent default.
+    if (!sequence.stream_warning().empty()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                           sequence.stream_warning().c_str());
+    }
     EngineOptions resolved = options;
     resolved.context_cache = sequence.context_cache_options();
     instance->frontend.publish_long_anchor_limit(

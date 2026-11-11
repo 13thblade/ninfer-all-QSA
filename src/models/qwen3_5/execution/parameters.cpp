@@ -3,6 +3,8 @@
 
 #include "core/weight_view.h"
 
+#include "ninfer/ops/qsa_budget.h"
+
 #include <array>
 #include <limits>
 #include <type_traits>
@@ -24,7 +26,9 @@ auto with_context(const std::string& context, Function&& function) {
 
 class Prepare {
 public:
-    explicit Prepare(const Model& model) : model_(model) {}
+    // `qsa_block_budget` is --qsa-history-tokens in blocks, or zero for the artifact's own.
+    explicit Prepare(const Model& model, std::uint32_t qsa_block_budget = 0)
+        : model_(model), qsa_block_budget_(qsa_block_budget) {}
 
     // The integer-activation route is an sm_86 addition: it feeds groupwise-int weights to the s8
     // tensor cores, which Ampere has and which no A16 route uses. It is registered per exact shape
@@ -432,7 +436,7 @@ public:
                     std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim);
                 qsa.key_rows       = q.indexer_head_dim;
                 qsa.compress_ratio = q.indexer_compress_ratio;
-                qsa.block_budget   = q.block_budget();
+                qsa.block_budget   = qsa_block_budget_ != 0 ? qsa_block_budget_ : q.block_budget();
                 out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                                 tensor(a->key_norm), std::move(attention_output),
                                                 std::move(qsa)};
@@ -697,12 +701,28 @@ public:
 
 private:
     const Model& model_;
+    // --qsa-history-tokens in blocks: nonzero replaces the artifact's indexer budget.
+    std::uint32_t qsa_block_budget_ = 0;
 };
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
-    const Prepare prepare(model);
+Parameters::Parameters(const Model& source, std::uint32_t qsa_history_tokens) : model(source) {
+    // --qsa-history-tokens: the indexer's selection width, in blocks. The flag is a whole number
+    // of 4-token blocks within the range the ops compile in (validate_options checks it too).
+    constexpr std::uint32_t kBlockTokens = static_cast<std::uint32_t>(ops::kQsaBlockTokens);
+    const std::uint32_t qsa_blocks =
+        qsa_history_tokens == 0 ? 0 : qsa_history_tokens / kBlockTokens;
+    if (qsa_history_tokens != 0 &&
+        (qsa_history_tokens % kBlockTokens != 0 ||
+         qsa_blocks > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax))) {
+        throw std::invalid_argument(
+            "qsa_history_tokens must be a multiple of 4 tokens, at most 8192");
+    }
+    if (const auto& artifact_qsa = model.config().text.qsa) {
+        text.qsa_block_budget = qsa_blocks != 0 ? qsa_blocks : artifact_qsa->block_budget();
+    }
+    const Prepare prepare(model, qsa_blocks);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head        = prepare.head(w.text.output_head_use);
