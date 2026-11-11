@@ -156,11 +156,15 @@ int main() {
                                    .qsa_history_tokens == 16384U &&
                            parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "32768"})
                                    .qsa_history_tokens == 32768U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "65536"})
+                                   .qsa_history_tokens == 65536U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", "262144"})
+                                   .qsa_history_tokens == 262144U &&
                            parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
                                  "--qsa-history-tokens", "4096", "--kv-resident", "16384"})
                                    .qsa_history_tokens == 4096U,
                        "server did not preserve --qsa-history-tokens");
-    for (const auto* value : {"5003", "32772", "8192x", ""}) {
+    for (const auto* value : {"5003", "262148", "8192x", ""}) {
         bool rejected = false;
         try { (void)parse({"ninfer-serve", "model.ninfer", "--qsa-history-tokens", value}); }
         catch (const std::invalid_argument&) { rejected = true; }

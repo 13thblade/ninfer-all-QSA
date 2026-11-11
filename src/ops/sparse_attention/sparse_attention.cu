@@ -46,11 +46,13 @@ constexpr int kTile        = 32;
 constexpr int kRowStride   = kHeadDim + 2; // BF16 elements; 129 words per row spreads the banks
 constexpr int kSplitTokens    = 8;
 constexpr int kSplitPositions = 2 * kTile;
-// The compile-time cap: a runtime selection budget is at most kQsaTopBlocksMax blocks, so the
-// split grid and the partial-softmax workspace are sized for it and stay graph-safe.
-constexpr int kMaxPositions   = kQsaBlockTokens * kQsaTopBlocksMax + 3; // selected blocks + the query's own
-constexpr int kSplits         = (kMaxPositions + kSplitPositions - 1) / kSplitPositions;
-constexpr int kPartialFloats  = kHeadDim + 2; // unnormalised output, running max, running sum
+constexpr int kPartialFloats  = kHeadDim + 2;
+// The split route's CTA count follows the call's own budget rather than a compile-time cap: the
+// budget is fixed for the process, so a captured graph replays the same grid, and a call that
+// selects few blocks never pays for the largest budget the engine accepts.
+[[nodiscard]] constexpr int split_count(std::int32_t top_blocks) noexcept {
+    return (kQsaBlockTokens * top_blocks + 3 + kSplitPositions - 1) / kSplitPositions;
+}
 
 static_assert(kPagedKVPageSize == 1 << 6 && kKvStreamPageTokens == 1 << 2);
 
@@ -221,7 +223,8 @@ __global__ void __launch_bounds__(Group * 32)
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             KvPlanes planes, const std::int32_t* __restrict__ block_table,
                             float scale, __nv_bfloat16* __restrict__ out,
-                            float* __restrict__ partial, int q_heads, int top_blocks) {
+                            float* __restrict__ partial, int q_heads, int top_blocks,
+                            int splits) {
     using Element = TileElement<Storage>;
     using Pair    = std::conditional_t<std::is_same_v<Element, __half>, __half2, __nv_bfloat162>;
     // bf16p rows decode to the BF16 a bf16 cache holds: neither quantized nor rotated.
@@ -400,7 +403,7 @@ __global__ void __launch_bounds__(Group * 32)
     if constexpr (Split) {
         float* slot =
             partial +
-            ((static_cast<std::int64_t>(t) * kSplits + blockIdx.z) * q_heads + q_head) *
+            ((static_cast<std::int64_t>(t) * splits + blockIdx.z) * q_heads + q_head) *
                 kPartialFloats;
 #pragma unroll
         for (int i = 0; i < 8; ++i) slot[lane * 8 + i] = acc[i];
@@ -424,18 +427,18 @@ __global__ void __launch_bounds__(Group * 32)
 template <int QHeads>
 __global__ void __launch_bounds__(kHeadDim)
     sparse_attention_merge_kernel(const float* __restrict__ partial,
-                                  __nv_bfloat16* __restrict__ out) {
+                                  __nv_bfloat16* __restrict__ out, int splits) {
     const int t = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     const float* first_split =
-        partial + (static_cast<std::int64_t>(t) * kSplits * QHeads + head) * kPartialFloats;
+        partial + (static_cast<std::int64_t>(t) * splits * QHeads + head) * kPartialFloats;
     constexpr std::int64_t kStride = std::int64_t(QHeads) * kPartialFloats;
     float maximum                  = -INFINITY;
-    for (int s = 0; s < kSplits; ++s) {
+    for (int s = 0; s < splits; ++s) {
         const float* slot = first_split + s * kStride;
         if (slot[kHeadDim + 1] > 0.0f) maximum = fmaxf(maximum, slot[kHeadDim]);
     }
     float sum = 0.0f, value = 0.0f;
-    for (int s = 0; s < kSplits; ++s) {
+    for (int s = 0; s < splits; ++s) {
         const float* slot = first_split + s * kStride;
         if (slot[kHeadDim + 1] > 0.0f) {
             const float weight = __expf(slot[kHeadDim] - maximum);
@@ -466,35 +469,41 @@ void launch(const __nv_bfloat16* q, const int* first, const int* selected, const
             const KvPlanes& planes, const std::int32_t* table, float scale, std::int32_t tokens,
             float* partial, __nv_bfloat16* out, cudaStream_t stream, int top_blocks) {
     const int q_heads = planes.heads * Group;
+    const int splits  = split_count(top_blocks);
     if (partial == nullptr) {
         sparse_attention_kernel<false, Storage, Shift, Group>
             <<<dim3(tokens, planes.heads), Group * 32, 0, stream>>>(
-                q, first, selected, counts, planes, table, scale, out, nullptr, q_heads, top_blocks);
+                q, first, selected, counts, planes, table, scale, out, nullptr, q_heads, top_blocks,
+                splits);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     sparse_attention_kernel<true, Storage, Shift, Group>
-        <<<dim3(tokens, planes.heads, kSplits), Group * 32, 0, stream>>>(
-            q, first, selected, counts, planes, table, scale, out, partial, q_heads, top_blocks);
+        <<<dim3(tokens, planes.heads, splits), Group * 32, 0, stream>>>(
+            q, first, selected, counts, planes, table, scale, out, partial, q_heads, top_blocks,
+            splits);
     CUDA_CHECK(cudaGetLastError());
     const dim3 grid(tokens, q_heads);
     switch (q_heads) {
-    case 6: sparse_attention_merge_kernel<6><<<grid, kHeadDim, 0, stream>>>(partial, out); break;
-    case 12: sparse_attention_merge_kernel<12><<<grid, kHeadDim, 0, stream>>>(partial, out); break;
-    default: sparse_attention_merge_kernel<kQueryHeads><<<grid, kHeadDim, 0, stream>>>(partial, out); break;
+    case 6: sparse_attention_merge_kernel<6><<<grid, kHeadDim, 0, stream>>>(partial, out, splits); break;
+    case 12: sparse_attention_merge_kernel<12><<<grid, kHeadDim, 0, stream>>>(partial, out, splits); break;
+    default: sparse_attention_merge_kernel<kQueryHeads><<<grid, kHeadDim, 0, stream>>>(partial, out, splits); break;
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
+std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens,
+                                                     std::int32_t top_blocks) {
     require(tokens > 0, "tokens must be positive");
-    // The split workspace is sized for kQsaTopBlocksMax, so any runtime budget fits and the
-    // captured graph's shape never changes; `tokens` is split tokens at most.
+    require(top_blocks >= 1 && top_blocks <= kQsaTopBlocksMax,
+            "top_blocks must be within 1..kQsaTopBlocksMax");
+    // The splits follow this call's budget, which the planner and the launches share, so the
+    // workspace is exactly what the captured grid writes and nothing more.
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::FP32,
-                       {kPartialFloats, kQueryHeads, kSplits, std::min(tokens, kSplitTokens)});
+    (void)layout.alloc(DType::FP32, {kPartialFloats, kQueryHeads, split_count(top_blocks),
+                                     std::min(tokens, kSplitTokens)});
     return layout.peak_bytes(1);
 }
 
@@ -565,7 +574,8 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
     float* partial_p = nullptr;
     if (tokens <= kSplitTokens) {
         Tensor partial =
-            workspace.alloc(DType::FP32, {kPartialFloats, q_heads, kSplits, tokens});
+            workspace.alloc(DType::FP32,
+                            {kPartialFloats, q_heads, split_count(top_blocks), tokens});
         partial_p = static_cast<float*>(partial.data);
     }
     switch (cache.storage) {

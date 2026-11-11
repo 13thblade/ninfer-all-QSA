@@ -366,7 +366,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     Tensor t_selected(d_selected.data(), DType::I32, {top, tokens});
     Tensor t_counts(d_counts.data(), DType::I32, {tokens});
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    WorkspaceArena workspace(ops::sparse_softmax_attention_workspace_bytes(tokens));
+    WorkspaceArena workspace(ops::sparse_softmax_attention_workspace_bytes(tokens, top));
     ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, workspace, t_out,
                                   nullptr, top);
     cuda_synchronize();

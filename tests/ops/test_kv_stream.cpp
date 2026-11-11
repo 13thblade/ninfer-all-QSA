@@ -195,7 +195,7 @@ public:
         : layer_(layer), random_(seed), in_(std::max(wide, ops::kKvStreamMaxTokens), top),
           out_stream_(std::size_t(ops::kKvStreamMaxTokens) * kQHeads * kDim * 2),
           out_resident_(out_stream_.bytes),
-          workspace_(ops::sparse_softmax_attention_workspace_bytes(ops::kKvStreamMaxTokens)),
+          workspace_(ops::sparse_softmax_attention_workspace_bytes(ops::kKvStreamMaxTokens, top)),
           top_(top) {}
 
     int position() const { return position_; }

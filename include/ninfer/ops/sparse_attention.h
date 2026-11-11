@@ -35,9 +35,10 @@ namespace ninfer::ops {
  * and its decoded values as stored, NVFP4 and K8V4 values rotated as well with the transform
  * applied back to the result. The kernel stages a quantized cache's decoded rows in FP16; the
  * output is compared after its BF16 store. Up to eight queries keep partial softmaxes in FP32
- * workspace; no state.
+ * workspace, whose split count follows `top_blocks`; no state.
  */
-[[nodiscard]] std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] std::size_t sparse_softmax_attention_workspace_bytes(
+    std::int32_t tokens, std::int32_t top_blocks = kQsaTopBlocksDefault);
 
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,

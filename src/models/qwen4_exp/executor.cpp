@@ -1645,7 +1645,9 @@ struct Executor::Impl {
                 bytes = std::max({bytes,
                                   ops::qsa_indexer_select_workspace_bytes(
                                       t, static_cast<std::int32_t>(pooled_slots)),
-                                  ops::sparse_softmax_attention_workspace_bytes(t)});
+                                  ops::sparse_softmax_attention_workspace_bytes(
+                                      t, static_cast<std::int32_t>(
+                                             config.indexer_block_budget()))});
             }
             if (plan.ple) {
                 bytes = std::max({bytes,

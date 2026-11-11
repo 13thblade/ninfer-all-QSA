@@ -711,7 +711,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         scratch(layout, ops::qsa_indexer_select_workspace_bytes(
                                             last, static_cast<std::int32_t>(blocks),
                                             static_cast<std::int32_t>(qsa.block_budget)));
-                        scratch(layout, ops::sparse_softmax_attention_workspace_bytes(last));
+                        scratch(layout, ops::sparse_softmax_attention_workspace_bytes(
+                                            last, static_cast<std::int32_t>(qsa.block_budget)));
                     } else {
                         scratch(layout,
                                 ops::causal_softmax_attention_workspace_capacity_bytes(
