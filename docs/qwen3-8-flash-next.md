@@ -1,14 +1,20 @@
 # Qwen3.8-Flash-Next
 
 NInfer runs Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`, 125B text parameters, about 6B
-active per token) from ISTA-DASLab's GSQ-RCO GGUF releases, converted without requantization:
+active per token) from ISTA-DASLab's GSQ-RCO GGUF releases and Unsloth's Dynamic v3.1 ones, converted
+without requantization:
 
 - [Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF):
   Q2_0 (37.6 GB), IQ2_XS (39.2 GB), IQ3_XXS (47.0 GB), IQ3_S (54.8 GB);
-- [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF).
+- [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF);
+- [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF): UD-IQ2_XS
+  (47.0 GB) and UD-IQ3_XXS (54.8 GB) were converted and run. Of its other sizes, UD-IQ1_M stores
+  IQ2_XS expert blocks, which have no CPU product, and UD-Q4_K_XL and the larger ones store Q5_1
+  tensors, which have no kernel; none of those was converted.
 
-Each release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's per-layer
-embedding (PLE), byte for byte the same in every release, the Coder build's included. A NInfer
+Each GSQ-RCO release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's
+per-layer embedding (PLE), byte for byte the same in every release, the Coder build's included. The
+table shard of Unsloth's UD-IQ2_XS release holds the same rows (the same SHA-256 of the rows). A NInfer
 model artifact describes the table it reads in its `ngram` component (the hash constants, the row
 format and the SHA-256 of the rows) and either stores the rows too, as one self-contained file, or
 leaves them to a table artifact of their own that every Flash-Next model can share. Nothing reads
@@ -26,12 +32,19 @@ The published conversions store the models without the table, which is published
 | [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 38.49 GiB | Vision and shared-Q8_0 MTP |
 | [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 54.50 GiB | Vision and shared-Q8_0 MTP |
 | [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 GiB | 256 text experts per layer, Vision and shared-Q8_0 MTP |
+| [Unsloth UD-IQ2_XS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ2_XS-NInfer-v3) | 47.43 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
+| [Unsloth UD-IQ3_XXS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-v3) | 54.66 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 
 The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
 output, images and video through its Vision tower (`--vision`, from an artifact converted with the
 tower), and MTP speculative decoding (`--spec mtp`). The three published NInfer models above now
 include Unsloth's shared-Q8_0 MTP block. The upstream GSQ-RCO GGUF sources omit it, so new
 conversions must supply it separately; see [MTP](#mtp-speculative-decoding).
+
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to Q4_K expert banks whose tables are
+16-byte aligned (`MoeTable::aligned16`): device banks, a rank's share under tensor parallelism, and
+the slot pools that host and disk experts' prompt chunks fill. The published Q2_0, IQ3_S and IQ1_M
+releases have no Q4_K experts.
 
 ## Convert
 
@@ -63,6 +76,28 @@ python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
 
 Every conversion containing PLE reads the table shard once more to hash it (a minute or so for 28.8 GB), since
 the model records the digest of the table it reads whether or not it stores the rows.
+
+A release split by llama.cpp (`llama-gguf-split`) converts the same way. Unsloth's Dynamic v3.1
+files of [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
+have this layout: the first shard holds the metadata and no tensor, the next one or two hold the
+model, and the last holds the table. `--source gguf=` names the first shard; the converter opens
+the shards beside it that the name counts (`-00001-of-0000N.gguf`) and reads each tensor from the
+shard that stores it. An absent shard is left out, so the table shard may lie elsewhere; a model
+tensor that no present shard stores, a cut shard, a tensor stored twice and a `split.count` that
+differs from the name are refused. The table shard is still the `ngram` source, and any release's
+table shard serves: the rows are the same.
+
+```bash
+# Unsloth UD-IQ2_XS without the table, with the Vision tower and the shared-Q8_0 MTP block.
+python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
+  --recipe qwen3_8_flash_next_gguf --components text,vision,mtp \
+  --source gguf=/path/to/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf \
+  --source ngram=/path/to/Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf \
+  --source vision=/path/to/mmproj-BF16.gguf \
+  --source mtp=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --device cpu --rows-per-chunk 65536 \
+  --name qwen3.8-flash-next --out models/flash-next-ud-iq2_xs.ninfer
+```
 
 `--layers A..B` makes a qualification artifact from source layers A through B-1, using zero-based,
 half-open bounds. It supports the HF, GGUF and native-Q2 recipes. The embedding, final mixer and
@@ -217,11 +252,11 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | Option | Meaning |
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers and a prompt span's stack between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
-| `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
+| `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Calls of up to eight tokens (decode steps, one request's verification) use the CPU; wider calls run every expert on the GPU. GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
-| `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into; `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. Default: `2` with the automatic cache, where both buffers hold cache slots between prompts, else `1`; with an explicit `--expert-cache-mib` the buffers take memory beside the cache. On an RTX 4090 with IQ3_S host experts the second buffer prefilled a 31,865-token prompt at 3,430 instead of 2,683 tokens/s and decoded within 2.4% of the one-buffer speed (one run each); on an RTX 3090 with Q2_0, before the buffers became cache slots, 8.5-10.5% faster at 5,462 tokens and 1.9-2.3% at 31,860 |
+| `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into; `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. When half the free memory holds not even one, prompt chunks and verifications copy their missing experts through the staging in rounds instead. Default: `2` with the automatic cache, where both buffers hold cache slots between prompts, else `1`; with an explicit `--expert-cache-mib` the buffers take memory beside the cache. On an RTX 4090 with IQ3_S host experts the second buffer prefilled a 31,865-token prompt at 3,430 instead of 2,683 tokens/s and decoded within 2.4% of the one-buffer speed (one run each); on an RTX 3090 with Q2_0, before the buffers became cache slots, 8.5-10.5% faster at 5,462 tokens and 1.9-2.3% at 31,860 |
 | `--iq1m-experts matrix\|vector` | GGUF IQ1_M experts of calls past eight tokens: ggml's integer matrix kernel once a call routes more than 16 rows to each expert on average for gate and up products and 6 for down products, the vector kernel below (default), or always the vector kernel in groups of eight columns; the two round the sums differently ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) |
 | `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most half its CPUs (the mask and a container CPU quota); the rest stay with the threads that drive the GPU and serve requests ([the CPU share on one RTX 4090](#the-cpu-share-on-one-rtx-4090)). Each thread is pinned to a physical core and spins while requests decode |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
@@ -238,11 +273,11 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
-| `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
+| `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides); with host or disk experts each GPU copies and caches the experts of its own stage's layers ([measured](#host-and-disk-experts-over-two-rtx-4090s)) |
 | `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer divided over the GPUs, its GDN key heads, its sparse-attention KV heads and its routed experts (GGUF banks on the devices), each GPU keeping the hyper-connection stack, running a run of the shared expert and projecting its rows of the head; MTP and Vision on the first ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
-CPU computes a share of each decode or verification call's missing experts ([the CPU
+CPU computes a share of the missing experts of each call of up to eight tokens ([the CPU
 share](#the-cpu-share)), MTP drafts three tokens a round when the artifact carries the block
 ([MTP](#mtp-speculative-decoding)), and the sparse-attention KV past 32,768 positions streams from
 host memory ([streamed KV](#streamed-sparse-attention-kv)), which leaves the device memory to the
@@ -271,7 +306,8 @@ every layer, gives each text layer the slots its most routed experts take; the M
 even share. Strata (MIT) measured this tier and its constants on Qwen3.8-Flash-Next.
 
 With the automatic cache and host experts, the device buffers that prompt chunks copy a layer's
-uncached experts into (`--expert-prefill-buffers`) are cache slots between prompts: every layer
+uncached experts into (`--expert-prefill-buffers`) and the stack of a prompt span (40 KiB a span
+token: 0.63 GiB for sixteen 1,024-token chunks) are cache slots between prompts: every layer
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
@@ -298,30 +334,38 @@ an 8-core EPYC 7302P it decoded 3.1 tok/s at a share of 0 and 5.3 at 0.5 against
 logits stay within top-1 but are not numerically qualified (maximum relative L2 0.32-0.60 against
 resident experts). A GGUF bank, including a GGUF MTP companion beside native text weights, keeps
 its GPU route. Linux registers native weight objects separately; Windows uses pageable weights and
-bounded pinned staging. Use `--max-concurrency 1` for native host execution.
+bounded pinned staging. Use `--max-concurrency 1` for native host execution. Under WDDM (Windows,
+and WSL2, recognised by `/dev/dxg`) a device's copies queue behind one another whatever their
+streams, so the tables, the CPU/GPU partition and the CPU's sum that a decode graph takes after it
+waited for the host reach the device through mapped host memory and a copy kernel; a queued copy
+there would hold back the expert copies that end the wait. The bytes are the same either way.
 
 ### The CPU share
 
-With GGUF host experts, CPU threads compute part of a call's missing experts from their stored
-blocks while the GPU copies and runs the rest (`--expert-dma-share auto`, the default, or a fixed
-share below `1`); the GPU then adds the CPU's products into the same fixed-point sum as its own.
-Decode steps, verifications of up to 64 tokens (several requests' joint one included) and prompt
-chunks of up to 64 tokens, such as a short chat prompt or the tail after its reusable anchor, use
-the CPU; longer prompt chunks always run on the GPU. A fixed share gives the CPU the experts with
-the fewest pairs. `auto` gives each call the split whose copies and CPU products end soonest by two
-straight lines fitted to earlier calls' copy and CPU times (a sample counts at most four times or a
-quarter of its line's value); a side left unused for eight calls takes one expert, so both lines
-follow the machine. Prompt chunks wider than the widest verification fit lines of their own, since
-their many pairs per expert would skew the decode steps'. On an RTX 3090 with IQ3_S host experts
-(EPYC 7K62), a 39-token chat prompt's first token came after 0.23-0.27 instead of 0.42-0.44 s once
-such chunks used the CPU, and the second request after a start, with the expert cache still cold,
-decoded 52 instead of 43 tokens/s without drafts; a later verification round took as long as before.
-Such chunks take the decode steps' vector kernels, which round each 32 activations' scale to FP16
-where the matrix kernel keeps IQ3_S's in FP32 and sum in another order, so answers after them
-change. Letting the CPU take chunks of up to 255 tokens brought a 196-token prompt's first token
-from 1.02-1.10 to 0.74-0.80 s but decoded 4-5% slower with MTP afterwards. An expert the CPU
-computed takes no slot and crosses no bus; the expert cache's rounds decide whether it enters the
-cache ([the expert cache](#the-expert-cache)). The CPU threads are pinned one to a physical core and
+With GGUF host experts, CPU threads compute part of the missing experts of a call of up to eight
+tokens (a decode step, one request's verification, a round of up to eight verified tokens) from
+their stored blocks while the GPU copies and runs the rest (`--expert-dma-share auto`, the default,
+or a fixed share below `1`); the GPU then adds the CPU's products into the same fixed-point sum as
+its own. Wider calls (a round verifying more than eight tokens, prompt chunks) run every expert on
+the GPU with the matrix kernel, as device and disk experts do: the CPU reproduces the vector
+kernel, which rounds each 32 activations' q8_1 scale to binary16 where the matrix kernel keeps it in
+FP32 and sums in another order, so a call's result does not depend on where its experts reside. A
+fixed share gives the CPU the experts with the fewest pairs. `auto` gives each call the split whose
+copies and CPU products end soonest by two straight lines fitted to earlier calls' copy and CPU
+times (a sample counts at most four times or a quarter of its line's value); a side left unused for
+eight calls takes one expert, so both lines follow the machine.
+
+Calls of 9 to 64 tokens on the GPU cost speed where the expert cache is small. On an RTX A6000
+(EPYC 7452 with a 10-CPU quota, the Q2_0 release's host experts with a 12 GiB cache,
+`--max-concurrency 8`, 2026-11-10) a fresh 44- to 46-token prompt's first token came after
+244-372 ms, against 168-228 ms when the CPU shared such calls through the vector kernel (whose
+answers then differed from device experts'), and eight requests under `--spec mtp --draft-tokens 3`
+decoded 72.3-75.2 instead of 104-113.5 tokens/s. With the automatic cache (34.1 GiB at startup) the
+matrix kernel was faster: 113-115 instead of 152-157 ms to the first token, 166.8-174.8 instead of
+140.2-146.7 tokens/s. The automatic drafting keeps a round of several requests within eight tokens
+([MTP with several requests](#mtp-with-several-requests)). An expert the CPU computed takes no slot
+and crosses no bus; the expert cache's rounds decide whether it enters the cache ([the expert
+cache](#the-expert-cache)). The CPU threads are pinned one to a physical core and
 spin while requests decode, so a call's products start without a wake-up.
 
 The CPU computes the GPU's decode products bit for bit, so outputs, log probabilities and context
@@ -471,8 +515,9 @@ cache. The residency scheme follows Strata's `kv_stream` (MIT).
 
 ### Sequences, KV and the context cache
 
-`--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the nine formats the
-Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 12.4 KiB in `int8`, 12.1 KiB
+`--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the ten formats the
+Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 18.4 KiB in the lossless
+`bf16p`, 12.4 KiB in `int8`, 12.1 KiB
 in `fp8`, 9.6 KiB in `rk8v4`, 9.4 KiB in `k8v4`, 6.8 KiB in `nvfp4`, 6.6 KiB in `rk4v4` and
 `rk4v4-e8`, and 5.1 KiB in `rk2v4-e8`; the indexer's pooled keys stay FP32 beside it, another
 1.5 KiB a position in every format. The sparse attention decodes each row it reads, keys in the
@@ -487,7 +532,8 @@ at startup). Requests are admitted
 in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest tokens
 left, so a short or cached request is not held behind a long prompt for its whole prefill (a prompt
 passed over eight times goes next, and a prompt with media, once begun, finishes first). A step is
-one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt, media
+one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt
+(sixteen under `--max-concurrency 1`, where no other prompt waits behind a step), media
 or not (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
 since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
@@ -511,7 +557,8 @@ takes the next chunks of the other such prompts that are prefilling, in the same
 fit the span: their chunks reach each layer together, so the layer's uncached experts cross the
 bus once for all of them. A step that does not end its prompt takes whole chunks, so each prompt
 runs the chunks it would run alone and computes the same bits. A prompt that would resume from a
-prefix another prompt of the step is about to keep waits for it. On the RTX 3090 above (host
+prefix another prompt of the step is about to keep waits for it, and a step that passes a shared
+prefix (below) runs alone. On the RTX 3090 above (host
 experts), eight requests got their last first token after 6.2-6.7 s instead of 19.3-20.9 s
 (9.5-9.7 instead of 22.8-23.7 s with BF16 KV) and finished 1.77-1.94 times as fast with MTP over
 the nine formats and 1.78 times as fast without drafts; two and four requests finished 1.37 and
@@ -523,26 +570,43 @@ when the template marks no turn), 74 MiB on the device: a later prompt that cont
 sequence holds resumes from its live state, and one that repeats the prompt up to that point (the
 next turn of a chat, which renders the previous answer without its reasoning) resumes from the
 snapshot.
+A turn that a stop string ends resumes where its visible text ends. The sequence keeps only the
+tokens before the one that begins the stop string's match: a round that holds such a token commits
+the tokens before it, and the next step reads the rest. A match that stays open keeps a second
+snapshot of the sequence there (another 74 MiB a sequence, with the context cache), which the turn
+goes back to when the stop string ends it in a later step, so the next prompt continues that state.
 Either way only the new tokens are prefilled; the response's prompt summary reports how many were
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
-`--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
+A prefix with images or video is the same only with the same media at the same places (each
+image's or video's content digest, grid and timestamps); a prompt that resumes past them
+encodes only its media after the prefix.
+`--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch, without the step ends below
+or at the turn closure.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
 each of 128 tokens or more, the end of a disposable request such as a decision read excepted) is
 kept as an image in host memory, and so is the state where the frontend marks a prefix other
 requests share (the end of the leading system messages, of the tool declarations, a declared
-cache boundary, 128 tokens or more): a prompt step ends there, and requests with the same prefix
-resume after it on any sequence, also when they arrive together, since a prompt that has not
-started prefilling looks for images again at its first step. An image is the paged KV and pooled keys
+cache boundary, 128 tokens or more): a prompt step ends there, or with host or disk experts on one
+GPU, where the tokens on each side fill more than a narrow chunk (64 tokens, 8 with
+`--expert-tail-skip`), a span runs on past it in the chunks two steps split there would run and keeps the state
+there as it passes, so the experts cross the bus once for both sides
+([measured](#media-conversations-on-one-rtx-4090)). Requests with the same prefix resume after it
+on any sequence, also when they arrive together, since a prompt that has not started prefilling
+looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
-pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
-the store pins more only when it holds more. Pinning while a request waits is slow where the
+pages of two images of a whole context (within a quarter of the budget) are pinned at startup.
+Once the Engine has had nothing to run for 50 ms, it pins free pages back up to that many in 64 MiB
+chunks, within the budget; a request that arrives meanwhile waits for the chunk in progress (about
+32 ms, [measured](#media-conversations-on-one-rtx-4090)), and the store pins pages itself only when
+the free ones fall short. Pinning while a request waits is slow where the
 experts and the page cache fill the host's memory: on an RTX 4090 host with IQ3_S host experts,
 pinning the two images of a 32K-token prompt held a short prompt after it for 2.3 s, and faulting
 in pageable memory for them 1.8 s; into the pages pinned at startup they copy in 15 ms, and the
 short prompt's first token came 0.45 s after it arrived (2.9 s before). Pinning the startup
-pages (2 GiB with the default 8 GiB budget) adds about 2 s to startup. A prompt that continues a kept prefix further than any free
+pages (2 GiB with the default 8 GiB budget) adds about 2 s to startup. The other families pin
+their whole store at startup and never pin while a request waits. A prompt that continues a kept prefix further than any free
 sequence resumes from its image, copied back into a sequence. `--host-kv-mib` (or `--host-cache-mib`) is the budget, 8 GiB by
 default; past it the least recently used images go to the disk tier with `--disk-kv-path DIR`
 (`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format, MTP
@@ -567,9 +631,12 @@ first device, beside the token embedding) and takes images and video as the Qwen
 the frontend renders the media tokens, the tower encodes the prompt's media before its first
 chunk, and their merged embeddings replace those tokens' embeddings. A media prompt rotates its
 positions on the three RoPE axes the frontend computes (text positions on all three, then each
-later token at its index plus the prompt's offset); it prefills in a pass of its own and is not
-kept for reuse by the context cache. Flash-Next media requests use plain decoding even when
-MTP is enabled. A fresh text-only request can use MTP again after the media request finishes.
+later token at its index plus the prompt's offset); it prefills in a pass of its own. The context
+cache keeps media prompts as it keeps text ones: the next turn of a conversation with images
+resumes past them, and the tower encodes only the media after the resumed prefix, whose merged
+tokens are what `--vision-max-merged` limits. The MTP block follows media prompts too, so their
+requests draft: the cell before a media token takes that token's merged embedding, and the cells
+rotate at the target's positions, on the three axes over media.
 
 ### MTP speculative decoding
 
@@ -577,10 +644,11 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
 with the block and host experts drafts up to three tokens a round with `--draft-min-p 0.5` (a
 verification window's routes share the layer's missing experts, which the CPU computes while the
-cached ones run), unless it also carries the DFlash2 drafter, which then drafts
+cached ones run; a round of several requests drafts fewer, [below](#mtp-with-several-requests)),
+unless it also carries the DFlash2 drafter, which then drafts on one device
 ([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without drafts
-([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Text-only
-decoding requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
+([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Decoding
+requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N
 drafts in one pass, and the acceptance keeps the drafts while they equal the model's own draw at
@@ -623,9 +691,9 @@ its prompt is in, a prefix the context cache restores included. Following a toke
 attention, which leaves its KV and indexer state, and its router, whose routes the expert cache
 counts, but not its experts: only a draft reads the stack they leave. Up to eight requests run their
 rounds together, one MTP pass for all of them per draft and one verification pass. A request decodes
-without drafts when its prompt has media, near the end of its context, with one token left in its
-output or thinking budget, and while a `--post-thinking` request still reasons. N-gram copy
-proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
+without drafts when its prompt ends with a media token, near the end of its context, with one token
+left in its output or thinking budget, and while a `--post-thinking` request still reasons. N-gram
+copy proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
 `--lm-head-draft` are refused.
 
 With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
@@ -640,20 +708,31 @@ the requests' measured draft survival and the round times it has measured at eac
 it goes down to one draft: the MTP block runs one step per draft, so a narrower round also drafts
 less, where the Qwen3.5 models' drafts are ready before the round. Each step count has its own
 draft-chain graph and each width its own verification graph, captured at startup. A round of
-several requests drafts as the automatic drafting does
-([below](#mtp-with-several-requests)).
+several requests drafts three steps at most ([below](#mtp-with-several-requests)).
 
 #### MTP with several requests
 
 A round of several requests verifies their anchors and drafts in one pass. With host experts, a
-pass of up to 64 tokens has its missing experts computed by the CPU or staged as a decode step's
-are ([the CPU share](#the-cpu-share)); a wider one copies them into the slot pools as a prompt
-chunk does. On an RTX 4090 at 425 W (Threadripper PRO 3995WX, Q2_0 host experts, the automatic
-cache, `--max-concurrency 8`; 256 greedy tokens a request after a code prompt of about 90 tokens;
-aggregate tokens per second, one request's second run, the mean of three runs of eight) the
-automatic drafting gave 1.16, 1.08, 1.07, 1.01 and 1.08 times the speed without drafts at one,
-two, three, four and eight requests, and three drafts every round without the floor 1.19, 1.09,
-1.00, 1.00 and 1.03 times.
+pass of up to eight tokens has its missing experts computed by the CPU or staged as a decode step's
+are ([the CPU share](#the-cpu-share)); a wider one copies every missing expert to the GPU. Under the
+automatic drafting with a CPU share a round therefore verifies at most eight tokens: three drafts a
+request for two requests, one for three or four, and none for five to eight, which decode without
+drafts. On an RTX A6000 (EPYC 7452 with a 10-CPU quota, the Q2_0 release's host experts with a
+12 GiB cache, `--max-concurrency 8`, the automatic drafting with the release's DFlash2 drafter; 256
+greedy tokens a request after a short prompt, two or four runs a cell, 2026-11-10), in aggregate
+tokens per second:
+
+| Requests | Without drafts | Four drafts a request | Bounded rounds (the default) |
+|---:|---:|---:|---:|
+| 1 | 51.3-67.8 | 92.7-120.5 | four drafts |
+| 2 | 75.4-83.5 | 90.2-101.6 | 99.3-115.5 |
+| 3 | 90.4-97.7 | 85.1-94.5 | 104.1-112.2 |
+| 4 | 96.2-103.4 | 79.1-90.0 | 110.0-119.6 |
+| 8 | 109.4-113.5 | 82.3-90.4 | 111.6-116.4 |
+
+When the CPU also shared verifications of up to 64 tokens, through the vector kernel and with
+host experts' answers then differing from device experts', four drafts a request had given
+110.2-114.8 tokens/s at three requests and 128.0-129.0 at eight on this host.
 
 Greedy answers of four or eight drafting requests, whose rounds can verify more than eight columns
 at once, are not reproducible bit for bit: on an RTX 3090 with IQ3_S host experts, 4 to 8 of
@@ -665,9 +744,10 @@ until each of its requests has reached the floor or the round's width, so a roun
 with the controller's widths (up to eight drafts, the floor 0.5) ran nearly every step for all of
 them and gave 0.89 and 0.91 times the speed without drafts at four and eight requests; the packed
 plan then left drafts unverified, and once kept 18 of 555 at two requests. A round of several
-requests therefore drafts as the automatic drafting does, three steps at most, each request
-verifying its drafts up to the floor: 1.16, 1.14, 1.09, 1.02 and 1.08 times the speed without
-drafts at one, two, three, four and eight requests on the host above.
+requests therefore drafts three steps at most, each request verifying its drafts up to the floor:
+on an RTX 4090 with Q2_0 host experts and the automatic cache, when the CPU also shared
+verifications of up to 64 tokens, 1.16, 1.14, 1.09, 1.02 and 1.08 times the speed without drafts
+at one, two, three, four and eight requests.
 
 With disk experts a layer reads the experts its cache lacks before it runs, and a verification's
 drafts route to experts of their own: three drafts every round gave 0.91, 0.82 and 0.64 times the
@@ -691,17 +771,17 @@ proposes from the context in place of the drafter as it does under MTP; `--adapt
 `--spec mtp`, and pipeline stages are refused. The drafter's mathematics is in
 [DFlash and DFlash2](maintainer/dflash.md#qwen38-flash-next).
 
-Without `--spec`, an artifact with the drafter and host experts drafts four tokens a round with
-`--draft-min-p 0.7`. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
+Without `--spec`, an artifact with the drafter and host experts on one device drafts four tokens a
+round with `--draft-min-p 0.7`; over pipeline stages its MTP block drafts instead. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
 a code prompt and after a prose prompt, and the answer to a 144-token prompt; the mean of two runs)
 that decoded 92.3, 77.9 and 58.2 tokens per second with the IQ3_S release, 1.10, 1.06 and 1.17
 times the MTP block's automatic drafting, and 122.4, 93.7 and 113.8 with the Coder IQ1_M release,
 1.19, 1.09 and 1.15 times MTP and 1.72, 1.31 and 1.59 times without drafts. Every answer matched
 decoding without drafts. Seven drafts with the floor 0.8 decoded within 5% of four (1.13 times MTP
-in geometric mean, as four) while verifying 68-73% more drafts. With two requests at once (IQ3_S, 256
-tokens each), four drafts gave 1.09 and 1.05 times the aggregate speed without drafts on the code
-and prose prompts (MTP 1.18 and 0.97), with four 1.04 and 0.93 (MTP 0.89 and 0.89); concurrent
-answers to one prompt differ from run to run with or without drafts. `--lookup-ngram 3` beside
+in geometric mean, as four) while verifying 68-73% more drafts. A round of several requests drafts
+fewer, so that it verifies at most eight tokens ([MTP with several
+requests](#mtp-with-several-requests)); concurrent answers to one prompt can differ from run to run
+with or without drafts. `--lookup-ngram 3` beside
 seven drafts decoded 85.9, 76.4 and 49.5 tokens per second on IQ3_S, below the drafter alone.
 Under tensor parallelism over two RTX 3090s (Q2_0, device experts, which draft only under
 `--spec`), four drafts with the floor 0.7 decoded 1.46, 1.21 and 1.24 times as fast as without
@@ -741,22 +821,30 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   pool and the two phases then took a 9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from
   a cold expert cache). The expert phase runs up to 4,096 tokens of consecutive chunks in one call,
   each chunk routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
-  1,024-token chunk; a last chunk of up to 64 tokens (eight without a CPU share) runs alone, after
+  1,024-token chunk; a last chunk of up to 64 tokens (eight with `--expert-tail-skip`) runs alone, after
   the layer's wider calls, since it may copy experts into cache slots those calls read (with IQ3_S,
   a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090). With
   two prefill buffers (the default with the automatic expert cache, `--expert-prefill-buffers`) the
   pool has two buffers that consecutive layers alternate between: each layer's copies start as soon
   as the layer two back is done with its buffer, while the layer before it runs. A thread of its own
   issues each layer's copies, hundreds of operations that would otherwise hold the launching thread
-  while the copy queue is full, so the layers in between keep being launched. Weighted expert
+  while the copy queue is full, so the layers in between keep being launched. An engine of one
+  sequence (`--max-concurrency 1`, the CLI) keeps no other prompt waiting behind a step, so its
+  spans take sixteen chunks where the further eight chunks' planes (46 KiB a token) fit 1/24 of
+  the memory the device has free at startup: in a prompt past eight chunks each layer's uncached
+  experts then cross the bus half as often ([Expert placements](#expert-placements)). Weighted expert
   outputs are summed in fixed point, so the result does not depend on the order experts finish in.
 - Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens (eight
-  without a CPU share) of GGUF host experts run in two stages. A kernel splits the call's routes
-  into the cached experts, which run at once, and the missing ones, which it posts to a host service
-  through mapped memory, without a host synchronization; the service copies each missing expert
-  into the slot of the layer's least recently used expert of the lowest frequency tier (or the CPU
-  computes its share), the layer waits for it (on the device in a replayed graph, on the host in
-  an eager pass such as a prompt chunk's), and the second stage runs it. The service spins for
+  with `--expert-tail-skip`) of GGUF host experts run in two stages. A kernel splits the call's
+  routes into the cached experts, which run at once, and the missing ones. A call of up to eight
+  tokens posts them to a host service through mapped memory, without a host synchronization; the
+  service copies each missing expert into the slot of the layer's least recently used expert of
+  the lowest frequency tier (or into staging, or the CPU computes its share), the layer waits for
+  it (on the device in a replayed graph, on the host in an eager pass such as a prompt chunk's),
+  and the second stage runs it. A wider call runs eagerly and takes the matrix kernel, as device
+  experts do: the host waits for the split, copies the missing experts into cache slots or into
+  half of the 128 MiB staging, a round at a time, and each round's products run while the next
+  round's copies cross the bus. The service spins for
   half a second after each pass start, call and served request; asleep, it still looks for
   requests every 10 ms, since a replayed layer posts its request from the device and no host call
   wakes the service for it. The decode form of the expert
@@ -766,7 +854,11 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   row by row over all its experts, summing a row in registers. The decoding of Q2_0, the routed
   experts' format, is integer-throughput bound, so its activations come transposed and its codes
   need two operations a word. The shared expert runs on a second stream meanwhile. All of it is
-  the separate kernels' arithmetic bit for bit.
+  the separate kernels' arithmetic bit for bit. Device and disk experts take the same decode form
+  in one stage, the shared expert on the second stream as well: on an RTX PRO 6000 Blackwell
+  Server (600 W), the UD-IQ2_XS release with device experts and no n-gram table decoded a
+  300-token greedy answer at 131.2 instead of 118.9 tok/s, with MTP and 4 drafts at 171.3 instead
+  of 153.0, and with disk experts at 70.6 instead of 67.5, the same bytes (November 10, 2026).
 - The expert cache counts the routes each forward pass took (decayed per token) and, between
   passes, copies the experts it needed most into its slots and points the tables at them: for
   every layer with mapped misses, and after a prompt chunk with staged ones. With disk experts the
@@ -813,7 +905,8 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
 Greedy decoding, one request, the generate test (`ninfer_qwen4_exp_generate_real`) without drafts.
 Decode is measured over a short answer (78 tokens for Q2_0, 81 or 82 for IQ3_S) and over the first
 five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks, which with host
-or disk experts run as a span of eight chunks and a last chunk of 367 tokens. Host memory is
+or disk experts ran as a span of eight chunks and a last chunk of 367 tokens (the span of that
+build; an engine of one sequence now takes the prompt as one span). Host memory is
 the process's peak resident set (with host experts, the pinned bank), device memory the most
 `nvidia-smi` showed in use. With host or disk experts the expert cache takes the memory the GPU has
 free and fills while the requests run.
@@ -846,8 +939,9 @@ the others), the n-gram table as the separate artifact, one run per row:
 | RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.7 GiB | 12.3 tok/s | 6.0 tok/s | 179 tok/s |
 
 - **Prompt spans.** With host or disk experts a prompt longer than a chunk prefills in spans of up
-  to eight chunks, so a layer's missing experts cross the host link once per span rather than once
-  per chunk; the chunk still sets each call's width. The CLI with 1,024-token chunks and MTP drafts
+  to eight chunks (sixteen now for one request at a time, below), so a layer's missing experts
+  cross the host link once per span rather than once per chunk; the chunk still sets each call's
+  width. The CLI with 1,024-token chunks and MTP drafts
   on the 7,680-token needle prompt with Q2_0 disk experts, 16 greedy tokens, this build
   against one that ran disk experts chunk by chunk with the MTP block's experts in the text layers'
   slots, interleaved on the same hosts, two runs each:
@@ -868,6 +962,31 @@ the others), the n-gram table as the separate artifact, one run per row:
   chunk keeps its experts, but this prompt ends in a separate 367-token chunk; without the releases
   the RTX 5090 decoded them at the rate chunk by chunk. With host experts they decode 1% slower on
   the RTX 5090, 8% slower on the RTX 4090 and 2% faster on the RTX 3090.
+- **Spans of sixteen chunks.** On November 10, 2026 a rented RTX 5090 (575 W, driver 595.91.07,
+  CUDA 13.4; EPYC 7543, 12.75 CPUs of a host other tenants loaded to 24-56 of its 120 threads) ran
+  the UD-IQ2_XS release from the CLI with host experts, 1,024-token chunks and no drafts, this build
+  against one held at spans of eight chunks, in interleaved pairs. Prefill, tok/s:
+
+  | Prompt | Spans of eight chunks | Sixteen (one request at a time) |
+  |---|---:|---:|
+  | 7,680 tokens, one span either way | 4.20k, 3.89k | 4.26k, 3.75k |
+  | 20,181 tokens | 4.01k, 3.90k | 4.34k, 4.29k |
+  | 32,256 tokens | 4.33k, 4.23k, 4.13k | 5.28k, 5.22k, 5.30k |
+  | 64,512 tokens | 4.77k, 3.83k | 5.31k, 5.23k |
+  | 32,256 tokens, disk experts in the page cache | 1.84k, 1.69k | 2.38k, 2.29k |
+  | 32,235 tokens, the DFlash2 drafter loaded | 4.76k, 3.81k | 5.24k, 5.31k |
+  | 32,235 tokens, `--expert-cache-mib 7000` | 3.13k, 2.90k | 4.30k, 4.33k |
+
+  The answers were the same text. With the span's stack in the automatic cache between prompts
+  the engine started with 23.4 GiB of expert cache (14,544 slots) instead of 23.1 GiB (14,400);
+  with disk experts, which lend nothing, with 23.2 instead of 23.6 GiB. The 256 tokens after a
+  32,235-token prompt decoded at 73.0-80.7 tok/s (median 76.3 of five runs) against 75.1-80.8
+  (77.5). After a 52-token prompt they decoded at 78.1-85.6 (median 82.4 of eight runs) against
+  76.2-86.4 (81.8) on the build before the change; ten pairs against the eight-chunk build of an
+  earlier commit gave 76.5-86.0 (81.4) against 81.2-86.6 (84.7), and that build ran 1.2% ahead of
+  the build before the change as well, so the host's load, not the spans, sets these differences.
+  Not measured: another card, a prompt step between the decode rounds of other requests, and the
+  DeepSeek-V4.1 executor, whose spans are 16,384 tokens already.
 - **NUMA.** Unpinned on another two-socket RTX 3090 host (Xeon E5-2690 v4), Q2_0 decoded the short
   answer 9% slower with host experts and 43% slower with disk experts in the page cache than pinned
   to the GPU's node.
@@ -920,6 +1039,25 @@ Where a decode step goes, from an Nsight Systems trace of the generate test's gr
 between them. A token read about 4 GB of weights when the hyper-connection projections were BF16,
 the largest share (1.27 GB, more than the ten routed experts of every layer, 0.66 GB); they are
 Q8_0 now, 0.67 GB.
+
+### Host and disk experts over two RTX 4090s
+
+Two RTX 4090s (450 W, PCIe without peer access, so the stages' transfers go through host memory)
+in a Vast container with an EPYC 7713 and 503 GB of RAM ran the Q2_0 release with its IQ4_NL table
+on two pipeline stages, 2026-11-07. Host and disk experts scored the first 40 KB of the WikiText
+stream (`scripts/pods/residency_check.sh` with `ARGS='--devices 0,1'`) at perplexity 2.540839
+each, the value one GPU gives with either. Through `ninfer-serve`, one request at a time, 64 greedy
+tokens after a 15-token and after a 5,879-token prompt, each configuration run once:
+
+| Experts | Options | Drafts | Expert cache | Prefill, 5,879 tokens | Decode, short / long |
+|---|---|---|---:|---:|---:|
+| host, one GPU | `--max-context 32768` | DFlash2, 4 | | 2,581 tok/s | 116.8 / 127.4 tok/s |
+| host, two stages | `--max-context 32768` | MTP, 3 | 17.8 + 16.3 GiB | 3,806 tok/s | 204.0 / 208.5 tok/s |
+| disk, two stages | `--ngram-residency disk --max-context 131072 --kv-capacity 131072 --kv-dtype rk8v4` | none | 20.4 + 19.9 GiB | 1,128 tok/s | 44.4 / 104.6 tok/s |
+
+All three gave the same tokens. The two caches together hold nearly every expert, so after its
+first reads the disk run decodes from the GPUs; its short prompt came first, with the caches cold.
+Before this build either placement over stages stopped at the first expert copy of the second GPU.
 
 ### Host experts on one RTX 3090
 
@@ -1084,6 +1222,75 @@ of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than 
 With host experts a verification's four columns route to up to four times as many experts, each
 missing one crossing the bus, so three drafts gained about 12% here; after the October 9
 host-expert work three drafts decode 90-123 tok/s against 87-94 plain (table above).
+
+### Media conversations on one RTX 4090
+
+One RTX 4090 (480 W) in a Vast container with an EPYC 7713 ran the Q2_0 release with its table and
+`--vision` through `ninfer-serve`, 2026-11-07: host experts, one request at a time, the release's
+DFlash2 drafts (the default), a four-turn chat whose system text is the first 24,000 characters of
+the WikiText stream, a 768x512 image in the first and third user turns, greedy answers of up to 128
+tokens with thinking off, each turn sending the whole history again; then a conversation with the
+same system text and another question, and a text conversation with characters 30,000-54,000.
+Three starts of each build, interleaved: before media prompts were cached (`d6a658b8a`), the first
+build that cached them (`0c08dfefd`), and `e38464e9b`, whose first step passes the system text's end.
+The client sent each request as soon as the last answer came:
+
+| Turn | Prompt tokens | `d6a658b8a` | `0c08dfefd`: reused, prefill | `e38464e9b` |
+|---|---:|---:|---:|---:|
+| 1, image | 5,831 | 1.55-1.67 s | 0, 2.82-3.17 s | 1.60-1.76 s |
+| 2 | 5,985 | 1.35-1.38 s | 5,958, 0.11-0.15 s | 0.12-0.14 s |
+| 3, image | 6,422-6,434 | 1.45 s | 6,006, 1.03-1.31 s | 1.03-1.15 s |
+| 4 | 6,572-6,586 | 1.48-1.52 s | 6,548, 0.10-0.12 s | 0.11-0.12 s |
+| Same system text | 5,441 | 1.32-1.34 s | 5,417, 0.66-0.88 s | 0.75-0.78 s |
+
+The four turns prefilled in 5.86-6.03 s, 4.07-4.64 s and 2.87-3.14 s. In `0c08dfefd` the first
+turn's step ended at the system text, whose state the store keeps for the next conversation, and
+the image and question after it were a second pass, which with host experts copied the experts
+again; here one span runs both sides and keeps the state at the system text's end as it passes. The
+third turn's 416 new tokens still take one pass that copies the experts. `e38464e9b`'s answers are
+`0c08dfefd`'s; `d6a658b8a`'s differ from the first turn on, since its media prompts did not end
+steps at the cache's frontiers (the end of the system text and of the last user message).
+
+The text conversation's first turn (6,383 tokens, nothing reused, the same answer in all three
+builds) took 1.60-1.63 s in `d6a658b8a` and 2.57-2.77 s in the later two. The earlier conversations'
+images had taken the host pages pinned at startup (about 1.9 GB here), so storing the next images
+pinned more pages while the request waited; run before the media conversation, it took 1.72-1.89 s
+in all three (one start each). The store pins pages only until it holds its budget (8 GiB by
+default) and reuses them after; `d6a658b8a` stored no media images. No request left the Engine the
+50 ms of idle time after which it pins free pages back.
+
+Another RTX 4090 (450 W) host with an EPYC 9334 ran the same chat on 2026-11-08 against
+`e38464e9b` and this build, which pins free pages back while it is idle, with the client pausing
+before each request after the first; three starts of each build, interleaved, the server on the
+GPU's NUMA node (`taskset`). Prompt times as the server reports them, `e38464e9b` / this build:
+
+| Client pause | 0 | 0.1 s | 3 s |
+|---|---:|---:|---:|
+| Text conversation, turn 1 | 2.10-2.21 / 2.14-2.17 s | 2.07-2.10 / 2.06-2.07 s | 2.06-2.08 / 1.49-1.50 s |
+| Text conversation, turn 2 | 0.25-0.30 / 0.29-0.30 s | 0.26 / 0.24-0.25 s | 0.26-0.27 / 0.09-0.10 s |
+| Same system text | 0.43-0.45 / 0.43 s | 0.42-0.44 / 0.27-0.28 s | 0.42-0.45 / 0.13 s |
+| Media turns 2 and 4, client's wall time | 0.23, 0.43-0.44 / 0.23, 0.43-0.44 s | 0.23-0.24, 0.43-0.45 / 0.25-0.26, 0.46 s | 0.24, 0.45 / 0.24-0.25, 0.44-0.45 s |
+
+With 3 s pauses the free pages were pinned back before each request, so storing images no longer
+pinned pages while a request waited: the text conversation's first turn took less than it takes as
+the first request after startup (1.61-1.62 s in both builds, two starts with the text conversation
+first). With 0.1 s pauses about one chunk was pinned before the next request came, and a short turn
+that came during a chunk waited for it, up to 30 ms. Without pauses both builds took the same times.
+A 64 MiB chunk pinned in 32 ms on this host (median of 24, at most 35 ms; 128 MiB took 61 ms). Both
+builds gave the same answers in every turn. This build decoded at 0.999-1.008 of `e38464e9b`'s rate
+a turn without pauses, 0.986-0.998 with 0.1 s pauses and 0.980-1.023 with 3 s pauses (geomeans
+1.003, 0.992 and 0.999); it pins nothing while a request runs.
+
+With `--spec mtp --draft-tokens 3` the media requests draft. They decoded the four answers at 135.7,
+178.5, 118.6 and 163.7 tok/s, against 70.9, 88.4, 87.6 and 99.2 with `--spec none`, the same tokens
+(the media cache's first build, one start each, on an earlier rental of the same kind). Without
+drafts the three builds decode at the same rate: over the chat above and the same chat without its
+system text, two starts each with `--spec none`, 78.7, 79.9 and 81.6 tok/s, and `d6a658b8a` with
+`--spec mtp` (which did not draft media requests there) 77.3; `e38464e9b` against `0c08dfefd`, with
+the same answers, 0.90-1.10 a turn. With DFlash2 drafts it decoded the table's answers at 0.78-1.21
+of `0c08dfefd`'s rate a turn, 1.3% and 0.4% below it overall in two sets of three starts; the second
+window of DFlash2 features that a span keeps for one sequence takes 50 MiB of workspace and left the
+expert cache 89 MiB smaller.
 
 ### Hyper-connections in Q8_0
 

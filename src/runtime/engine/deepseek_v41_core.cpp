@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/device_wait.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_split.h"
@@ -20,6 +21,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/worker_fault.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -143,8 +145,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                     "head");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("DeepSeek-V4.1 keeps its attention latents in BF16 (no "
-                                    "--kv-dtype formats)");
+        throw std::invalid_argument("DeepSeek-V4.1 keeps its attention caches in the release's "
+                                    "FP8/FP4 forms (--kv-dtype bf16 only)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -222,6 +224,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         {.artifact = options.artifact_path,
          .experts  = options.expert_residency,
          .dspark   = dspark,
+         .draft_experts = speculative.draft_experts,
          .vision   = vision},
         device, &options.startup_observer);
     // An image's span takes the release's 1024 prompt positions at most, fewer with
@@ -372,8 +375,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         }
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, BF16 latent "
-                       "caches %.0f MiB%s, workspace %.0f MiB",
+                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, FP8/FP4 "
+                       "latent caches %.0f MiB%s, workspace %.0f MiB",
                        executor.sequences, chunk_tokens, spans.c_str(),
                        double(memory.kv_bytes) / 1048576.0,
                        memory.kv_grows
@@ -479,12 +482,21 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            speculative.lookup_ngram, lookup_drafts);
     }
     if (dspark) {
+        const auto& kept = model->dspark_kept();
+        const std::string experts =
+            kept.empty() ? std::string("every expert on the GPU")
+                         : std::to_string(kept.front().size()) + " of " +
+                               std::to_string(model->dspark_config()->experts) +
+                               " experts a block on the GPU (" +
+                               std::to_string(instance->executor->memory().drafter_expert_bytes >> 20) +
+                               " MiB), the rest in pinned memory";
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "DeepSeek-V4.1: DSpark speculative decoding, up to %u drafts a round "
                            "while their confidence is at least %.2f, one decoding request at a "
-                           "time",
+                           "time, %s",
                            drafts,
-                           double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)));
+                           double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
+                           experts.c_str());
     }
     ConstructedDeepSeekV41 out;
     const auto& stats         = model->storage_stats();
@@ -625,6 +637,14 @@ struct DeepSeekV41Core::Request {
     bool post_thinking         = false;
     std::uint32_t position     = 0;
     std::vector<TokenId> feed;
+    // A stop string's match began at the token the next step feeds: the step first keeps the
+    // sequence's state (Slot::hold). In a speculative round the match began after `hold_after` of
+    // the round's verified tokens (the anchor, then the accepted ones): the round's commit keeps
+    // the state there. And the turn ended at a stop string inside a speculative round: the
+    // sequence goes back to the kept state after the round commits.
+    bool hold_wanted = false;
+    bool stop_rewind = false;
+    std::optional<std::uint32_t> hold_after;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -636,9 +656,16 @@ struct DeepSeekV41Core::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+        std::size_t lookup_lag = 0;
         // The pictures among fed and anchor (an image token does not tell one from another).
         std::vector<MediaMark> media, anchor_media;
         models::deepseek_v41::SequenceSnapshot snapshot;
+        // The sequence's state after its first hold_tokens tokens, where a stop string's match
+        // began in the request it serves (0: none): the visible text of a turn the stop string
+        // ends continues that state, not the live one, which has read the tokens the cut removed.
+        models::deepseek_v41::SequenceSnapshot hold;
+        std::uint32_t hold_tokens = 0;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
     };
@@ -802,7 +829,8 @@ struct DeepSeekV41Core::Impl {
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
-        CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
@@ -833,7 +861,8 @@ struct DeepSeekV41Core::Impl {
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
         load_sampling_kernels();
-        worker           = std::thread([this] {
+        worker = std::thread([this] {
+            const DeviceWaitWatch watched(device, "DeepSeek-V4.1 worker");
             device.bind_to_current_thread();
             loop();
         });
@@ -857,8 +886,9 @@ struct DeepSeekV41Core::Impl {
     void load_sampling_kernels() {
         const cudaStream_t stream = instance.executor->head_stream();
         const ops::SamplingConfig greedy{};
-        CUDA_CHECK(cudaMemcpy(sample_config.p, &greedy, sizeof(greedy), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(sample_position.p, 0, sizeof(std::int32_t)));
+        CUDA_CHECK(ninfer::copy_and_wait(sample_config.p, &greedy, sizeof(greedy),
+                                         cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::fill_and_wait(sample_position.p, 0, sizeof(std::int32_t)));
         const auto* config  = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const auto vocab    = static_cast<std::int32_t>(domain);
         const Tensor flag(logprob_flag.p, DType::I32, {1});
@@ -883,7 +913,7 @@ struct DeepSeekV41Core::Impl {
         }
         if (drafts > 0) {
             for (DeviceBuffer* plane : {&spec_drafts, &spec_extents, &spec_lengths, &spec_anchors}) {
-                CUDA_CHECK(cudaMemset(plane->p, 0, plane->bytes));
+                CUDA_CHECK(ninfer::fill_and_wait(plane->p, 0, plane->bytes));
             }
             // A round's width is its drafts and the bonus column, one draft to all of them.
             for (std::uint32_t k = 1; k <= drafts; ++k) {
@@ -906,9 +936,9 @@ struct DeepSeekV41Core::Impl {
                     *sample_workspace, stream);
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         // Each request clears its own row of the counts; the scratch increment leaves no trace.
-        CUDA_CHECK(cudaMemset(token_counts.p, 0, token_counts.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(token_counts.p, 0, token_counts.bytes));
     }
 
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
@@ -1070,6 +1100,41 @@ struct DeepSeekV41Core::Impl {
         stats.prefilling_requests   = prefilling;
         stats.decode_ready_requests = decoding;
         if (engram) { stats.ngram_table = *engram; }
+    }
+
+    // Drops every stored image of a prefix of the request's prompt.
+    void drop_stored_prefixes(const Request& r) {
+        for (std::size_t i = stored.size(); i-- > 0;) {
+            const std::vector<TokenId>& tokens = stored[i].tokens;
+            if (tokens.size() > r.prompt_tokens.size() ||
+                !std::equal(tokens.begin(), tokens.end(), r.prompt_tokens.begin())) {
+                continue;
+            }
+            free_pages.insert(free_pages.end(), stored[i].pages.begin(), stored[i].pages.end());
+            host_used -= stored[i].pages.size() * kHostPageBytes;
+            stored.erase(stored.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        std::lock_guard lock(stats_mutex);
+        stats.host_kv_occupied_bytes = host_used;
+    }
+
+    // Ends one request whose logits came out non-finite, or whose sampled or licensed token lies
+    // outside the vocabulary: thrown where the request's own handler (fail) ends it alone, so the
+    // other requests and the Engine go on. Before its first token the request may have computed
+    // its prompt wrong or resumed from a wrong prefix, and no later logits have vouched for the
+    // images it stored on the way: every stored prefix of its prompt goes, so the same prompt
+    // computes again. Later the prompt's logits were finite, and its images stay.
+    [[noreturn]] void throw_numerical_failure(const Request& r) {
+        const std::string where =
+            r.generated.empty() ? std::string("at the end of the prompt")
+                                : "after " + std::to_string(r.generated.size()) + " generated tokens";
+        if (r.generated.empty()) { drop_stored_prefixes(r); }
+        publish_diagnostic(diagnostics, DiagnosticLevel::Error,
+                           "request %llu: non-finite logits or a token outside the vocabulary %s - "
+                           "ending the request",
+                           static_cast<unsigned long long>(r.id), where.c_str());
+        throw RequestError(RequestErrorKind::NumericalFailure,
+                           "the model produced non-finite logits " + where);
     }
 
     void fail(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -1321,9 +1386,10 @@ struct DeepSeekV41Core::Impl {
             slot.media.clear();
             slot.anchor_media.clear();
         }
-        slot.request    = request;
-        slot.last_used  = ++use_clock;
-        slot.disposable = r.disposable;
+        slot.request     = request;
+        slot.hold_tokens = 0;
+        slot.last_used   = ++use_clock;
+        slot.disposable  = r.disposable;
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
             r.speculative.enabled      = true;
@@ -1579,13 +1645,21 @@ struct DeepSeekV41Core::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
         for (std::size_t b = 0; b < n; ++b) {
-            const std::int32_t token = tokens[b];
-            if (token == ops::kSamplerNonFiniteToken || token < 0 ||
-                std::uint32_t(token) >= domain) {
-                throw std::runtime_error("DeepSeek-V4.1 produced non-finite logits");
+            std::int32_t token = tokens[b];
+            if (b == 0 && runtime::consume_armed_numerical_fault(
+                              purpose == ops::kSamplePurposePrefill
+                                  ? runtime::armed_prefill_numerical_faults
+                                  : runtime::armed_decode_numerical_faults)) {
+                token = ops::kSamplerNonFiniteToken; // the verification seam of worker_fault.h
+            }
+            if (token < 0 || std::uint32_t(token) >= domain) {
+                // Non-finite logits (the sampler's marker) or an id outside the vocabulary: the
+                // row's request ends where it takes the token (throw_numerical_failure).
+                out[b] = ops::kSamplerNonFiniteToken;
+                continue;
             }
             out[b] = token;
             if (!rows[b].logprobs) { continue; }
@@ -1749,7 +1823,7 @@ struct DeepSeekV41Core::Impl {
             slot.anchor_media = slot.media;
         }
         if (r.observation.prompt_progress) {
-            CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+            CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
             executor.check_experts();
             {
                 std::lock_guard lock(r.mutex);
@@ -1927,6 +2001,7 @@ struct DeepSeekV41Core::Impl {
                 logits.slice(1, static_cast<std::int32_t>(at), static_cast<std::int32_t>(n));
             sample(rows, ops::kSamplePurposePrefill, sampled, records, &source);
             for (std::size_t k = 0; k < n; ++k) {
+                if (sampled[k] < 0) { throw_numerical_failure(r); }
                 if (r.branch_results.empty()) {
                     r.branch_token  = sampled[k];
                     r.branch_record = records[k];
@@ -1947,7 +2022,7 @@ struct DeepSeekV41Core::Impl {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+        CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
         {
@@ -2002,10 +2077,36 @@ struct DeepSeekV41Core::Impl {
     // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
                 const runtime::RawTokenLogprob* logprob) {
+        if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                                        : std::span<const runtime::RawTokenLogprob>{});
+                                        : std::span<const runtime::RawTokenLogprob>{},
+                     true);
         check_capacity(request);
+    }
+
+    // Keeps the state of a request whose next step feeds the token that begins a stop string's
+    // match: the sequence has read everything before it.
+    void keep_hold(Request& r) {
+        r.hold_wanted = false;
+        Slot& slot    = slots[r.slot];
+        if (!reuse_prefixes || !r.decoding || r.feed.empty()) { return; }
+        // A match that begins without a state kept leaves none of an earlier one either.
+        slot.hold_tokens = instance.executor->hold(r.slot, slot.hold)
+                               ? static_cast<std::uint32_t>(slot.fed.size())
+                               : 0;
+    }
+
+    // A turn that ended at a stop string whose match began before its last token: the sequence
+    // goes back to the state kept where the match began, which the visible text continues.
+    // Without one it keeps its live state, which no later prompt continues.
+    void rewind_to_hold(Request& r) {
+        r.stop_rewind = false;
+        Slot& slot    = slots[r.slot];
+        if (slot.hold_tokens == 0 || slot.hold_tokens > slot.fed.size()) { return; }
+        instance.executor->restore_hold(r.slot, slot.hold);
+        slot.fed.resize(slot.hold_tokens);
+        slot.hold_tokens = 0;
     }
 
     // A request whose next feed would pass the context finishes.
@@ -2019,8 +2120,10 @@ struct DeepSeekV41Core::Impl {
     // capacity check, which the caller makes once the round's position is known: returns how many
     // of them the policy accepted. The next step feeds the last accepted one (the first when none
     // was, as a single sampled token is fed whatever the policy decides).
+    // `committed`: the sequence already holds the state the tokens leave; a speculative round
+    // commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -2048,10 +2151,29 @@ struct DeepSeekV41Core::Impl {
             std::lock_guard lock(stats_mutex);
             stats.committed_decode_tokens += accepted;
         }
+        // The match of a stop string began at accepted token `hold`. A sampled token is not read
+        // yet, so the next step keeps the state before it feeds it. A speculative round has
+        // verified the anchor and the accepted tokens but the last: its commit keeps the state
+        // after those before the match (Executor::commit), where the visible text may end.
+        const std::optional<std::uint32_t> hold =
+            accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted
+                ? decision.stop_hold_after
+                : std::nullopt;
+        if (hold && !committed) { r.hold_after = *hold + 1; }
         if (decision.finished()) {
+            // A sampled token that begins and ends the match is not read: the live state is the
+            // one the text continues. Any other cut returns to the kept state.
+            if (decision.stop_cut && !(committed && hold)) {
+                if (committed) {
+                    rewind_to_hold(r);
+                } else {
+                    r.stop_rewind = true;
+                }
+            }
             finish(request, decision.finish_reason);
             return accepted;
         }
+        r.hold_wanted = committed && hold.has_value();
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
         if (decision.continuation == ContinuationAction::ApplyTargetControl) {
             // A reached thinking budget, or the loop guard's conclusion, closes the reasoning: the
@@ -2101,7 +2223,7 @@ struct DeepSeekV41Core::Impl {
     std::uint32_t lookup(const Request& r, std::uint32_t steps, TokenId* out) {
         std::vector<TokenId>& ledger = slots[r.slot].fed;
         ledger.push_back(r.feed.front());
-        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out);
+        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out, slots[r.slot].lookup_lag);
         ledger.pop_back();
         return found;
     }
@@ -2134,6 +2256,9 @@ struct DeepSeekV41Core::Impl {
             if (slot.request && slot.request->decoding) { ++decoding; }
         }
         const std::uint32_t steps = round_drafts(decoding);
+        for (const Slot& slot : slots) {
+            if (slot.request && slot.request->hold_wanted) { keep_hold(*slot.request); }
+        }
         std::vector<std::shared_ptr<Request>> deferred;
         for (const Slot& slot : slots) {
             // A copy: finishing or failing the request clears its slot.
@@ -2487,7 +2612,7 @@ struct DeepSeekV41Core::Impl {
             cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
@@ -2500,13 +2625,19 @@ struct DeepSeekV41Core::Impl {
             const std::int32_t licensed_n = host[b * w + j];
             const std::int32_t drafts_n   = host[b * w + b + j];
             const std::int32_t* run       = host + j * w;
-            if (licensed_n < 1 || licensed_n > columns || run[0] == ops::kSamplerNonFiniteToken) {
-                throw std::runtime_error("DeepSeek-V4.1 produced non-finite logits");
+            if (licensed_n < 1 || licensed_n > columns) {
+                throw std::runtime_error("DeepSeek-V4.1 verification returned an invalid licensed run");
             }
-            for (std::int32_t i = 0; i < licensed_n; ++i) {
-                if (run[i] < 0 || std::uint32_t(run[i]) >= domain) {
-                    throw std::runtime_error("DeepSeek-V4.1 licensed a token outside the vocabulary");
-                }
+            // Non-finite logits (the sampler's marker) or an id outside the vocabulary in the run:
+            // this request ends, the round's other rows commit.
+            if (std::any_of(run, run + licensed_n, [&](std::int32_t token) {
+                    return token < 0 || std::uint32_t(token) >= domain;
+                })) {
+                try {
+                    throw_numerical_failure(r);
+                } catch (...) { fail(request, std::current_exception()); }
+                failed[j] = 1;
+                continue;
             }
             std::vector<runtime::RawTokenLogprob> records;
             if (rows[j].logprobs) {
@@ -2541,7 +2672,7 @@ struct DeepSeekV41Core::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records);
+                    taken = accept(request, run_tokens, records, false);
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
@@ -2564,15 +2695,32 @@ struct DeepSeekV41Core::Impl {
                 ops::increment_token_counts(ids, row_counts, stream);
             }
         }
-        executor.commit(sequences, kept);
+        // A row whose stop string's match began inside its run also keeps the state after the
+        // tokens before the match.
+        std::vector<std::uint32_t> hold_after(b, 0);
+        std::vector<models::deepseek_v41::SequenceSnapshot*> holds(b, nullptr);
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto after = std::exchange(batch[j]->hold_after, std::nullopt);
+            if (!after || failed[j] || !reuse_prefixes) { continue; }
+            hold_after[j] = std::min(*after, kept[j]);
+            holds[j]      = &slots[batch[j]->slot].hold;
+        }
+        const std::uint32_t held = executor.commit(sequences, kept, hold_after, holds);
         for (std::size_t j = 0; j < b; ++j) {
             Request& r = *batch[j];
             if (failed[j]) { continue; }
             Slot& slot = slots[r.slot];
+            if (hold_after[j] != 0) {
+                // A match that began without a state kept leaves none of an earlier one either.
+                slot.hold_tokens = (held >> j & 1U) != 0
+                                       ? static_cast<std::uint32_t>(slot.fed.size()) + hold_after[j]
+                                       : 0;
+            }
             // The verification fed the anchor and the drafts; the sequence keeps the first ones.
             slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
                             tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
+            if (r.stop_rewind) { rewind_to_hold(r); }
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }
@@ -2629,7 +2777,7 @@ struct DeepSeekV41Core::Impl {
             std::vector<float> host(rows);
             CUDA_CHECK(cudaMemcpyAsync(host.data(), score_out.p, rows * 4, cudaMemcpyDeviceToHost,
                                        stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
@@ -2930,6 +3078,8 @@ std::vector<float> DeepSeekV41Core::score(models::qwen3_5::PreparedPrompt prompt
             --impl.outstanding;
         }
     } release{*impl_};
+
+    const DeviceWaitWatch watched(impl_->device, "DeepSeek-V4.1 scoring caller");
     impl_->device.bind_to_current_thread();
     return impl_->score(tokens, first_target);
 }

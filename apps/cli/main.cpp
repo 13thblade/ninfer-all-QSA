@@ -100,6 +100,8 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -333,7 +335,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cli.version_requested) {
-        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << " (" << NINFER_TOOLCHAIN
+                  << ")\n";
         return 0;
     }
     if (cli.help_requested) {
@@ -347,7 +350,7 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-    logger->info("build {}", NINFER_BUILD_ID);
+    logger->info("build {} ({})", NINFER_BUILD_ID, NINFER_TOOLCHAIN);
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {

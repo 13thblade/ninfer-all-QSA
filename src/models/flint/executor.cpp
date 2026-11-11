@@ -1,6 +1,7 @@
 #include "models/flint/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/tensor_parallel.h"
@@ -120,6 +121,7 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
+    bool gate_up_aligned16 = true, down_aligned16 = true;
     // Expert parallelism: rank r's tables (r > 0) in its device memory, entries of the experts it
     // holds (`tables` holds rank 0's); the other entries are null.
     std::vector<DeviceBuffer> peer_tables;
@@ -188,6 +190,9 @@ struct Executor::Impl {
     const float* final_norm = nullptr;
     DeviceBuffer inv_freq;
     std::vector<std::uint32_t> positions;
+    // The position at which each sequence's rings last came from a prompt, a checkpoint or an
+    // image: they hold the window before it and what the sequence wrote since (rewind()).
+    std::vector<std::uint32_t> ring_floor;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows. A
     // branch pass's rows: d_slots, the position whose cache slot each takes; d_starts, its branch's
     // first row.
@@ -238,6 +243,7 @@ struct Executor::Impl {
         prefill_ring = int(round_up(config.sliding_window + options.prefill_chunk, 256));
         global_slots = int(round_up(options.max_context + 1, 256));
         positions.assign(options.sequences, 0);
+        ring_floor.assign(options.sequences, 0);
         const auto& w = model.weights();
         embedding     = native_weight(model.weight(w.token_embedding).view);
         head          = matrix(model, {w.output_head});
@@ -342,6 +348,16 @@ struct Executor::Impl {
                             table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                                std::int64_t(x - first) * hidden * p.down_row_bytes;
                         }
+                        bool gate_up_aligned = p.gate_up_row_bytes % 16 == 0;
+                        bool down_aligned    = p.down_row_bytes % 16 == 0;
+                        for (std::size_t i = 0; i < table.size(); ++i) {
+                            const auto address = reinterpret_cast<std::uintptr_t>(table[i]);
+                            const bool aligned = table[i] == nullptr || address % 16 == 0;
+                            (i < 3 * std::size_t(e) ? gate_up_aligned : down_aligned) &=
+                                aligned;
+                        }
+                        p.gate_up_aligned16 = p.gate_up_aligned16 && gate_up_aligned;
+                        p.down_aligned16    = p.down_aligned16 && down_aligned;
                         DeviceBuffer buffer(table.size() * sizeof(void*));
                         buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
                         return buffer;
@@ -517,6 +533,17 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
+        // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
+        for (auto& p : layers) {
+            if (p.delivery_layer < 0) { continue; }
+            const auto l       = std::size_t(p.delivery_layer);
+            const auto aligned = [&](std::size_t alias) {
+                return delivery->alias_aligned(l, alias, 16);
+            };
+            p.gate_up_aligned16 =
+                p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
+            p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+        }
     }
 
     // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
@@ -634,7 +661,7 @@ struct Executor::Impl {
     // sequence reaches, and the expert cache takes what is free beyond its headroom.
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         std::uint32_t longest = 0;
         for (const std::uint32_t backed : sequence_areas.front()->backed) { longest = std::max(longest, backed); }
@@ -649,11 +676,11 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { ninfer::wait_for_stream(stream); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
-            cudaStreamSynchronize(expert_peers[r].stream);
+            ninfer::wait_for_stream(expert_peers[r].stream);
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
@@ -837,10 +864,12 @@ struct Executor::Impl {
         gguf::moe_keep_experts(ids, pairs, int(range.first), int(range.second), mine, on);
         const gguf::MoeRouting routing = gguf::moe_sort_routes(
             mine, pairs, e, space.alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data, on);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::max(1, std::min(pairs, int(range.second - range.first)));
         auto* middle =
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1151,10 +1180,12 @@ struct Executor::Impl {
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::min(pairs, e);
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1465,7 +1496,8 @@ struct Executor::Impl {
                     std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
             }
             head_logits(rows, int(logit_rows), 0);
-            positions[sequence] = first + shared;
+            positions[sequence]  = first + shared;
+            ring_floor[sequence] = first + shared;
             return;
         }
         if (q8) {
@@ -1475,7 +1507,8 @@ struct Executor::Impl {
                             std::int64_t(t - int(logit_rows)) * hidden,
                         int(logit_rows), 0);
         }
-        positions[sequence] = first + std::uint32_t(t);
+        positions[sequence]  = first + std::uint32_t(t);
+        ring_floor[sequence] = first + std::uint32_t(t);
     }
 
     // ---- Decode ---------------------------------------------------------------------------------------
@@ -1559,6 +1592,10 @@ struct Executor::Impl {
         }
         GraphEntry& entry = graphs[key];
         if (!entry.warmed) {
+            // A graph launched before this may still wait on the device for the experts' host
+            // service, and a kernel that loads at its first launch during that wait never
+            // returns: the stream is idle before a body's kernels load.
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             body();
             entry.warmed = true;
             return;
@@ -1678,7 +1715,7 @@ struct Executor::Impl {
                 positions[0] = 0;
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         if (delivery) {
             // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
             // request counters, and the cache starts from the routing profile rather than the
@@ -1780,7 +1817,8 @@ struct Executor::Impl {
         }
         back(sequence, image.position, false);
         copy_image(sequence, image.position, pages, page_bytes, false, false);
-        positions.at(sequence) = image.position;
+        positions.at(sequence)  = image.position;
+        ring_floor.at(sequence) = image.position;
     }
 
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
@@ -1790,7 +1828,21 @@ struct Executor::Impl {
 
     void restore(std::uint32_t sequence, const SequenceSnapshot& from) {
         copy_rings(sequence, false);
-        positions[sequence] = from.position;
+        positions[sequence]  = from.position;
+        ring_floor[sequence] = from.position;
+    }
+
+    // A position's window lies in the rings while the sequence has written fewer positions past
+    // it than the rings hold beyond the window and a round's drafts, and the rings held the
+    // window before it when they last came whole. The full-attention rows are kept by position.
+    bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
+        const std::uint32_t at = positions.at(sequence);
+        const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
+        if (tokens > at || at - tokens < ring_floor[sequence] || std::int64_t(tokens) > slack) {
+            return false;
+        }
+        positions[sequence] = at - tokens;
+        return true;
     }
 };
 
@@ -1824,7 +1876,8 @@ void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
 }
 
 void Executor::reset(std::uint32_t sequence) {
-    impl_->positions.at(sequence) = 0;
+    impl_->positions.at(sequence)  = 0;
+    impl_->ring_floor.at(sequence) = 0;
     impl_->release(sequence);
 }
 
@@ -1905,6 +1958,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {
+    return impl_->rewind(sequence, tokens);
 }
 
 } // namespace ninfer::models::flint

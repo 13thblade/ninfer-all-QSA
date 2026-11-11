@@ -49,6 +49,11 @@ struct SpeculativeOptions {
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
     std::optional<float> draft_confidence;
+    // DeepSeek-V4.1 DSpark: each drafter block keeps the N experts of its 128 that its shipped
+    // ranking routes most to on the device and routes among those (the others stay in pinned host
+    // memory); 0 keeps every expert on the device. Unset: 64 with the STQ drafter and host or disk
+    // experts, otherwise every expert.
+    std::optional<std::uint32_t> draft_experts;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
@@ -76,7 +81,8 @@ struct SpeculativeOptions {
     // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a
     // round verified through the first draft at or below kAutomaticDFlash2MinP, or without one
     // with its MTP block, kAutomaticDraftTokens a round ending at the first draft at or below
-    // kAutomaticDraftMinP; Gemma 4 with host or disk experts with its assistant,
+    // kAutomaticDraftMinP, a round of several requests with a CPU share verifying at most the
+    // eight tokens of a call the CPU shares; Gemma 4 with host or disk experts with its assistant,
     // kAutomaticDraftTokens a round; others run without drafts. The Engine's options() report the
     // resolved backend.
     bool automatic = false;
@@ -156,6 +162,11 @@ struct HybridPrefixCacheOptions {
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
     // lane plus two (a staging slot and one for a shared prefix or another conversation).
     std::optional<std::uint32_t> device_snapshot_slots;
+    // Whether startup may lower device_snapshot_slots, down to one, when the KV capacity asked
+    // for (an explicit one, or one --max-context window beside the automatic headroom) would not
+    // fit beside them. Normalization sets it when device_snapshot_slots is not given; a given
+    // count is kept and a capacity that does not fit beside it fails.
+    bool fit_device_snapshot_slots = false;
     // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
     std::optional<std::uint32_t> max_new_taps;
     // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default
@@ -206,6 +217,12 @@ struct ContextCacheOptions {
     HybridPrefixCacheOptions hybrid;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
+    // Legacy mode, Qwen3.5-core models: one more Device StateImage for each of the C requests,
+    // outside the catalog, keeps the state at the token where a stop string's match began, so a
+    // turn that the stop string ends rounds later resumes its next turn from there. A startup
+    // whose KV capacity does not fit beside them drops them, and Engine::options() reports it.
+    // The hybrid cache keeps that state in a snapshot slot.
+    bool stop_hold_images = true;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
