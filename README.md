@@ -2,7 +2,7 @@
 
 # 中文
 
-本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了本属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（可用--qsa-top-blocks调整），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
 
 模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 
@@ -12,8 +12,7 @@
 
 后续计划：
 1. QSA目前只允许一条序列（--max-concurrency 1），考虑增加并发支持；
-2. prefill速度低于Qwen3.8-27B原生注意力，这是ninfer上游的QSA注意力内核性能尚未充分优化导致的，考虑进行优化；
-3. 提供Dflash2和Dspine草稿的支持。
+2. 提供Dflash2和Dspine草稿的支持。
 
 ## 旗标
 
@@ -21,11 +20,11 @@
 
 | 旗标 | 作用 | 取值 | 默认 |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | 打开 QSA 分支：16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力。要求 artifact 自带 indexer；只能用单卡、不开张量并行、`--max-concurrency 1`，投机后端只能是模型自带的 MTP。不开则走原生 dense 全注意力。 | 布尔开关 | 关 |
-| `--qsa-top-blocks N` | 每个 token 可见的历史块数，1 块 = 4 token。值越大越接近 dense，但 prefill 时间大致随块数线性增长。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
+| `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 仍对该层完整 KV 做 dense 因果注意力）。要求 artifact 自带 indexer；只能用单卡、不开张量并行、`--max-concurrency 1`，投机后端只能是模型自带的 MTP。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
+| `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
-`--kv-resident` 的自动下限是 `块数 + 向上取整(验证宽度 / 4)` 个块：验证列是连续位置，选块高度重合，开启 MTP 只增加每步从 host 池提取的流量，不增加需常驻的不同块数。显式给更大的值仍会生效。典型用法：
+`--kv-resident` 的自动下限是 `块数 + 向上取整(验证宽度 / 4)` 个块：验证列是连续位置，选块高度重合，开启 MTP 只增加每步从 host 池提取的流量，不增加需常驻的不同块数。显式给更大的值仍会生效，建议设置较高的 --kv-resident 以免过大的PCIe流量波动。典型用法：
 
 ```bash
 # 启用QSA + 2048 token 注意力窗口 + KV 全驻留
@@ -40,33 +39,27 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 同一块 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA.ninfer`、int8 KV、关闭投机解码与前缀复用、KV 全驻留。
 
-速度：单次冷请求，26,522 token 提示 + 64 token 输出，KV 容量 32,768。
+速度：单次冷请求，26,587 token 提示 + 48 token 输出，KV 容量 32,768。**QSA 路径在 prefill 阶段对该层完整的 KV 做 dense 因果注意力，decode/verify 仍走 QSA 稀疏注意力**，所以 prefill 不再随窗口变化；`NINFER_QSA_DENSE_PREFILL=0` 可回到纯 QSA prefill。
 
 | 配置 | prefill (tok/s) | decode (tok/s) | TTFT |
 | --- | ---: | ---: | ---: |
 | dense（不开 `--qwen38-27b-qsa`） | 1,960 | 49.7 | 13.6 s |
-| QSA 512 块（2,048 token，默认） | 1,600 | 49.6 | 16.6 s |
-| QSA 1,024 块（4,096 token） | 1,330 | 48.9 | 20.0 s |
-| QSA 2,048 块（8,192 token） | 1,020 | 47.4 | 26.1 s |
-| QSA 4,096 块（16,384 token） | 770 | 44.7 | 34.4 s |
+| QSA 512 块（2,048 token，默认） | 1,930 | 49.6 | 13.8 s |
+| QSA 1,024 块（4,096 token） | 1,940 | 48.9 | 13.7 s |
+| QSA 2,048 块（8,192 token） | 1,930 | 47.4 | 13.8 s |
+| QSA 4,096 块（16,384 token） | 1,920 | 44.8 | 13.9 s |
 
-PPL：teacher-forced，语料 68,408 token（本仓库 docs 与 src 混合），上下文截断到 65,536、stride 512，共 7 个窗口。引擎的指标名本身就是 truncated-context，形状很关键：第一个窗口从文档开头起算、一次计分 65,535 token（占全篇 95.8%），深度从 0 递增到 65,535；其后 6 个窗口各 512 token，上下文都是 65,024。所以全篇均值主要由浅层决定，长上下文的代价看右列。
+关闭混合时的纯 QSA prefill 依次为 1,600 / 1,330 / 1,020 / 770 tok/s（TTFT 16.6 / 20.0 / 26.1 / 34.4 s），窗口越宽越慢；混合后四档分别提升 20% / 46% / 89% / 149%，decode 不变。
 
-| 配置 | 全篇 PPL（68,408 tok） | 相对 dense | 65K 深度 PPL（2,873 tok） | 相对 dense |
-| --- | ---: | ---: | ---: | ---: |
-| dense | 3.9200 | — | 3.9745 | — |
-| QSA 512 块 | 3.9993 | +2.02% | 4.2023 | +5.73% |
-| QSA 1,024 块 | 3.9488 | +0.74% | 4.0774 | +2.59% |
-| QSA 2,048 块 | 3.9303 | +0.26% | 4.0190 | +1.12% |
-| QSA 4,096 块 | 3.9248 | +0.12% | 3.9923 | +0.45% |
+PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（`NINFER_QSA_DENSE_PREFILL=0`）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）；测试条件：teacher-forced、68,408 token 语料（本仓库 docs 与 src）、上下文截断到 65,536、stride 512，取尾部 6 个 512-token 块（65,024 上下文、2,873 token），dense 基线 3.9745。
 
-窗口越宽越接近 dense，但 prefill 的时间大致随块数线性增长（4,096 块约为 dense 的 39%）；从默认 512 块加到 1,024 块就收回约 2/3 的差距。稀疏的代价随深度放大：在 65,024 上下文的 6 个 512-token 块上，512 块是 +5.7%，2,048 块才降到 +1.1%（逐块比值 1.01–1.09，6 块全部劣于 dense）。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），KV stream 仅改变全量 KV 存放的位置，不影响模型质量。
+混合模式下 prefill 已与窗口解耦，窗口只影响 decode 的速度与稀疏质量；关闭混合时 prefill 才随块数线性增长（4,096 块约为 dense 的 39%）。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），KV stream 仅改变全量 KV 存放的位置，不影响模型质量。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
 # English
 
-This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints.
+This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints. Prefill is usually compute-bound, so even dense attention can be computed over a streamed KV cache. Upstream's wide-T QSA kernel is not yet optimised and a wider attention window slows prefill sharply, so this fork runs dense attention during prefill for the best quality and speed, and switches to QSA sparse attention only for decode, with an adjustable window.
 
 - Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 - Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
@@ -75,8 +68,7 @@ It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts.
 
 Planned work:
 1. QSA serves one sequence at a time (`--max-concurrency 1`); we plan to add concurrent serving.
-2. Prefill is slower than Qwen3.8-27B's native attention. This is because the QSA attention kernel inherited from upstream ninfer is not yet fully optimized; we plan to optimize it.
-3. Add support for DFlash2 and DSpine drafting.
+2. Add support for DFlash2 and DSpine drafting.
 
 ## Flags
 
@@ -84,11 +76,11 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 
 | Flag | What it does | Values | Default |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | Runs the QSA branch: the sixteen full-attention layers score only the blocks the artifact's indexer selects. Needs the artifact's indexer, one device, no tensor parallelism, `--max-concurrency 1`, and either no speculative backend or the model's own MTP. Without it the model runs its native dense attention. | boolean switch | off |
-| `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over. A wider window moves towards dense, at a prefill cost that grows roughly with the block count. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
+| `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill still attends densely over the layer's complete KV). Needs the artifact's indexer, one device, no tensor parallelism, `--max-concurrency 1`, and either no speculative backend or the model's own MTP. Without it the model runs its native dense attention throughout. | boolean switch | off |
+| `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 
-The `--kv-resident` pool's automatic floor is `blocks + ceil(verification width / 4)` blocks: verification columns are consecutive positions whose selections overlap, so MTP raises the H2D traffic of a resolve rather than the distinct blocks that must stay resident. An explicit larger value still takes effect. Typical use:
+The `--kv-resident` pool's automatic floor is `blocks + ceil(verification width / 4)` blocks: verification columns are consecutive positions whose selections overlap, so MTP raises the H2D traffic of a resolve rather than the distinct blocks that must stay resident. An explicit larger value still takes effect; a higher `--kv-resident` is advisable to avoid large swings in PCIe traffic. Typical use:
 
 ```bash
 # QSA on, a 2048-token attention window, every layer's KV resident
@@ -103,27 +95,21 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA.ninfer`, int8 KV, speculative decoding and prefix reuse off, every sparse layer's KV resident.
 
-Speed: one cold request, a 26,522-token prompt and 64 output tokens, KV capacity 32,768.
+Speed: one cold request, a 26,587-token prompt and 48 output tokens, KV capacity 32,768. **The QSA path runs dense causal attention over the layer's complete KV during prefill; decode/verify stay sparse**, so prefill no longer depends on the window. `NINFER_QSA_DENSE_PREFILL=0` restores a pure QSA prefill.
 
 | Configuration | prefill (tok/s) | decode (tok/s) | TTFT |
 | --- | ---: | ---: | ---: |
 | dense (no `--qwen38-27b-qsa`) | 1,960 | 49.7 | 13.6 s |
-| QSA 512 blocks (2,048 tokens, default) | 1,600 | 49.6 | 16.6 s |
-| QSA 1,024 blocks (4,096 tokens) | 1,330 | 48.9 | 20.0 s |
-| QSA 2,048 blocks (8,192 tokens) | 1,020 | 47.4 | 26.1 s |
-| QSA 4,096 blocks (16,384 tokens) | 770 | 44.7 | 34.4 s |
+| QSA 512 blocks (2,048 tokens, default) | 1,930 | 49.6 | 13.8 s |
+| QSA 1,024 blocks (4,096 tokens) | 1,940 | 48.9 | 13.7 s |
+| QSA 2,048 blocks (8,192 tokens) | 1,930 | 47.4 | 13.8 s |
+| QSA 4,096 blocks (16,384 tokens) | 1,920 | 44.8 | 13.9 s |
 
-Perplexity: teacher-forced over a 68,408-token corpus (this repository's docs and src), context truncated at 65,536 with a 512-token stride, seven windows. The engine names the metric truncated-context, and its shape matters: the first window starts at the document's beginning and scores 65,535 tokens in one go (95.8% of the corpus), at depths rising from 0 to 65,535; the six windows after it score 512 tokens each at a 65,024-token context. The whole-corpus average is therefore mostly a shallow-depth number; the right-hand column is the long-context one.
+With the hybrid route off, pure QSA prefill is 1,600 / 1,330 / 1,020 / 770 tok/s (TTFT 16.6 / 20.0 / 26.1 / 34.4 s): the wider the window, the slower. The hybrid route gains 20% / 46% / 89% / 149% on those four and leaves decode unchanged.
 
-| Configuration | whole corpus (68,408 tok) | vs dense | at 65K depth (2,873 tok) | vs dense |
-| --- | ---: | ---: | ---: | ---: |
-| dense | 3.9200 | — | 3.9745 | — |
-| QSA 512 blocks | 3.9993 | +2.02% | 4.2023 | +5.73% |
-| QSA 1,024 blocks | 3.9488 | +0.74% | 4.0774 | +2.59% |
-| QSA 2,048 blocks | 3.9303 | +0.26% | 4.0190 | +1.12% |
-| QSA 4,096 blocks | 3.9248 | +0.12% | 3.9923 | +0.45% |
+Perplexity: the default dense path and the QSA path (whose prefill is still dense attention) give strictly identical teacher-forced perplexity (3.91997). Force-running QSA during prefill (`NINFER_QSA_DENSE_PREFILL=0`) raises the tail perplexity of the same evaluation by 5.73% (512 blocks), 2.59% (1,024), 1.12% (2,048) and 0.45% (4,096); conditions: teacher-forced, 68,408-token corpus (this repository's docs and src), context truncated at 65,536 with a 512-token stride, scored over the last six 512-token blocks (65,024-token context, 2,873 tokens), dense baseline 3.9745.
 
-A wider window moves towards dense, and prefill time grows roughly with the block count (4,096 blocks is about 39% of dense). Going from the default 512 blocks to 1,024 recovers about two thirds of the gap. Sparsity costs more the deeper you go: over the six 512-token blocks at a 65,024-token context, 512 blocks costs 5.7% and 2,048 blocks still costs 1.1% (per-block ratios 1.01 to 1.09, all six worse than dense). Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks). Streaming only changes where the full KV lives; it does not affect model quality.
+On the hybrid route prefill is decoupled from the window, which now only moves decode speed and sparse quality; with the route off, prefill grows roughly with the block count (4,096 blocks is about 39% of dense). Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks). Streaming only changes where the full KV lives; it does not affect model quality.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 

@@ -68,6 +68,19 @@ offered under the same Apache-2.0 license.
 | `17105e33` | 2026-11-11 | flags: count the QSA history window in blocks |
 | `2d4a1ffb` | 2026-11-11 | docs: record the QSA history window and tabulate its measurements |
 | `190507b0` | 2026-11-11 | docs: keep the planning document out of the repository |
+| `0dd7caa3` | 2026-11-11 | Merge remote-tracking branch 'origin/master' |
+| `fcf6f891` | 2026-11-11 | docs: point the commit table at the rewritten history |
+| `24b422d6` | 2026-11-11 | docs: refresh the commit table after the identity rewrite |
+| `ab916569` | 2026-11-11 | Merge upstream/master into the QSA fork |
+| `fe1a9fa9` | 2026-11-11 | docs: spell out the three QSA flags |
+| `ea0c0d33` | 2026-11-11 | docs: put concurrent QSA serving first on the planned work |
+| `3c146938` | 2026-11-11 | docs: state the perplexity metric honestly and split it by depth |
+| `d655dae4` | 2026-11-12 | engine: size the streamed KV pool from one selection, not the verification width |
+| `779a875e` | 2026-11-12 | engine: run QSA prefills as dense attention over the complete KV |
+
+The early web-edit README commits on `origin/master` (`5afa9ae7` through
+`087692d9`) are folded into `0dd7caa3` and are not listed individually; they
+only rewrote the README's opening, which the local version has since replaced.
 
 ## Change summary
 
@@ -143,6 +156,23 @@ largest accepted one. The planner (`program/planning/startup.cpp`,
 workspaces and the KV-stream pool from the same number, and
 `src/serve/operational_log.cpp` logs the effective window with its source. The
 measurements this knob was tuned against are in `README.md`.
+
+**Dense prefill / QSA decode.** A wide QSA prefill already holds the layer's
+complete KV (the fully resident layer view, or the full-capacity staging copy
+`stage()` fills from pinned host memory), so scoring and gathering only the
+selected blocks paid for the whole copy and then read each query's window again
+without cross-query tile reuse. `src/models/qwen3_5/execution/text.cpp` now
+routes `Phase::Prefill` calls over a complete, identity-mapped, text-only cache
+to the read-only `causal_softmax_attention_cached`; decode and speculative
+verification keep the sparse route because their stream pool holds only the
+resolved blocks. The indexer's `append` still runs on both routes so decode
+selections have the prompt's pooled blocks, and the KV append, staging and
+eviction are unchanged. `program/planning/startup.cpp` reserves the dense
+operator's transient capacity alongside the sparse one, and
+`NINFER_QSA_DENSE_PREFILL=0` restores the pure QSA route. Measured at 26,587
+tokens: prefill 1,610 -> 1,930 tok/s at 512 blocks and 772 -> 1,920 at 4,096
+blocks, now independent of the window; teacher-forced perplexity 3.91997 is
+identical to dense attention. `README.md` tabulates both routes.
 
 **Documentation.** `README.md` keeps the Chinese description, adds an English
 counterpart, and states the fork's attribution in both languages. This file is
