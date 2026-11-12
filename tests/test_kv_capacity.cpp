@@ -99,6 +99,33 @@ int main() {
                       "a device without KV constrained the capacity");
     split.extra_ranks[0].bytes_per_additional_main_page_group = 300;
 
+    // --kv-resident: the Main KV lives in pinned host memory and the device keeps a fixed staging
+    // copy, so a further page group costs the device nothing. The curve accepts that flat stride
+    // only when it is marked host-resident, and automatic capacity keeps the minimum because this
+    // curve cannot price the Host budget that really bounds it.
+    ninfer::runtime::SequenceCapacityCurve host_curve{
+        .main_page_tokens                 = 64,
+        .minimum_main_page_groups         = 4,
+        .maximum_main_page_groups         = 40,
+        .minimum_device_reservation_bytes = 1000,
+    };
+    bool flat_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(0), host_curve,
+                                                   100000);
+    } catch (const std::invalid_argument&) { flat_rejected = true; }
+    failures += check(flat_rejected,
+                      "a flat device stride without a host-resident KV was accepted");
+    host_curve.kv_host_resident = true;
+    const auto host_resident  = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(0), host_curve, 100000);
+    failures += check(host_resident.main_page_groups == 4,
+                      "a host-resident KV expanded the device capacity automatically");
+    const auto host_resident_explicit = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(64 * 30), host_curve, 100000);
+    failures += check(host_resident_explicit.main_page_groups == 30,
+                      "an explicit capacity was not honored on a host-resident KV");
+
     // A failure names the device that could not hold the plan.
     const auto names_device = [&](auto&& call, const char* device) {
         try {
