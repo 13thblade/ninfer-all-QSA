@@ -2196,6 +2196,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .kv_host_resident                     = planner->minimum->stream_slots != 0,
           .resident_main_pages                  = resident_main_pages,
     };
     for (const std::size_t bytes : planner->minimum->extra_rank_reservation_bytes) {
@@ -2245,11 +2246,20 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     }
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
+        const std::size_t minimum_bytes = planner->minimum->device_reservation_bytes;
+        // --kv-resident (QSA only) pins the Main Text KV to the logical page count in pinned host
+        // memory and keeps one shared staging layer on the device, so a further Main page group
+        // costs the device nothing; the Host budget bounds that capacity instead. Every other
+        // layout still has to grow, and no layout may shrink.
+        if (adjacent->device_reservation_bytes < minimum_bytes) {
+            throw std::logic_error("Qwen3.5 sequence layout has a negative KV capacity stride");
+        }
+        if (adjacent->device_reservation_bytes == minimum_bytes &&
+            planner->minimum->stream_slots == 0) {
             throw std::logic_error("Qwen3.5 sequence layout has a nonpositive KV capacity stride");
         }
         planner->curve.bytes_per_additional_main_page_group =
-            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
+            adjacent->device_reservation_bytes - minimum_bytes;
         // A further device's stride may legitimately be zero: a stage with no attention layers holds
         // no KV.
         for (std::size_t rank = 0; rank < planner->curve.extra_ranks.size(); ++rank) {

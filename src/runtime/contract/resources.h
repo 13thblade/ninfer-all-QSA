@@ -402,6 +402,10 @@ struct SequenceCapacityCurve {
     std::uint32_t maximum_main_page_groups           = 0;
     std::size_t minimum_device_reservation_bytes     = 0;
     std::size_t bytes_per_additional_main_page_group = 0;
+    // The Main KV lives in pinned host memory (a model streamed to the host) and the device keeps
+    // a fixed staging copy, so a further page group costs the device nothing and the stride above
+    // is legitimately zero. The Host budget, not this curve, bounds that capacity.
+    bool kv_host_resident                            = false;
     // Pages held for good by injected graft prefixes. They sit inside the range above, so an
     // explicit capacity asks for them on top of the requested tokens.
     std::uint32_t resident_main_pages = 0;
