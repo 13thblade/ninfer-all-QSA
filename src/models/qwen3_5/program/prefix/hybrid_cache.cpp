@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "core/device_wait.h"
 #include "core/paged_kv_cache.h"
+#include "models/qwen3_5/state/decoder_state.h"
+#include "ninfer/ops/kv_stream.h"
 
 #include <algorithm>
 #include <array>
@@ -52,20 +54,38 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
                                      qwen3_5::StateImageDevicePool& state_pool,
                                      const HybridHostLayout& host,
                                      std::vector<HybridRestoreLayer> layers,
+                                     const qwen3_5::QsaStreamState* stream,
                                      StartupPhaseScope* pin_progress)
     : config_(config), taps_(taps), text_pages_(&text_pages), backend_pages_(backend_pages),
-      states_(&states), state_pool_(&state_pool), host_layout_(host), images_(config.max_snapshots),
-      layers_(std::move(layers)) {
+      states_(&states), state_pool_(&state_pool), stream_(stream), host_layout_(host),
+      images_(config.max_snapshots), layers_(std::move(layers)) {
     if (host.backend.has_value() != (backend_pages != nullptr)) {
         throw std::invalid_argument("hybrid Host layout does not match the backend KV pool");
     }
     const auto attention_layers   = static_cast<std::size_t>(std::count_if(
         layers_.begin(), layers_.end(), [](const HybridRestoreLayer& l) { return l.attention; }));
-    const std::size_t text_planes = text_pages.physical_pool().plane_count();
-    if (layers_.empty() || attention_layers == 0 || text_planes % attention_layers != 0) {
-        throw std::invalid_argument("hybrid restore layers do not match the text KV planes");
+    if (layers_.empty() || attention_layers == 0) {
+        throw std::invalid_argument("hybrid restore layers are empty");
     }
-    planes_per_attention_layer_ = text_planes / attention_layers;
+    if (stream_ != nullptr) {
+        // The streamed tier: the block record is one packed 64-position page per streamed
+        // layer of the pinned stream host pages, and the text pool's pages are bookkeeping
+        // placeholders, so the pool's plane count no longer bounds the restore. Both sides
+        // must agree on the streamed layer count.
+        if (host.stream && host.stream->layers != attention_layers) {
+            throw std::invalid_argument(
+                "hybrid stream Host layout does not match the restore layers");
+        }
+        if (stream_->layers != attention_layers) {
+            throw std::invalid_argument("hybrid stream layers do not match the restore layers");
+        }
+    } else {
+        const std::size_t text_planes = text_pages.physical_pool().plane_count();
+        if (text_planes % attention_layers != 0) {
+            throw std::invalid_argument("hybrid restore layers do not match the text KV planes");
+        }
+        planes_per_attention_layer_ = text_planes / attention_layers;
+    }
     // Pipeline stages shard the layers and tensor parallelism the heads, so the image's layers
     // end where its last shard's do.
     std::uint32_t linear_layers = 0;
@@ -146,6 +166,19 @@ std::uint32_t HybridPrefixCache::allocate_block_id(HybridBlockPages pages) {
     return static_cast<std::uint32_t>(blocks_.size() - 1U);
 }
 
+std::uint32_t HybridPrefixCache::reserve_block_id() {
+    // The slot stays empty: under the streamed tier the id names the caller's placeholder pool
+    // page for index bookkeeping, and the cache holds no reference on it.
+    if (!free_blocks_.empty()) {
+        const std::uint32_t id = free_blocks_.back();
+        free_blocks_.pop_back();
+        return id;
+    }
+    if (blocks_.size() >= kNoId - 1U) { throw std::overflow_error("hybrid block ids exhausted"); }
+    blocks_.emplace_back(std::nullopt);
+    return static_cast<std::uint32_t>(blocks_.size() - 1U);
+}
+
 void HybridPrefixCache::free_block_id(std::uint32_t id) noexcept {
     blocks_[id].reset();
     free_blocks_.push_back(id);
@@ -167,7 +200,9 @@ void HybridPrefixCache::retain(const HybridBlockPages& pages, std::uint32_t text
             throw std::logic_error("hybrid cache page is not retainable");
         }
     };
-    check(*text_pages_, pages.text, text_columns);
+    // Under the streamed tier the text half is a bookkeeping placeholder: the cache holds no
+    // reference on it, so only the backend page is checked and retained.
+    if (stream_ == nullptr) { check(*text_pages_, pages.text, text_columns); }
     if (pages.backend.has_value() != (backend_pages_ != nullptr)) {
         throw std::logic_error("hybrid block does not match the KV pools");
     }
@@ -180,12 +215,16 @@ void HybridPrefixCache::retain(const HybridBlockPages& pages, std::uint32_t text
         store.retain_reference(page, false);
         if (columns != 0) { store.protect_coverage(page, columns); }
     };
-    retain_one(*text_pages_, pages.text, text_columns);
+    if (stream_ == nullptr) { retain_one(*text_pages_, pages.text, text_columns); }
     if (pages.backend) { retain_one(*backend_pages_, *pages.backend, backend_columns); }
 }
 
 void HybridPrefixCache::release(const HybridBlockPages& pages) noexcept {
-    if (!text_pages_->release_reference(pages.text, false)) { std::terminate(); }
+    // Under the streamed tier the text half is a bookkeeping placeholder the cache holds no
+    // reference on; only the backend page may carry one.
+    if (stream_ == nullptr && !text_pages_->release_reference(pages.text, false)) {
+        std::terminate();
+    }
     if (pages.backend &&
         (backend_pages_ == nullptr || !backend_pages_->release_reference(*pages.backend, false))) {
         std::terminate();
@@ -196,8 +235,12 @@ void HybridPrefixCache::adopt_destination(const HybridBlockPages& pages, std::ui
     if (pages.backend.has_value() != (backend_pages_ != nullptr)) {
         throw std::logic_error("hybrid restore destination does not match the KV pools");
     }
-    text_pages_->publish_transfer_destination(pages.text, false);
-    text_pages_->protect_coverage(pages.text, columns);
+    // Under the streamed tier the destination's text half is a bookkeeping placeholder that
+    // never materializes; only the backend page is adopted.
+    if (stream_ == nullptr) {
+        text_pages_->publish_transfer_destination(pages.text, false);
+        text_pages_->protect_coverage(pages.text, columns);
+    }
     if (pages.backend) {
         backend_pages_->publish_transfer_destination(*pages.backend, false);
         backend_pages_->protect_coverage(*pages.backend, columns);
@@ -213,13 +256,30 @@ InsertResult HybridPrefixCache::insert_block(NodeRef parent, std::uint64_t looku
     // leaves it private to the caller.
     const std::optional<NodeRef> existing = index_->find_child(parent, lookup_hash, tokens, extra);
     const bool adopts      = !existing || index_->node(*existing).device == CopyState::Absent;
-    const std::uint32_t id = allocate_block_id(pages);
-    if (adopts) {
-        try {
-            retain(pages, kFullPage, kFullPage);
-        } catch (...) {
-            free_block_id(id);
-            throw;
+    // Under the streamed tier the id keeps an empty slot: the text page is a bookkeeping
+    // placeholder the cache holds no reference on, and only the backend page (when a backend
+    // pool exists) carries the reference the eviction releases.
+    std::uint32_t id;
+    if (stream_ != nullptr) {
+        id = reserve_block_id();
+        if (adopts && pages.backend) {
+            try {
+                retain(pages, kFullPage, kFullPage);
+            } catch (...) {
+                free_block_id(id);
+                throw;
+            }
+            blocks_[id] = pages;
+        }
+    } else {
+        id = allocate_block_id(pages);
+        if (adopts) {
+            try {
+                retain(pages, kFullPage, kFullPage);
+            } catch (...) {
+                free_block_id(id);
+                throw;
+            }
         }
     }
     InsertResult result;
@@ -292,9 +352,13 @@ void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& p
                                    std::uint32_t slab_id) {
     std::byte* record         = slab(slab_id);
     const std::uint32_t chunk = slab_id / slabs_per_chunk_;
-    copies.text_pages.push_back(text_pages_->physical(pages.text));
-    copies.text_records.push_back(record);
-    copies.text_groups.push_back(chunk);
+    // Under the streamed tier the text half moves host-to-host by copy_stream_block*, so no
+    // Device record stands for it here.
+    if (stream_ == nullptr) {
+        copies.text_pages.push_back(text_pages_->physical(pages.text));
+        copies.text_records.push_back(record);
+        copies.text_groups.push_back(chunk);
+    }
     if (pages.backend) {
         copies.backend_pages.push_back(backend_pages_->physical(*pages.backend));
         copies.backend_records.push_back(record + host_layout_.backend_offset);
@@ -326,6 +390,47 @@ void HybridPrefixCache::enqueue_from_host(const PageCopies& copies, cudaStream_t
         backend_pages_->physical_pool().copy_from_host_records(
             const_records(copies.backend_records), copies.backend_groups, copies.backend_pages,
             *host_layout_.backend, on_every_rank(stream));
+    }
+}
+
+void HybridPrefixCache::copy_stream_block_layer(std::byte* record, std::uint32_t block,
+                                                std::uint32_t lane, std::uint32_t layer,
+                                                bool to_lane_host, cudaStream_t stream) const {
+    const qwen3_5::QsaStreamLayerState& layer_state =
+        stream_->layer_states[static_cast<std::size_t>(lane) * stream_->layers + layer];
+    const PagedKVLayerView& host = layer_state.host;
+    // The record's layer page packs the layer's planes in K, V, K scale, V scale order,
+    // skipping planes the storage has none of; the host planes are the same tensors in the
+    // same order, and a page is one contiguous run in both (page stride nb[3]).
+    std::array<const Tensor*, 4> plane_tensors{&host.k_pages, &host.v_pages, &host.k_scale_pages,
+                                                &host.v_scale_pages};
+    std::vector<const Tensor*> present;
+    for (const Tensor* tensor : plane_tensors) {
+        if (tensor->data != nullptr) { present.push_back(tensor); }
+    }
+    if (present.size() != host_layout_.text.planes.size()) {
+        throw std::logic_error("hybrid stream layer planes do not match the Host layout");
+    }
+    std::byte* page = record + static_cast<std::size_t>(layer) * host_layout_.text.page_stride;
+    for (std::size_t plane = 0; plane < present.size(); ++plane) {
+        const Tensor& tensor   = *present[plane];
+        const std::size_t bytes = static_cast<std::size_t>(tensor.nb[3]);
+        if (bytes != host_layout_.text.planes[plane].page_payload_bytes) {
+            throw std::logic_error("hybrid stream page stride does not match the Host layout");
+        }
+        const std::byte* host_page =
+            static_cast<const std::byte*>(tensor.data) + static_cast<std::int64_t>(block) * bytes;
+        const std::size_t offset = host_layout_.text.planes[plane].offset;
+        const std::byte* src = to_lane_host ? page + offset : host_page;
+        std::byte* dst       = to_lane_host ? const_cast<std::byte*>(host_page) : page + offset;
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToHost, stream));
+    }
+}
+
+void HybridPrefixCache::copy_stream_block(std::byte* record, std::uint32_t block, std::uint32_t lane,
+                                          bool to_lane_host, cudaStream_t stream) const {
+    for (std::uint32_t layer = 0; layer < stream_->layers; ++layer) {
+        copy_stream_block_layer(record, block, lane, layer, to_lane_host, stream);
     }
 }
 
@@ -396,11 +501,31 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
         }
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
+            const std::uint32_t tail_slab = view.host_slabs[host_layout_.image_slabs];
             write_scratch_.clear();
-            add_copies(write_scratch_, block(view.tail_device),
-                       view.host_slabs[host_layout_.image_slabs]);
+            if (stream_ != nullptr) {
+                // The tail's text half lives in this lane's pinned stream host page (the pool
+                // page is a placeholder): copy it host-to-host into the record, page by layer.
+                const std::uint32_t tail_page = view.frontier / kFullPage;
+                copy_stream_block(slab(tail_slab), tail_page, qsa_lane, /*to_lane_host=*/false,
+                                  transfer);
+                bytes += static_cast<std::uint64_t>(stream_->layers) * host_layout_.text.page_stride;
+            }
+            add_copies(write_scratch_, block(view.tail_device), tail_slab);
             enqueue_to_host(write_scratch_, transfer);
-            bytes += host_layout_.block_payload_bytes;
+            if (stream_ == nullptr) {
+                bytes += host_layout_.block_payload_bytes;
+            } else if (block(view.tail_device).backend) {
+                bytes += host_layout_.backend->page_stride;
+            }
+            if (stream_ != nullptr) {
+                // The writer lane keeps appending past the tail of the same host pages: hold it
+                // at the capture point until the copy lands, as the image's QSA region does.
+                cudaEvent_t tail_done = take_event();
+                CUDA_CHECK(cudaEventRecord(tail_done, transfer));
+                CUDA_CHECK(cudaStreamWaitEvent(producer, tail_done, 0));
+                spare_events_.push_back(tail_done);
+            }
         }
         PendingWrite write;
         write.snapshot = snapshot;
@@ -425,21 +550,26 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
 
 void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, SnapshotRef keep,
                                                 double claim, cudaStream_t producer,
-                                                cudaStream_t transfer) {
+                                                cudaStream_t transfer, std::uint32_t source_lane) {
     if (!host_tier()) { return; }
     PendingWrite write;
     write_scratch_.clear();
+    // Streamed tier: the text half of block i leaves the lane's pinned stream host page i
+    // (nodes run in block order from the root); the source lane's Device state is bookkeeping.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> host_sources;
     const auto abort_batch = [&]() noexcept {
         for (const NodeRef node : write.nodes) {
             index_->abort_host_fill(node);
             index_->unpin_node(node);
         }
         write.nodes.clear();
+        host_sources.clear();
     };
     try {
-        for (const NodeRef node : nodes) {
+        for (std::size_t position = 0; position < nodes.size(); ++position) {
+            const NodeRef node = nodes[position];
             const NodeView view = index_->node(node);
-            if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
+            if (view.host != CopyState::Absent) { continue; }
             index_->pin_node(node);
             const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node, keep, claim);
             if (!slab_id) {
@@ -448,7 +578,14 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, 
                 break;
             }
             write.nodes.push_back(node);
-            add_copies(write_scratch_, block(view.device_id), *slab_id);
+            // Under the streamed tier without a backend pool the block id keeps an empty slot
+            // (the text half moves host-to-host), so no Device record stands for the block.
+            if (stream_ == nullptr || backend_pages_ != nullptr) {
+                add_copies(write_scratch_, block(view.device_id), *slab_id);
+            }
+            if (stream_ != nullptr) {
+                host_sources.emplace_back(static_cast<std::uint32_t>(position), *slab_id);
+            }
         }
     } catch (...) {
         abort_batch();
@@ -457,9 +594,20 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, 
     if (write.nodes.empty()) { return; }
     try {
         order_after(producer, transfer);
+        for (const auto& [block_index, slab_id] : host_sources) {
+            copy_stream_block(slab(slab_id), block_index, source_lane, /*to_lane_host=*/false,
+                              transfer);
+        }
         enqueue_to_host(write_scratch_, transfer);
         write.done = take_event();
         CUDA_CHECK(cudaEventRecord(write.done, transfer));
+        if (stream_ != nullptr) {
+            // The copies read the source lane's pinned stream host pages, which no reference
+            // protects the way a Device page is: the next sequence on that lane overwrites them
+            // from position zero. Hold every later Device work (that append runs on `producer`)
+            // until the write-through has landed.
+            CUDA_CHECK(cudaStreamWaitEvent(producer, write.done, 0));
+        }
     } catch (...) {
         (void)ninfer::wait_for_stream(transfer);
         if (write.done != nullptr) { spare_events_.push_back(write.done); }
@@ -569,6 +717,83 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
     add_copies(restore_.tail_copies, destination, view.host_slabs[host_layout_.image_slabs]);
 }
 
+void HybridPrefixCache::restore_block_stream(NodeRef node, std::uint32_t block_index,
+                                             std::uint32_t lane, HybridBlockPages destination) {
+    if (!restore_.open || restore_.submitted) {
+        throw std::logic_error("hybrid restore is not open");
+    }
+    if (restore_.stream_lane != kNoStreamLane && restore_.stream_lane != lane) {
+        throw std::logic_error("hybrid stream restore mixes lanes");
+    }
+    const NodeView view = index_->node(node);
+    if (view.host != CopyState::Resident) {
+        throw std::logic_error("hybrid stream restore source block is not host-backed");
+    }
+    // The text half lands in the destination lane's pinned stream host page (submit_restore
+    // copies it); no Device fill is opened for it. The backend half, when absent, restores to
+    // a Device page as the ordinary fill does.
+    restore_.stream_lane    = lane;
+    restore_.stream_blocks.emplace_back(block_index, view.host_slab);
+    if (view.device != CopyState::Absent || backend_pages_ == nullptr) {
+        if (destination.backend.has_value()) {
+            throw std::logic_error("hybrid stream restore destination has a stray backend page");
+        }
+        return;
+    }
+    if (!destination.backend) {
+        throw std::logic_error("hybrid stream restore has no backend destination");
+    }
+    adopt_destination(destination, kFullPage);
+    const std::uint32_t id = allocate_block_id(destination);
+    try {
+        index_->begin_device_fill(node, id);
+    } catch (...) {
+        release(destination);
+        free_block_id(id);
+        throw;
+    }
+    restore_.nodes.push_back(node);
+    add_copies(restore_.copies, destination, view.host_slab);
+}
+
+void HybridPrefixCache::restore_tail_stream(SnapshotRef snapshot, std::uint32_t lane,
+                                            HybridBlockPages destination) {
+    if (!restore_.open || restore_.submitted || restore_.tail) {
+        throw std::logic_error("hybrid restore is not open");
+    }
+    if (restore_.stream_lane != kNoStreamLane && restore_.stream_lane != lane) {
+        throw std::logic_error("hybrid stream restore mixes lanes");
+    }
+    const SnapshotView view = index_->snapshot(snapshot);
+    if (view.tail_len == 0 || view.host != CopyState::Resident ||
+        (view.tail_device_copy != CopyState::Absent && view.tail_device_copy != CopyState::Resident)) {
+        throw std::logic_error("hybrid stream restore source tail is not host-backed");
+    }
+    const std::uint32_t tail_slab = view.host_slabs[host_layout_.image_slabs];
+    restore_.stream_lane = lane;
+    restore_.stream_tail = {view.frontier / kFullPage, tail_slab};
+    if (view.tail_device_copy != CopyState::Absent || backend_pages_ == nullptr) {
+        if (destination.backend.has_value()) {
+            throw std::logic_error("hybrid stream restore destination has a stray backend page");
+        }
+        return;
+    }
+    if (!destination.backend) {
+        throw std::logic_error("hybrid stream restore has no backend destination");
+    }
+    adopt_destination(destination, view.tail_len);
+    const std::uint32_t id = allocate_block_id(destination);
+    try {
+        index_->begin_tail_device_fill(snapshot, id);
+    } catch (...) {
+        release(destination);
+        free_block_id(id);
+        throw;
+    }
+    restore_.tail = snapshot;
+    add_copies(restore_.tail_copies, destination, tail_slab);
+}
+
 void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_slot,
                                       std::uint32_t qsa_lane) {
     if (!restore_.open || restore_.submitted || restore_.image) {
@@ -607,6 +832,16 @@ void HybridPrefixCache::submit_restore() {
         }
         return event;
     };
+    if (restore_.stream_lane != kNoStreamLane) {
+        // The destination lane's 4-token pools and residency maps still hold whatever its
+        // previous sequence left (a root prefill repools only its own lane's indexer planes):
+        // clear them on the restore stream, ahead of the prelude every reader waits for.
+        const std::size_t base =
+            static_cast<std::size_t>(restore_.stream_lane) * stream_->layers;
+        for (std::uint32_t layer = 0; layer < stream_->layers; ++layer) {
+            ops::kv_stream_reset(stream_->layer_states[base + layer].map, restore_stream_);
+        }
+    }
     // Prelude: what activation reads (the snapshot tail) and what a pass reads outside the layer
     // stack (backend KV, the continuation hidden, DFlash local state).
     enqueue_from_host(restore_.tail_copies, restore_stream_);
@@ -627,7 +862,19 @@ void HybridPrefixCache::submit_restore() {
     restore_.layers.reserve(layers_.size());
     for (const HybridRestoreLayer& layer : layers_) {
         if (layer.attention) {
-            if (!restore_.copies.text_pages.empty()) {
+            if (restore_.stream_lane != kNoStreamLane) {
+                // Streamed tier: the text half lands in the destination lane's pinned stream
+                // host pages, this layer's page of each restored block record, in block order.
+                for (const auto& [block_index, slab_id] : restore_.stream_blocks) {
+                    copy_stream_block_layer(slab(slab_id), block_index, restore_.stream_lane,
+                                            layer.index, /*to_lane_host=*/true, restore_stream_);
+                }
+                if (restore_.stream_tail) {
+                    copy_stream_block_layer(slab(restore_.stream_tail->second),
+                                            restore_.stream_tail->first, restore_.stream_lane,
+                                            layer.index, /*to_lane_host=*/true, restore_stream_);
+                }
+            } else if (!restore_.copies.text_pages.empty()) {
                 const std::size_t begin = layer.index * planes_per_attention_layer_;
                 text_pages_->physical_pool().copy_from_host_records(
                     const_records(restore_.copies.text_records), restore_.copies.text_groups,
@@ -645,12 +892,25 @@ void HybridPrefixCache::submit_restore() {
     }
     restore_.submitted = true;
     restore_.ticket    = next_ticket_++;
-    counters_.host_block_restores += restore_.nodes.size();
-    counters_.host_tail_restores += restore_.tail ? 1U : 0U;
+    std::size_t restored_blocks = restore_.nodes.size();
+    std::size_t restored_bytes   = restored_blocks * host_layout_.block_payload_bytes;
+    if (restore_.stream_lane != kNoStreamLane) {
+        // Streamed tier: every restored text half is a host-to-host copy of the record's layer
+        // pages; the opened Device fills add their backend page on top.
+        restored_blocks = restore_.stream_blocks.size();
+        restored_bytes  = restored_blocks * static_cast<std::size_t>(stream_->layers) *
+                             host_layout_.text.page_stride +
+                         restore_.nodes.size() *
+                             (host_layout_.backend ? host_layout_.backend->page_stride : 0U);
+        counters_.host_block_restores += restored_blocks;
+        counters_.host_tail_restores  += restore_.stream_tail ? 1U : 0U;
+    } else {
+        counters_.host_block_restores += restored_blocks;
+        counters_.host_tail_restores  += restore_.tail ? 1U : 0U;
+    }
     counters_.host_image_restores += restore_.image ? 1U : 0U;
     counters_.host_restore_bytes +=
-        (restore_.nodes.size() + (restore_.tail ? 1U : 0U)) * host_layout_.block_payload_bytes +
-        (restore_.image ? host_layout_.image_bytes : 0U);
+        restored_bytes + (restore_.image ? host_layout_.image_bytes : 0U);
 }
 
 std::uint64_t HybridPrefixCache::land_restore(cudaStream_t consumer) {
@@ -779,7 +1039,9 @@ void HybridPrefixCache::clear() noexcept {
     reset_restore();
     for (std::optional<HybridBlockPages>& pages : blocks_) {
         if (!pages) { continue; }
-        (void)text_pages_->release_reference(pages->text, false);
+        // Under the streamed tier the text half is a bookkeeping placeholder the cache holds no
+        // reference on (and the pool page may already be gone with the writer lane).
+        if (stream_ == nullptr) { (void)text_pages_->release_reference(pages->text, false); }
         if (pages->backend && backend_pages_ != nullptr) {
             (void)backend_pages_->release_reference(*pages->backend, false);
         }
@@ -800,8 +1062,13 @@ void HybridPrefixCache::clear() noexcept {
 // ---- PrefixIndexBackend ------------------------------------------------------------------------
 
 void HybridPrefixCache::release_device_block(std::uint32_t device_id) noexcept {
-    if (device_id >= blocks_.size() || !blocks_[device_id]) { std::terminate(); }
-    release(*blocks_[device_id]);
+    // Under the streamed tier an id may keep an empty slot: the text half is a bookkeeping
+    // placeholder the cache holds no reference on, and a block without a backend pool has no
+    // bundle at all.
+    if (device_id >= blocks_.size() || (stream_ == nullptr && !blocks_[device_id])) {
+        std::terminate();
+    }
+    if (blocks_[device_id]) { release(*blocks_[device_id]); }
     free_block_id(device_id);
     ++counters_.evicted_blocks;
 }

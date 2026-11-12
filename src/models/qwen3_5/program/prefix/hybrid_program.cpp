@@ -89,8 +89,30 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
     const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
     const KVPageGeometry* backend_geometry =
         backend_kv_pages ? &backend_kv_pages->physical_pool().geometry() : nullptr;
-    const HybridHostLayout host = plan_hybrid_host_layout(text_pool.geometry(), backend_geometry,
-                                                          state_images->host_layout().image_bytes);
+    HybridHostLayout host;
+    if (qsa_stream_state.has_value()) {
+        // Streamed tier: the block record is one packed 64-position page per streamed layer,
+        // laid out from the pinned stream host planes. Synthesize the layer page geometry from
+        // the first (lane, layer)'s host view (K, V, K scale, V scale order, skipping the
+        // planes the storage has none of).
+        const qwen3_5::QsaStreamState& stream = *qsa_stream_state;
+        const PagedKVLayerView& layer_view    = stream.layer_states.front().host;
+        const Tensor* plane_tensors[4] = {&layer_view.k_pages, &layer_view.v_pages,
+                                          &layer_view.k_scale_pages, &layer_view.v_scale_pages};
+        KVPageGeometry layer_page;
+        for (const Tensor* tensor : plane_tensors) {
+            if (tensor->data == nullptr) { continue; }
+            layer_page.planes.push_back(
+                KVPlaneGeometry{.dtype          = tensor->dtype,
+                                .leading_extent = tensor->ne[0],
+                                .head_extent    = tensor->ne[2]});
+        }
+        host = plan_hybrid_stream_host_layout(stream.layers, layer_page, backend_geometry,
+                                               state_images->host_layout().image_bytes);
+    } else {
+        host = plan_hybrid_host_layout(text_pool.geometry(), backend_geometry,
+                                       state_images->host_layout().image_bytes);
+    }
     const std::uint32_t slabs =
         hybrid_host_slabs(host, context_cache.host_cache_budget_bytes.value_or(0U));
     const std::uint32_t device_slots        = context_cache.device_state_slots.value_or(0U);
@@ -132,7 +154,8 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
     }
     hybrid_ = std::make_unique<HybridPrefixCache>(
         config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
-        std::move(layers), phase ? &*phase : nullptr);
+        std::move(layers), qsa_stream_state ? &*qsa_stream_state : nullptr,
+        phase ? &*phase : nullptr);
     if (phase) { phase->complete(host_bytes, host_bytes); }
 }
 
@@ -434,7 +457,13 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
         DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
         DeviceKVPagePool* backend_pool =
             backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
+        // Streamed tier: the text half never takes a Device page (the Host slab is its other
+        // home, and admission copies it host-to-host into the lane's stream pages), so only
+        // the backend pool is worth prefetching; without one there is nothing to move.
+        const bool streamed = hybrid_->kv_streamed();
+        if (streamed && backend_pool == nullptr) { return 0U; }
         const auto available = [&] {
+            if (streamed) { return backend_pool->available_pages(); }
             const std::uint32_t text = text_pool.available_pages();
             return backend_pool != nullptr ? std::min(text, backend_pool->available_pages()) : text;
         };
@@ -445,16 +474,19 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
         std::optional<DeviceKVPageReservation> text_pages;
         std::optional<DeviceKVPageReservation> backend_pages;
         if (wanted != 0) {
-            text_pages = text_pool.reserve(wanted);
+            if (!streamed) { text_pages = text_pool.reserve(wanted); }
             if (backend_pool != nullptr) { backend_pages = backend_pool->reserve(wanted); }
         }
-        if (text_pages && (backend_pool == nullptr || backend_pages)) {
+        if ((!streamed && text_pages) || (streamed && backend_pool != nullptr && backend_pages)) {
             hybrid_->open_restore(device.stream);
             for (const pc::NodeRef node : path) {
                 if (started == wanted) { break; }
                 if (index.node(node).device != pc::CopyState::Absent) { continue; }
-                HybridBlockPages pages{
-                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
+                HybridBlockPages pages;
+                if (!streamed) {
+                    pages.text =
+                        text_kv_pages->materialize_transfer_destination(*text_pages, kBlock);
+                }
                 if (backend_pool != nullptr) {
                     pages.backend =
                         backend_kv_pages->materialize_transfer_destination(*backend_pages, kBlock);
@@ -735,16 +767,45 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
         transaction.snapshot_pinned = true;
     }
 
+    const bool streamed  = hybrid_->kv_streamed();
     std::vector<pc::NodeRef> host_only;
-    for (const pc::NodeRef node : transaction.path) {
-        const pc::NodeView view = index.node(node);
-        if (view.device == pc::CopyState::Absent) {
+    // Streamed tier, among the nodes above: the ones whose backend half must be filled on the
+    // Device (its text half always restores from the Host slab).
+    std::vector<pc::NodeRef> backend_missing;
+    if (streamed) {
+        for (const pc::NodeRef node : transaction.path) {
+            const pc::NodeView view = index.node(node);
+            if (view.host != pc::CopyState::Resident) {
+                // The text half is not on the Host tier; under the streamed tier the pinned
+                // stream host pages are its only other home, and only the writer lane's.
+                return false;
+            }
             host_only.push_back(node);
-        } else if (view.device != pc::CopyState::Resident) {
-            return false;
+            if (view.device == pc::CopyState::Absent) {
+                backend_missing.push_back(node);
+            } else if (view.device != pc::CopyState::Resident) {
+                return false;
+            }
+        }
+    } else {
+        for (const pc::NodeRef node : transaction.path) {
+            const pc::NodeView view = index.node(node);
+            if (view.device == pc::CopyState::Absent) {
+                host_only.push_back(node);
+            } else if (view.device != pc::CopyState::Resident) {
+                return false;
+            }
         }
     }
-    const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
+    // Streamed tier: the tail's text half always restores from the slab into the destination
+    // lane's stream host page, so the tail forces a restore whenever it exists.
+    const bool tail_restore =
+        streamed
+            ? reuse != 0 && tail != 0
+            : tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
+    // The tail's backend page fills only when its Device copy is gone.
+    const bool tail_backend_restore =
+        streamed && tail_restore && snapshot.tail_device_copy == pc::CopyState::Absent;
     // --qwen38-27b-qsa: a snapshot's QSA state lives in its Host replica (the shared device
     // planes hold the live sequence's), so a QSA image restores from the Host whenever the
     // replica is there, even beside a Device slot. An image the restore must take from the Host
@@ -756,11 +817,23 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
         (snapshot.device_slot == pc::kNoId || qsa_host_image);
     if (image_restore && snapshot.host != pc::CopyState::Resident) { return false; }
     const bool backend_pool  = backend_kv_pages != nullptr;
-    const auto restored = static_cast<std::uint32_t>(host_only.size()) + (tail_restore ? 1U : 0U);
-    const std::uint32_t text_need = quote.text_kv_page_entitlement - full + restored;
+    // Streamed tier: the restored text halves land in the lane's stream host pages, so they
+    // take no text pool pages; only the missing backend halves take Device pages.
+    const auto restored =
+        streamed
+            ? static_cast<std::uint32_t>(host_only.size())
+            : static_cast<std::uint32_t>(host_only.size()) + (tail_restore ? 1U : 0U);
+    const auto restored_backend =
+        streamed
+            ? static_cast<std::uint32_t>(backend_missing.size()) + (tail_backend_restore ? 1U : 0U)
+            : 0U;
+    const std::uint32_t text_need =
+        streamed ? quote.text_kv_page_entitlement - full
+                 : quote.text_kv_page_entitlement - full + restored;
     const std::uint32_t backend_need =
         backend_pool
-            ? quote.backend_kv_page_entitlement - hybrid_backend_frontier(reuse) / kBlock + restored
+            ? quote.backend_kv_page_entitlement - hybrid_backend_frontier(reuse) / kBlock +
+              (streamed ? restored_backend : restored)
             : 0U;
     // The quote counted these pages; failing here means it went stale, and the Engine plans the
     // request again instead of failing it.
@@ -773,7 +846,7 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     }
     transaction.state = state_store->reserve_destination();
     if (!transaction.state) { return false; }
-    if (restored == 0 && !image_restore) { return true; }
+    if (restored == 0 && !image_restore && !tail_restore) { return true; }
 
     // Host restores run on the restore stream while other lanes keep executing; the transaction
     // stays in progress until they complete.
@@ -782,17 +855,44 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
         static_cast<std::uint64_t>(restored) * block_bytes +
         (image_restore ? static_cast<std::uint64_t>(hybrid_->host_layout().image_bytes) : 0U);
     hybrid_->open_restore(device.stream);
+    // Streamed tier: a destination carries the backend page only; the text half never
+    // materializes on the Device (the restore copies it host-to-host instead).
     const auto destination = [&](std::uint32_t columns) {
-        HybridBlockPages pages{.text = text_kv_pages->materialize_transfer_destination(
-                                   *transaction.text_pages, columns)};
+        HybridBlockPages pages;
+        if (!streamed) {
+            pages.text = text_kv_pages->materialize_transfer_destination(
+                *transaction.text_pages, columns);
+        }
         if (backend_pool) {
             pages.backend = backend_kv_pages->materialize_transfer_destination(
                 *transaction.backend_pages, columns);
         }
         return pages;
     };
-    for (const pc::NodeRef node : host_only) { hybrid_->restore_block(node, destination(kBlock)); }
-    if (tail_restore) { hybrid_->restore_tail(quote.snapshot, destination(tail)); }
+    if (streamed) {
+        for (std::size_t position = 0; position < host_only.size(); ++position) {
+            const pc::NodeRef node = host_only[position];
+            // A fill opens only when the block's Device copy is gone (its backend page then
+            // lands there); otherwise the block's record already stands and only its text
+            // half moves host-to-host.
+            const HybridBlockPages backend_destination =
+                index.node(node).device == pc::CopyState::Absent
+                    ? destination(kBlock)
+                    : HybridBlockPages{};
+            hybrid_->restore_block_stream(node, static_cast<std::uint32_t>(position), lane,
+                                           std::move(backend_destination));
+        }
+        if (tail_restore) {
+            hybrid_->restore_tail_stream(quote.snapshot, lane,
+                                         tail_backend_restore ? destination(tail)
+                                                              : HybridBlockPages{});
+        }
+    } else {
+        for (const pc::NodeRef node : host_only) {
+            hybrid_->restore_block(node, destination(kBlock));
+        }
+        if (tail_restore) { hybrid_->restore_tail(quote.snapshot, destination(tail)); }
+    }
     if (image_restore) {
         hybrid_->restore_image(quote.snapshot, state_store->physical_slot(*transaction.state),
                                quote.destination);
@@ -843,7 +943,11 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
     const std::span<const pc::NodeRef> path(transaction.path);
     const pc::SnapshotView snapshot =
         reuse != 0 ? index.snapshot(quote.snapshot) : pc::SnapshotView{};
-    if (reuse != 0 && tail != 0 && snapshot.tail_device_copy == pc::CopyState::Absent) {
+    if (reuse != 0 && tail != 0 && snapshot.tail_device_copy == pc::CopyState::Absent &&
+        !hybrid_->kv_streamed()) {
+        // Streamed tier: the tail's text half never lives on the Device; admission forced the
+        // tail restore, so it is landing into the lane's stream host page (its backend page
+        // is present or filling).
         throw std::logic_error("hybrid admission tail is not on the Device");
     }
 
@@ -891,7 +995,12 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             const std::optional<KVAddressSpaceHandle> address = addresses.create_inactive();
             if (!address) { throw std::logic_error("hybrid admission has no KV address space"); }
             try {
-                if (frontier == 0) {
+                // Streamed tier: the text half never lives in the Device pages (the pinned
+                // stream host pages are the content's authority, and the pool pages are
+                // bookkeeping placeholders the restore's host copies supersede), so its address
+                // space activates root-style. The backend half still shares its real pages
+                // through the fork.
+                if (frontier == 0 || (!backend && hybrid_->kv_streamed())) {
                     addresses.activate(*address, entitlement, static_cast<std::int32_t>(lane),
                                        compute_streams);
                     return *address;
@@ -1225,29 +1334,33 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
 std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPages& source,
                                                            std::uint32_t columns) {
     const bool backend_pool = backend_kv_pages != nullptr;
-    if (!hybrid_make_room(1U, backend_pool ? 1U : 0U)) { return std::nullopt; }
-    std::optional<DeviceKVPageReservation> text_reservation =
-        text_kv_pages->physical_pool().reserve(1U);
-    std::optional<DeviceKVPageReservation> backend_reservation;
-    if (!text_reservation) { return std::nullopt; }
-    if (backend_pool) {
-        backend_reservation = backend_kv_pages->physical_pool().reserve(1U);
-        if (!backend_reservation) { return std::nullopt; }
+    const bool streamed = hybrid_->kv_streamed();
+    if (!hybrid_make_room(streamed ? 0U : 1U, backend_pool ? 1U : 0U)) { return std::nullopt; }
+    HybridBlockPages copy;
+    if (!streamed) {
+        // Each tail owns its bundle, so evicting any cache entry returns exactly one page per
+        // pool.
+        std::optional<DeviceKVPageReservation> text_reservation =
+            text_kv_pages->physical_pool().reserve(1U);
+        if (!text_reservation) { return std::nullopt; }
+        copy.text =
+            text_kv_pages->materialize_transfer_destination(*text_reservation, columns);
+        text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
+                                                 text_kv_pages->physical(copy.text),
+                                                 compute_streams);
     }
-    HybridBlockPages copy{
-        .text = text_kv_pages->materialize_transfer_destination(*text_reservation, columns)};
     if (backend_pool) {
+        std::optional<DeviceKVPageReservation> backend_reservation =
+            backend_kv_pages->physical_pool().reserve(1U);
+        if (!backend_reservation) { return std::nullopt; }
         copy.backend =
             backend_kv_pages->materialize_transfer_destination(*backend_reservation, columns);
+        backend_kv_pages->physical_pool().copy_page(
+            backend_kv_pages->physical(*source.backend),
+            backend_kv_pages->physical(*copy.backend), compute_streams);
     }
-    // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
-    text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
-                                             text_kv_pages->physical(copy.text), compute_streams);
-    if (backend_pool) {
-        backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
-                                                    backend_kv_pages->physical(*copy.backend),
-                                                    compute_streams);
-    }
+    // Streamed tier: the tail's text half stays in this lane's pinned stream host page; only
+    // the backend page (the MTP pool reads it densely) moves to a new Device page.
     return hybrid_->register_tail_copy(copy, columns);
 }
 
@@ -1266,17 +1379,32 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         const std::uint32_t tail    = tap.frontier % kBlock;
         const bool anchored         = lane.path.size() >= full;
         const bool tail_block_ready = tail == 0 || lane.path.size() > full;
+        const bool streamed = hybrid_->kv_streamed();
         std::optional<HybridBlockPages> tail_source;
         if (anchored && tail != 0) {
             if (tail_block_ready) {
-                tail_source = hybrid_->block(index.node(lane.path[full]).device_id);
+                if (streamed) {
+                    // Streamed tier: the text half is captured from the lane's pinned stream
+                    // host page by start_snapshot_host_write; only the backend half (when a
+                    // backend pool exists) stands behind a Device page.
+                    HybridBlockPages own;
+                    if (backend_kv_pages) {
+                        own.backend =
+                            hybrid_->block(index.node(lane.path[full]).device_id).backend;
+                    }
+                    tail_source = own;
+                } else {
+                    tail_source = hybrid_->block(index.node(lane.path[full]).device_id);
+                }
             } else if (finishing && sequence.kv && sequence.text_kv_valid >= tap.frontier &&
                        (!sequence.kv->backend ||
                         backend_kv_valid(sequence) >= hybrid_backend_frontier(tap.frontier))) {
                 // The finishing lane's own partial page holds the tail; it is copied before the
-                // lane releases it.
-                HybridBlockPages own{.text =
-                                         text_kv_addresses->logical_page(sequence.kv->text, full)};
+                // lane releases it. Streamed tier: the text half stays in the stream host page.
+                HybridBlockPages own;
+                if (!streamed) {
+                    own.text = text_kv_addresses->logical_page(sequence.kv->text, full);
+                }
                 if (sequence.kv->backend) {
                     own.backend = backend_kv_addresses->logical_page(*sequence.kv->backend, full);
                 }
@@ -1657,7 +1785,7 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
             try {
                 hybrid_->start_block_host_writes(state.path, state.superseded_tap,
                                                  index.retained_priority(state.published),
-                                                 device.stream, device.transfer_stream);
+                                                 device.stream, device.transfer_stream, lane);
             } catch (...) {}
             index.release_path(state.path);
         }

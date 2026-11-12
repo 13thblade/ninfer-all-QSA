@@ -695,6 +695,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size())); }
+        queue_qsa_stream_overflow_fetch();
         submit_range.reset();
         timing.begin_wait();
         {
@@ -702,6 +703,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        check_qsa_stream_overflow();
         observe_masks(lanes);
         timing.end_wait();
 
@@ -933,6 +935,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     verify_window, draft_window, envelopes, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
+        queue_qsa_stream_overflow_fetch();
         submit_range.reset();
         timing.begin_wait();
         {
@@ -940,6 +943,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        check_qsa_stream_overflow();
         observe_masks(lanes);
         timing.end_wait();
 
@@ -1210,6 +1214,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        verify_drafts, envelopes, target_envelope, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
+        queue_qsa_stream_overflow_fetch();
         submit_range.reset();
         timing.begin_wait();
         {
@@ -1217,6 +1222,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        check_qsa_stream_overflow();
         observe_masks(lanes);
         timing.end_wait();
 

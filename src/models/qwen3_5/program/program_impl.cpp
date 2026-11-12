@@ -1029,6 +1029,40 @@ void ProgramImpl::synchronize_transfer_streams() const {
     }
 }
 
+void ProgramImpl::queue_qsa_stream_overflow_fetch() {
+    if (!qsa_stream_state.has_value()) { return; }
+    const qwen3_5::QsaStreamState& stream = *qsa_stream_state;
+    const std::size_t words = static_cast<std::size_t>(stream.lanes) * stream.layers;
+    if (!qsa_stream_overflow_host) {
+        qsa_stream_overflow_host.emplace(words * sizeof(std::int32_t));
+    }
+    // The resolve of the round just submitted wrote each pool's overflow word on `stream`,
+    // so the copies, enqueued on the same stream, read that round's value. The round's
+    // device sync covers them.
+    std::int32_t* target = static_cast<std::int32_t*>(qsa_stream_overflow_host->data());
+    for (std::size_t index = 0; index < words; ++index) {
+        const qwen3_5::QsaStreamLayerState& layer = stream.layer_states[index];
+        CUDA_CHECK(cudaMemcpyAsync(target + index, layer.map.control + 3, sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+}
+
+void ProgramImpl::check_qsa_stream_overflow() {
+    if (!qsa_stream_state.has_value() || !qsa_stream_overflow_host) { return; }
+    const qwen3_5::QsaStreamState& stream = *qsa_stream_state;
+    const std::int32_t* words = static_cast<const std::int32_t*>(qsa_stream_overflow_host->data());
+    for (std::uint32_t lane = 0; lane < stream.lanes; ++lane) {
+        for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
+            if (words[lane * stream.layers + layer] != 0) {
+                throw std::logic_error(
+                    "QSA streamed KV pool overflow: lane " + std::to_string(lane) + " layer " +
+                    std::to_string(layer) + " needed more of its " + std::to_string(stream.slots) +
+                    "-slot pool than it has; raise --kv-resident to widen the pool");
+            }
+        }
+    }
+}
+
 ProgramImpl::~ProgramImpl() noexcept {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
         (void)ninfer::wait_for_stream(transfer_streams[rank]);

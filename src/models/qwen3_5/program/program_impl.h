@@ -1045,6 +1045,8 @@ public:
     // per-(lane, layer) pool / residency map views. Empty when streaming is off.
     std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
     std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
+    // --kv-resident: the (lane, layer) stream pool overflow words staged by each decode round.
+    std::optional<PinnedHostBuffer> qsa_stream_overflow_host;
     // --qwen38-27b-qsa (Legacy cache): the continuation that last wrote each lane's QSA
     // planes (the indexer state and, under --kv-resident, that lane's pinned KV copy). The
     // Legacy StateImage carries no QSA region, so a catalogued continuation can resume its
@@ -1981,6 +1983,11 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+    // --kv-resident: enqueues an async copy of every (lane, layer) stream pool overflow word
+    // after a decode round's forward pass; the round's device sync covers the copy, and
+    // check_qsa_stream_overflow then refuses a round that reported an overflow.
+    void queue_qsa_stream_overflow_fetch();
+    void check_qsa_stream_overflow();
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
