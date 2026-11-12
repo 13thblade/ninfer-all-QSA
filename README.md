@@ -2,13 +2,13 @@
 
 # 中文
 
-本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力支持，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
 
 模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 
 模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文。
+支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。
 
 后续计划：
 1. 提供Dflash2和Dspine草稿的支持。
@@ -36,23 +36,19 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## 实测
 
-同一块 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA.ninfer`、int8 KV、关闭投机解码与前缀复用、KV 全驻留。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-proposal.ninfer`、int8 KV、**Hybrid 前缀缓存**（`--use-alt-prefix-caching`）、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 16384`、**MTP + ngram 草稿开启**、贪心解码；`--wddm-evictable-budget` 开启，`--prefill-chunk` 保持默认 1024。每条请求 32,768 token + 512 token 输出。
 
-速度：单次冷请求，26,587 token 提示 + 48 token 输出，KV 容量 32,768。**QSA 路径在 prefill 阶段对该层完整的 KV 做 dense 因果注意力，decode/verify 仍走 QSA 稀疏注意力**，所以 prefill 不再随窗口变化；`NINFER_QSA_DENSE_PREFILL=0` 可回到纯 QSA prefill。
+| 并发 | 聚合 prefill (tok/s) | 聚合 decode (tok/s) | TTFT（最小–最大） | 每请求 prompt / 输出 |
+| --- | ---: | ---: | ---: | --- |
+| 单发（1 lane） | 1,766 | 123.5 | 18.55 s | 32,768 / 512 |
+| 双并发（2 lane） | 1,752 | 222.4 | 18.79–42.01 s | 各 32,768 / 512 |
+| 四并发（4 lane）\* | 1,747 | 369.3 | 18.78–91.68 s | 各 32,768 / 512 |
 
-| 配置 | prefill (tok/s) | decode (tok/s) | TTFT |
-| --- | ---: | ---: | ---: |
-| dense（不开 `--qwen38-27b-qsa`） | 1,960 | 49.7 | 13.6 s |
-| QSA 512 块（2,048 token，默认） | 1,930 | 49.6 | 13.8 s |
-| QSA 1,024 块（4,096 token） | 1,940 | 48.9 | 13.7 s |
-| QSA 2,048 块（8,192 token） | 1,930 | 47.4 | 13.8 s |
-| QSA 4,096 块（16,384 token） | 1,920 | 44.8 | 13.9 s |
+聚合 prefill = 各请求 prompt token 之和 ÷ 各请求 prefill 耗时之和（共享 dense-prefill staging 使 prefill 串行）；聚合 decode = 各请求输出 token 之和 ÷ 最长 decode 耗时（decode 重叠）。TTFT 阶梯来自共享 staging 的串行化。
 
-关闭混合时的纯 QSA prefill 依次为 1,600 / 1,330 / 1,020 / 770 tok/s（TTFT 16.6 / 20.0 / 26.1 / 34.4 s），窗口越宽越慢；混合后四档分别提升 20% / 46% / 89% / 149%，decode 不变。
+\* **四并发需降级**（24 GiB 显存限制）：`--ngram-draft-tokens 0`、`--kv-resident 12288`、`--kv-headroom-mib 0`；MTP/proposal、Hybrid、`--wddm-evictable-budget`、`--prefill-chunk 1024` 均不变。
 
-PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（`NINFER_QSA_DENSE_PREFILL=0`）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）；测试条件：teacher-forced、68,408 token 语料（本仓库 docs 与 src）、上下文截断到 65,536、stride 512，取尾部 6 个 512-token 块（65,024 上下文、2,873 token），dense 基线 3.9745。
-
-混合模式下 prefill 已与窗口解耦，窗口只影响 decode 的速度与稀疏质量；关闭混合时 prefill 才随块数线性增长（4,096 块约为 dense 的 39%）。KV stream 是另一笔开销：同一场景下 512 块开流式是 prefill −6.8% / decode −6.6%，4,096 块开流式 decode −22%（流式池需容纳 `width × (块数 + 1)` 块），KV stream 仅改变全量 KV 存放的位置，不影响模型质量。
+PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（NINFER_QSA_DENSE_PREFILL=0）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）；
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -91,23 +87,19 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA.ninfer`, int8 KV, speculative decoding and prefix reuse off, every sparse layer's KV resident.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-proposal.ninfer`, int8 KV, **hybrid prefix cache** (`--use-alt-prefix-caching`), `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 16384`, **MTP and ngram drafting on**, greedy decode; `--wddm-evictable-budget` on, `--prefill-chunk` left at its 1024 default. Each request is 32,768 tokens with 512 output tokens.
 
-Speed: one cold request, a 26,587-token prompt and 48 output tokens, KV capacity 32,768. **The QSA path runs dense causal attention over the layer's complete KV during prefill; decode/verify stay sparse**, so prefill no longer depends on the window. `NINFER_QSA_DENSE_PREFILL=0` restores a pure QSA prefill.
+| Concurrency | aggregate prefill (tok/s) | aggregate decode (tok/s) | TTFT (min–max) | prompt / output per request |
+| --- | ---: | ---: | ---: | --- |
+| single (1 lane) | 1,766 | 123.5 | 18.55 s | 32,768 / 512 |
+| 2 concurrent (2 lanes) | 1,752 | 222.4 | 18.79–42.01 s | 32,768 / 512 each |
+| 4 concurrent (4 lanes)\* | 1,747 | 369.3 | 18.78–91.68 s | 32,768 / 512 each |
 
-| Configuration | prefill (tok/s) | decode (tok/s) | TTFT |
-| --- | ---: | ---: | ---: |
-| dense (no `--qwen38-27b-qsa`) | 1,960 | 49.7 | 13.6 s |
-| QSA 512 blocks (2,048 tokens, default) | 1,930 | 49.6 | 13.8 s |
-| QSA 1,024 blocks (4,096 tokens) | 1,940 | 48.9 | 13.7 s |
-| QSA 2,048 blocks (8,192 tokens) | 1,930 | 47.4 | 13.8 s |
-| QSA 4,096 blocks (16,384 tokens) | 1,920 | 44.8 | 13.9 s |
+Aggregate prefill = sum of prompt tokens / sum of prefill seconds (the shared dense-prefill staging serializes prefill); aggregate decode = sum of output tokens / the longest decode interval (decodes overlap). The TTFT staircase comes from the serialization of that shared staging.
 
-With the hybrid route off, pure QSA prefill is 1,600 / 1,330 / 1,020 / 770 tok/s (TTFT 16.6 / 20.0 / 26.1 / 34.4 s): the wider the window, the slower. The hybrid route gains 20% / 46% / 89% / 149% on those four and leaves decode unchanged.
+\* **Four lanes need a fallback** (24 GiB memory limit): `--ngram-draft-tokens 0`, `--kv-resident 12288`, `--kv-headroom-mib 0`; MTP/proposal, hybrid caching, `--wddm-evictable-budget` and `--prefill-chunk 1024` are unchanged.
 
-Perplexity: the default dense path and the QSA path (whose prefill is still dense attention) give strictly identical teacher-forced perplexity (3.91997). Force-running QSA during prefill (`NINFER_QSA_DENSE_PREFILL=0`) raises the tail perplexity of the same evaluation by 5.73% (512 blocks), 2.59% (1,024), 1.12% (2,048) and 0.45% (4,096); conditions: teacher-forced, 68,408-token corpus (this repository's docs and src), context truncated at 65,536 with a 512-token stride, scored over the last six 512-token blocks (65,024-token context, 2,873 tokens), dense baseline 3.9745.
-
-On the hybrid route prefill is decoupled from the window, which now only moves decode speed and sparse quality; with the route off, prefill grows roughly with the block count (4,096 blocks is about 39% of dense). Streamed KV is a separate cost: in the same setting 512 blocks streamed costs 6.8% of prefill and 6.6% of decode, while 4,096 blocks streamed costs 22% of decode (the pool must hold `width × (blocks + 1)` blocks). Streaming only changes where the full KV lives; it does not affect model quality.
+PPL: whether the default dense path without QSA, or the QSA path (whose prefill is still dense attention), teacher-forced PPL is strictly identical (3.91997). Forcing QSA during the prefill phase (`NINFER_QSA_DENSE_PREFILL=0`) raises the tail PPL of the same evaluation by 5.73% (512 blocks) / 2.59% (1,024 blocks) / 1.12% (2,048 blocks) / 0.45% (4,096 blocks).
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 

@@ -244,11 +244,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // one shared 64-position device layer before reading it densely. Keep exactly one device
     // layer instead of sixteen. Neither device pool may shrink below the full history -- the
     // staging layer holds ceil(F / 64) pages at frontier F, and the MTP pool reads its complete
-    // history on every verification (dense, never streamed) -- and neither needs the Main page
-    // capacity, which grafts and extra lanes push above the history: under stream both pools
-    // are pinned to the logical page count.
+    // history on every verification (dense, never streamed).
+    //
+    // Under stream that single device text layer has TWO jobs: it is the shared dense-prefill
+    // staging buffer (one full history = logical_pages), and it is the physical page pool every
+    // lane's text address space reserves its entitlement from. Those reserved pages are
+    // bookkeeping placeholders the sparse branch never reads (the pinned host copy is the
+    // authority), but admission and block publication still need distinct page ids for each live
+    // lane: pinning the pool to logical_pages makes C near-full-history sessions look like C*L
+    // pages against an L-page pool, so a later turn is refused with a Paged KV pool reservation
+    // error even though host RAM already holds all C histories. Give the pool C*L page groups;
+    // the staging copy still addresses only its first L pages through the identity table, the MTP
+    // pool stays at L (+draft window), and every address space keeps its L-page cap.
+    const std::uint32_t stream_text_pages = static_cast<std::uint32_t>(checked_i32(
+        static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages,
+        "QSA streamed text KV page pool exceeds int32"));
     const std::uint32_t text_page_groups =
-        plan.stream_slots != 0 ? logical_pages : physical_pages;
+        plan.stream_slots != 0 ? stream_text_pages : physical_pages;
     const std::uint32_t mtp_page_groups =
         plan.stream_slots != 0
             ? static_cast<std::uint32_t>(

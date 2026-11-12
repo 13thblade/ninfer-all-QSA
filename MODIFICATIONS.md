@@ -356,3 +356,18 @@ credited in `CONTRIBUTORS.md` and the git history.
 
 - `tools/convert/convert_qsa27b.py`
 - `tools/convert/qsa_gguf.py`
+
+## 2026-11-13: QSA streamed text KV page pool (uncommitted)
+
+`src/models/qwen3_5/program/planning/startup.cpp` is modified: under `--kv-resident`
+(QSA streamed KV) the single device text-KV layer is both the shared dense-prefill
+staging buffer and the physical page pool that every lane's text address space reserves
+its entitlement from. `text_page_groups` used to be pinned to `logical_pages` (one
+full history), so with `--max-concurrency C` two near-full-history sessions exhausted
+the placeholder page pool on their second turn (`Paged KV pool cannot resize the page
+reservation`). It is now `C * logical_pages`; the staging copy still addresses only its
+first `logical_pages` pages through the identity table, the MTP pool and each address
+space's page cap are unchanged. Only this `.cpp` file changed, so an incremental build
+is sufficient. Measured results and the A/B control are recorded in
+`F:\ninfer_bench\qsa-stream-reuse-graph-plan.md` (§11) and
+`F:\ninfer_bench\qsa-stream-reuse-graph-execution-20261113.md`.

@@ -48,6 +48,12 @@ def main() -> int:
     p.add_argument("--out", type=Path, required=True, help="output .ninfer path")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--components", default="text,vision,mtp,dflash2")
+    p.add_argument("--proposal", action="store_true",
+                   help="pack the indexed proposal head (required for --lm-head-draft)")
+    p.add_argument("--proposal-rows", type=int, default=131072,
+                   help="shortlist size of the proposal head (default 131072)")
+    p.add_argument("--ranking", type=Path, default=None,
+                   help="token-frequency ranking fixture (converter default if unset)")
     p.add_argument("--skip-preflight", action="store_true")
     args = p.parse_args()
 
@@ -74,6 +80,10 @@ def main() -> int:
         cmd += ["--source", f"vision={args.vision}"]
     if args.dflash2 is not None:
         cmd += ["--source", f"dflash2={args.dflash2}"]
+    if args.proposal:
+        cmd += ["--proposal", "--proposal-rows", str(args.proposal_rows)]
+        if args.ranking is not None:
+            cmd += ["--ranking", str(args.ranking)]
     print("== convert ==", flush=True)
     return run(cmd)
 
