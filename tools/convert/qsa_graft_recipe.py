@@ -154,10 +154,15 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
     if mtp and not has_mtp(target):
         raise ValueError(f"{target.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
 
-    donor = open_donor(sources)
-    if donor.path.resolve() == target.path.resolve():
-        raise ValueError(f"{donor.path}: the donor must not be the target file")
-    check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
+    # Indexer source: prefer the committed asset; fall back to a donor GGUF (legacy path).
+    if qsa_gguf.has_indexer_asset():
+        indexer_sources = qsa_gguf.sources_from_asset()
+    else:
+        donor = open_donor(sources)
+        if donor.path.resolve() == target.path.resolve():
+            raise ValueError(f"{donor.path}: the donor must not be the target file")
+        check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
+        indexer_sources = qsa_gguf.sources(donor)
 
     # Register the indexer parameters and their artifact config before the stock
     # recipe body runs, exactly as qwen3_8_27b_qsa_gguf does.
@@ -170,10 +175,10 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
     # Text tower, MTP block, vision and DFlash2 come from the target.
     qwen3_8_27b_gguf(model, recipe, sources)
 
-    # ... and the 80 indexer parameters are filled from the donor.  ``sources``
-    # already un-folds the stored 1 + w norms, so the bytes match the official path.
+    # ... and the 80 indexer parameters are filled from the asset or the donor. Both
+    # un-fold the stored 1 + w norms, so the bytes match the official path.
     formats: dict[str, str] = {}
-    for name, source in qsa_gguf.sources(donor).items():
+    for name, source in indexer_sources.items():
         parameter = model.parameters[name]
         recipe.assign(
             name, format=parameter.direct_format, method=cast_direct, source=source

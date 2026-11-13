@@ -26,6 +26,10 @@ The GGUF metadata keys come from the fork's ``gguf-py/gguf/constants.py``:
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -143,6 +147,69 @@ def sources(gguf: GGUFFile) -> dict[str, LogicalSource]:
     return out
 
 
+# --- optional offline asset of the 80 F32 indexer tensors ------------------------------
+# Route-B graft can read the indexer tensors from a compact asset safetensors built by
+# extract_indexer_tensors.py instead of the full ~16 GB donor GGUF. The env var overrides:
+#   unset            -> use the committed default asset if present, else require a donor
+#   <path>           -> use that asset file
+#   off|none|0       -> disable the asset, require a donor GGUF exactly as before
+# The asset stores donor F32 values verbatim (norms still carry 1 + w), and sources_from_asset
+# below applies the SAME -1.0 un-fold and BF16 cast as sources(), so an asset graft is
+# bit-identical to a donor-GGUF graft.
+_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+INDEXER_ASSET_NAME = "indexer_tensors_fp32.safetensors"
+INDEXER_ASSET_ENV = "NINFER_QSA_INDEXER_ASSET"
+
+
+def indexer_asset_path() -> Path | None:
+    raw = os.environ.get(INDEXER_ASSET_ENV)
+    if raw is not None and raw.strip().lower() in ("off", "none", "0"):
+        return None
+    if raw:
+        path = Path(raw)
+        if not path.is_file():
+            raise ValueError(f"{INDEXER_ASSET_ENV}: {path} is not an indexer asset file")
+        return path
+    default = _ASSETS_DIR / INDEXER_ASSET_NAME
+    return default if default.is_file() else None
+
+
+def has_indexer_asset() -> bool:
+    return indexer_asset_path() is not None
+
+
+def sources_from_asset(path: Path | None = None) -> dict[str, LogicalSource]:
+    """Read the 80 indexer tensors from the asset, converting exactly as sources() does."""
+    path = path or indexer_asset_path()
+    if path is None:
+        raise ValueError("no indexer asset; set NINFER_QSA_INDEXER_ASSET or pass a donor GGUF")
+
+    from safetensors import safe_open
+
+    out: dict[str, LogicalSource] = {}
+    with safe_open(str(path), framework="pt") as handle:
+        keys = set(handle.keys())
+        expected = {gguf_tensor(layer, role) for layer in qsa_layers() for role in ROLES}
+        missing = sorted(expected - keys)
+        if missing:
+            raise ValueError(
+                f"indexer asset {path} is missing {len(missing)} tensors ({missing[:3]}...)")
+        for layer in qsa_layers():
+            for role in ROLES:
+                name = gguf_tensor(layer, role)
+                words = handle.get_tensor(name).detach().to("cpu").numpy().astype(np.float32)
+                if tuple(words.shape) != tuple(_SHAPES[role]):
+                    raise ValueError(
+                        f"{name}: asset shape {tuple(words.shape)} != expected {_SHAPES[role]}")
+                if role in _NORM_ROLES:
+                    words = words - 1.0
+                out[parameter_name(layer, role)] = array_source(
+                    torch.from_numpy(np.ascontiguousarray(words)).to(torch.bfloat16),
+                    f"{name}[indexer-asset]",
+                )
+    return out
+
+
 def register_parameters(model: Model) -> None:
     """Add the QSA logical parameters to a model built from the dense 27B geometry.
 
@@ -202,4 +269,9 @@ __all__ = [
     "qsa_layers",
     "register_parameters",
     "sources",
+    "sources_from_asset",
+    "indexer_asset_path",
+    "has_indexer_asset",
+    "INDEXER_ASSET_ENV",
+    "INDEXER_ASSET_NAME",
 ]
