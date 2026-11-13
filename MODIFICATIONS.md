@@ -75,9 +75,11 @@ offered under the same Apache-2.0 license.
 | `fe1a9fa9` | 2026-11-11 | docs: spell out the three QSA flags |
 | `ea0c0d33` | 2026-11-11 | docs: put concurrent QSA serving first on the planned work |
 | `3c146938` | 2026-11-11 | docs: state the perplexity metric honestly and split it by depth |
+| `2c058b1a` | 2026-11-12 | engine: pin the QSA stream device pools to the logical page count |
 | `d655dae4` | 2026-11-12 | engine: size the streamed KV pool from one selection, not the verification width |
 | `779a875e` | 2026-11-12 | engine: run QSA prefills as dense attention over the complete KV |
 | `939c81f8` | 2026-11-12 | engine: reuse a QSA conversation's own continuation as a live KV prefix |
+| `c2f68aab` | 2026-11-13 | docs + engine: document and restore the disjoint streamed-KV pool floor |
 
 The early web-edit README commits on `origin/master` (`5afa9ae7` through
 `087692d9`) are folded into `0dd7caa3` and are not listed individually; they
@@ -357,7 +359,7 @@ credited in `CONTRIBUTORS.md` and the git history.
 - `tools/convert/convert_qsa27b.py`
 - `tools/convert/qsa_gguf.py`
 
-## 2026-11-13: QSA streamed text KV page pool (uncommitted)
+## 2026-11-13: QSA streamed text KV page pool (committed as `2c058b1a`)
 
 `src/models/qwen3_5/program/planning/startup.cpp` is modified: under `--kv-resident`
 (QSA streamed KV) the single device text-KV layer is both the shared dense-prefill
@@ -371,3 +373,26 @@ space's page cap are unchanged. Only this `.cpp` file changed, so an incremental
 is sufficient. Measured results and the A/B control are recorded in
 `F:\ninfer_bench\qsa-stream-reuse-graph-plan.md` (§11) and
 `F:\ninfer_bench\qsa-stream-reuse-graph-execution-20261113.md`.
+
+## 2026-11-13: restore the disjoint-selection streamed-KV pool floor (revert of `d655dae4`)
+
+`src/models/qwen3_5/program/planning/startup.cpp` and `src/ops/kv_stream/kv_stream.cu`
+restore the streamed-KV pool's automatic floor to the pre-`d655dae4` disjoint worst
+case. The floor is now `max((kv_resident_positions + kKvStreamPageTokens - 1) /
+kKvStreamPageTokens, kv_stream_minimum_slots(width, budget + 1))` blocks, where
+`width = widest_verify_window(*impl) + 1` (the columns a verify reads =
+`max(MTP draft window, ngram window) + 1`) and `budget` is `--qsa-top-blocks` (default
+512). A verify's columns may pick disjoint indexer selections, so the pool must hold
+`width × (budget + 1)` blocks — each column its own `(budget + 1)` blocks (its selection
+plus the incomplete block it writes). Sizing the floor to that count guarantees a verify
+never exceeds the pool and never raises the `kv_stream` overflow flag; the cost is a
+larger pool, so when `worst_case × 4` tokens is not below the context, streaming is
+disabled and the whole history stays resident. The start-up warning that previously
+advised raising `--kv-resident` on overflow is removed (the floor now covers the worst
+case by construction); an explicit larger `--kv-resident` is still honoured. The
+`kv_stream.cu` comment that claimed the engine floor assumed overlapping selections is
+corrected. `README.md` documents the floor as `(attention-window blocks + 1) ×
+verification width × 4` tokens and fixes the `--spec` example to name its backend
+(`--spec mtp`). Verified on a 24 GiB RTX 3090 Ti: the 2048-block / 16,384-resident arm
+runs a full 512-token decode with no overflow, with or without ngram drafting (ngram off
+needs `--kv-headroom-mib 0` to clear the card's ~0.23 MiB marginal reservation noise).

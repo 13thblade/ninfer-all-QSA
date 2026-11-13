@@ -23,15 +23,16 @@
 | `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
-`--kv-resident` 的自动下限是 `块数 + 向上取整(验证宽度 / 4)` 个块：验证列是连续位置，选块高度重合，开启 MTP 只增加每步从 host 池提取的流量，不增加需常驻的不同块数。显式给更大的值仍会生效，建议设置较高的 --kv-resident 以免过大的PCIe流量波动。典型用法：
+`--kv-resident` 的自动下限是 `(注意力窗口块数 + 1) × 验证宽度 × 4` 个 token（即 `验证宽度 × (注意力窗口块数 + 1)` 个块）。「验证宽度」= 一次 verify 的列数 = `max(MTP draft window, ngram window) + 1`（如 MTP draft-tokens 3、ngram 15 → 16），「注意力窗口块数」即 `--qsa-top-blocks`（默认 512，每块 4 token）。一次 verify 的各列可能选中互不重叠的 indexer 块，故池须容纳最坏不重叠情形：每一列各持独立的 `(注意力窗口块数 + 1)` 块（其选区 + 自身写入的不完整块）。显式给更大的 `--kv-resident` 仍生效；当此下限 ×4 token 不小于上下文时流式关闭、整段历史全驻留。典型用法：
 
 ```bash
 # 启用QSA + 2048 token 注意力窗口 + KV 全驻留
 ninfer-serve model.ninfer --qwen38-27b-qsa
 
-# 4 倍注意力窗口（8,192 token），并把 KV 的 16,384 个位置留在显存、其余流式
+# 2 倍注意力窗口（4,096 token），开启 MTP + ngram 草稿，并把 KV 的 65,600 个位置留在显存、其余流式传输
 ninfer-serve model.ninfer --max-context 262144 \
-  --qwen38-27b-qsa --qsa-top-blocks 2048 --kv-resident 16384
+  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 65600 \
+  --spec mtp --draft-tokens 3 --ngram-draft-tokens 15
 ```
 
 ## 实测
@@ -74,15 +75,16 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 
-The `--kv-resident` pool's automatic floor is `blocks + ceil(verification width / 4)` blocks: verification columns are consecutive positions whose selections overlap, so MTP raises the H2D traffic of a resolve rather than the distinct blocks that must stay resident. An explicit larger value still takes effect; a higher `--kv-resident` is advisable to avoid large swings in PCIe traffic. Typical use:
+The `--kv-resident` pool's automatic floor is `(attention-window blocks + 1) × verification width × 4` tokens (equivalently, `verification width × (attention-window blocks + 1)` blocks). Verification width is the number of columns a verify reads = `max(MTP draft window, ngram window) + 1` (e.g. MTP draft-tokens 3 with ngram 15 gives 16); attention-window blocks is `--qsa-top-blocks` (default 512, four tokens each). A verify's columns may pick disjoint indexer selections, so the pool must hold the disjoint worst case: each of the `verification width` columns keeps its own `(attention-window blocks + 1)` blocks (its selection plus the incomplete block it writes). An explicit larger `--kv-resident` still takes effect; when this floor times four tokens is not below the context, streaming is disabled and the whole history stays resident. Typical use:
 
 ```bash
 # QSA on, a 2048-token attention window, every layer's KV resident
 ninfer-serve model.ninfer --qwen38-27b-qsa
 
-# four times the attention window (8,192 tokens), keeping 16,384 KV positions on the device and streaming the rest
+# twice the attention window (4,096 tokens), MTP and ngram drafting on, keeping 65,600 KV positions on the device and streaming the rest
 ninfer-serve model.ninfer --max-context 262144 \
-  --qwen38-27b-qsa --qsa-top-blocks 2048 --kv-resident 16384
+  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 65600 \
+  --spec mtp --draft-tokens 3 --ngram-draft-tokens 15
 ```
 
 ## Measurements
