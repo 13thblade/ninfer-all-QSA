@@ -4,11 +4,7 @@
 
 本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，QSA注意力窗口筛选反而带来额外开销，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
 
-模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
-
-模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
-
-支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。使用本仓库中的转换脚本将GGUF格式的模型转换为ninfer格式。
+支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。注：引擎内核对 GDN A/B controls 张量仅支持 BF16 精度，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失，因此本仓库的格式转换器从Qwen官方原生精度中剪裁了对应的 BF16 张量并进行嫁接，张量文件见 release。
 
 后续计划：
 1. 提供Dflash2和Dspine草稿的支持。
@@ -51,13 +47,11 @@ PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（
 
 ## 格式转换脚本
 
-把 GGUF 转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。相对上游转换脚本，本 fork 的差异：
+相对上游转换脚本，本 fork 的差异：
 
 1. **QSA 索引器嫁接**（`convert_qsa27b.py` + `qsa_graft_recipe.py`）：在同一次转换里，把 stock 27B GGUF 的 866 个张量按其原始 ggml 块 byte-for-byte 导入，再从 QSA donor GGUF 追加 80 个 F32 `blk.N.indexer.*` 张量，全程不落中间的 grafted GGUF。上游没有这条嫁接路径。
 2. **GDN A/B 控制原生 BF16 无损嫁接**（`gguf_blocks.py`，配合新增的 `extract_gdn_controls.py` 与资产 `tools/convert/assets/gdn_controls_fp8_bf16.safetensors`）：上游的 `gdn_control_source` 会把量化发布里的 `ssm_alpha/ssm_beta` 一律「反量化 → 舍入到 BF16」（一次有损还原）；本 fork 默认改从官方 `Qwen3.8-27B-FP8` 的原生 BF16 `in_proj_a/in_proj_b`（本就是 grouped 头序）无损直存进 `a_projection/b_projection`，且**绝不再 `untile`**（否则头序错位）。由环境变量 `NINFER_GDN_CONTROLS_FP8` 控制：默认读工作树资产；可覆盖为一个 FP8 目录；设为 `off` 则完全回退上游原行为（零回归）；资产缺失时自动回退。附带一次性头序自检，源与发布不匹配即报错。
 3. 其余转换能力（ternary、vision/mmproj、DFlash2、GGUF native 块导入等）继承上游。
-
-> 该 45 MB 资产文件按本仓库 `.gitignore` 约定（`*.safetensors`，权重类一律不入库）**不纳入 git**，改以 **GitHub Release 附件**分发（下载后用 `gdn_controls_fp8_bf16.manifest.json` 里的 `asset_sha256` 校验），或在本地运行 `python tools/convert/extract_gdn_controls.py <Qwen3.8-27B-FP8 目录>` 自行重建；把下载/重建的 `gdn_controls_fp8_bf16.safetensors` 放到 `tools/convert/assets/` 即可被默认命中。三者都不可用时，provider 自动回退上游 dequant 行为（零回归）。
 
 ```bash
 # 常规 QSA 嫁接转换（默认走 GDN 原生 BF16 资产）
@@ -72,14 +66,13 @@ python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B 目录> \
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
+Qwen3.8-27B-QSA原模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+
 # English
 
 This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints. Prefill is usually compute-bound, so even dense attention can be computed over a streamed KV cache, whereas QSA attention window filtering introduces additional overhead. Upstream's wide-T QSA kernel is not yet optimised and a wider attention window slows prefill sharply, so this fork runs dense attention during prefill for the best quality and speed, and switches to QSA sparse attention only for decode, with an adjustable window.
 
-- Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
-- Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
-
-It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts. Use the conversion script in this repository to convert the GGUF format model to the ninfer format.
+It supports the ViT and MTP of Qwen3.8-27B, and YaRN for contexts up to 1M. The script that grafts QSA attention onto any GGUF Qwen3.8-27B and converts it to the ninfer format lives in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point. Note: the engine's kernels accept only BF16 for the GDN A/B control tensors; upstream's converter dequantizes lower-precision models to BF16, which for some quantizations (Q4_K, Q8, …) both costs extra space and loses accuracy. This fork's converter instead cuts the corresponding BF16 tensors out of Qwen's official native-precision model and grafts them in; the tensor file is provided in the release.
 
 Planned work:
 1. Add support for DFlash2 and DSpine drafting.
@@ -122,13 +115,11 @@ PPL: whether the default dense path without QSA, or the QSA path (whose prefill 
 
 ## Conversion scripts
 
-The scripts that convert a GGUF into the ninfer format live in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point. Differences from the upstream conversion scripts:
+Differences from the upstream conversion scripts:
 
 1. **QSA indexer graft** (`convert_qsa27b.py` + `qsa_graft_recipe.py`): in a single pass it imports the 866 tensors of a stock 27B GGUF byte-for-byte in their original ggml block formats, then appends the 80 F32 `blk.N.indexer.*` tensors from a QSA donor GGUF, without ever writing an intermediate grafted GGUF. Upstream has no such graft path.
 2. **GDN A/B controls grafted losslessly from native BF16** (`gguf_blocks.py`, with the new `extract_gdn_controls.py` and the asset `tools/convert/assets/gdn_controls_fp8_bf16.safetensors`): upstream's `gdn_control_source` dequantizes the `ssm_alpha/ssm_beta` of a quantized release and rounds to BF16 (one lossy round-trip); this fork instead reads the official `Qwen3.8-27B-FP8` native BF16 `in_proj_a/in_proj_b` (already in grouped head order) straight into `a_projection/b_projection`, and never re-`untile`s them (which would misalign the heads). The environment variable `NINFER_GDN_CONTROLS_FP8` controls it: by default it reads the committed asset; it may be set to a full FP8 directory; setting it to `off` restores the upstream dequant behavior exactly (zero regression); and if the asset is missing it falls back to the original path. A one-time head-order self-check raises if the source and the release are not the same model.
 3. All other conversion capabilities (ternary, vision/mmproj, DFlash2, GGUF native block import, etc.) are inherited from upstream.
-
-> This 45 MB asset file is **not tracked by git** per the repository's `.gitignore` (`*.safetensors`, i.e. weight-class files are never committed). It is distributed as a **GitHub Release attachment** (verify it against the `asset_sha256` recorded in `gdn_controls_fp8_bf16.manifest.json` after downloading), or you rebuild it locally with `python tools/convert/extract_gdn_controls.py <Qwen3.8-27B-FP8 dir>`; drop the resulting `gdn_controls_fp8_bf16.safetensors` into `tools/convert/assets/` and it is used by default. When none of these is available, the provider falls back to the upstream dequant behavior exactly (zero regression).
 
 ```bash
 # Normal QSA-graft conversion (uses the native BF16 GDN asset by default)
@@ -142,6 +133,8 @@ python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B dir> \
 ```
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
+
+The original model author's llama.cpp fork for Qwen3.8-27B-QSA: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
 # This is the upstream original documentation
 
