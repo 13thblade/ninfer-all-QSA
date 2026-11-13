@@ -10,6 +10,7 @@ from tools.convert import gguf_blocks
 from tools.convert.sources.gguf import GGUFFile, write_gguf
 
 TYPE_Q8_0 = 8
+TYPE_Q4_K = 12
 
 # ggml-common.h: block values and bytes of every type the importer keeps.
 GGML_BLOCKS = {
@@ -95,6 +96,103 @@ def test_output_projection_columns_read_the_grouped_value_heads():
     for tiled_head in (0, 1, 15, 16, 31, 47):
         key_head, repeat = tiled_head % 16, tiled_head // 16
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
+
+
+def _q4_k_file(tmp_path, rows: int, columns: int, seed: int, name: str = "w"):
+    """Q4_K blocks: eight six-bit (scale, min) pairs and 256 nibbles per super-block."""
+
+    generator = np.random.default_rng(seed)
+    values = (generator.standard_normal((rows, columns)) * 0.04).astype(np.float32)
+    blocks = np.zeros((rows, columns // 256, 144), dtype=np.uint8)
+    for row in range(rows):
+        for column in range(blocks.shape[1]):
+            blocks[row, column] = _q4_k_block(values[row, column * 256:(column + 1) * 256])
+    path = tmp_path / "blocks.gguf"
+    write_gguf(
+        path,
+        {"general.architecture": "qwen35"},
+        [(name, (rows, columns), TYPE_Q4_K, blocks.tobytes())],
+    )
+    return path, blocks
+
+
+def _q4_k_block(values: np.ndarray) -> np.ndarray:
+    """Encode 256 values as one Q4_K block: d, dmin, 12 scale bytes, 128 nibble bytes."""
+
+    raw = np.zeros(144, dtype=np.uint8)
+    d = np.float16(0.02)
+    dmin = np.float16(0.001)
+    raw[0:2] = np.array([d], dtype="<f2").view(np.uint8)
+    raw[2:4] = np.array([dmin], dtype="<f2").view(np.uint8)
+    scales = np.array([1 + j % 5 for j in range(8)], dtype=np.uint8)
+    minimums = np.array([(j * 3) % 8 for j in range(8)], dtype=np.uint8)
+    q = np.zeros(12, dtype=np.uint8)
+    for j in range(4):
+        q[j] |= scales[j] & 63
+        q[j + 4] |= minimums[j] & 63
+    for j in range(4, 8):
+        q[j + 4] |= (scales[j] & 0x0F) | ((minimums[j] & 0x0F) << 4)
+        q[j - 4] |= ((scales[j] >> 4) & 0x03) << 6
+        q[j] |= ((minimums[j] >> 4) & 0x03) << 6
+    raw[4:16] = q
+    codes = np.clip(
+        np.rint((values.reshape(8, 32) + np.float32(dmin) * minimums[:, None])
+                / (np.float32(d) * scales[:, None])),
+        0,
+        15,
+    ).astype(np.uint8)
+    qs = np.zeros(128, dtype=np.uint8)
+    for j in range(8):
+        base = (j // 2) * 32
+        qs[base:base + 32] |= codes[j] if j % 2 == 0 else codes[j] << 4
+    raw[16:144] = qs
+    return raw
+
+
+def _q4_k_scale_min(j: int, q: np.ndarray) -> tuple[int, int]:
+    """ggml's get_scale_min_k4: four 6-bit scales, then four packed as 4+2 bits."""
+
+    if j < 4:
+        return int(q[j] & 63), int(q[j + 4] & 63)
+    return (
+        int((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4)),
+        int((q[j + 4] >> 4) | ((q[j] >> 6) << 4)),
+    )
+
+
+def _q4_k_values(blocks: np.ndarray) -> np.ndarray:
+    """Independent ggml Q4_K dequantization: d * scale * nibble - dmin * min."""
+
+    rows, columns, _ = blocks.shape
+    values = np.empty((rows, columns * 256), dtype=np.float32)
+    for row in range(rows):
+        for column in range(columns):
+            raw = np.ascontiguousarray(blocks[row, column])
+            d = float(raw[0:2].view("<f2")[0])
+            dmin = float(raw[2:4].view("<f2")[0])
+            q = raw[4:16]
+            qs = raw[16:144]
+            sub = values[row, column * 256:(column + 1) * 256].reshape(8, 32)
+            for j in range(8):
+                scale, minimum = _q4_k_scale_min(j, q)
+                nibbles = qs[(j // 2) * 32:(j // 2) * 32 + 32]
+                codes = (nibbles & 0x0F) if j % 2 == 0 else (nibbles >> 4)
+                sub[j] = d * scale * codes.astype(np.float32) - dmin * minimum
+    return values
+
+
+def test_q4_k_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
+    # Unsloth's UD-Q4_K_XL stores ssm_alpha/ssm_beta as Q4_K blocks, which must pass the type
+    # gate (GDN_CONTROL_TYPES) instead of being refused by validate.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    path, blocks = _q4_k_file(tmp_path, heads, 256, 9, "blk.0.ssm_beta.weight")
+    with GGUFFile(path) as gguf:
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_beta.weight").rows(0, heads)
+    tiled = _q4_k_values(blocks)
+    # Grouped head k * 3 + r is the exporter's tiled head r * 16 + k.
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))
 
 
 def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
@@ -292,22 +390,31 @@ def test_ssm_out_values_and_imatrix_importance_name_the_same_grouped_column(tmp_
     assert np.array_equal(importance.astype(np.int64), column)
 
 
-def _header(head_type: int):
+def _header(head_type: int, control_type: int = TYPE_Q8_0):
     """A dense Qwen3.8-27B GGUF's header and tensor table, stored blocks as Q8_0; no data."""
 
     from types import SimpleNamespace
 
     from tools.convert.sources.gguf import TYPE_IDS, TensorInfo
 
+    controls = ("ssm_alpha.weight", "ssm_beta.weight")
     tensors, offset = {}, 0
     for name, (shape, kind) in gguf_blocks.expected_tensors(False).items():
         kinds = (kind,) if isinstance(kind, str) else kind
         type_id = (head_type if name == "output.weight"
+                   else control_type if name.endswith(controls)
                    else TYPE_Q8_0 if "blocks" in kinds else TYPE_IDS[kinds[0]])
         tensors[name] = TensorInfo(name, shape, type_id, offset)
         offset += tensors[name].nbytes
     kv = gguf_blocks.EXPECTED_HEADER | {"qwen35.block_count": gguf_blocks.LAYERS}
     return SimpleNamespace(path="header.gguf", kv=kv, tensors=tensors, data_bytes_available=offset)
+
+
+def test_the_gdn_controls_may_be_bf16_or_any_stored_block_type():
+    from tools.convert.sources.gguf import TYPE_BF16
+
+    gguf_blocks.validate(_header(TYPE_Q8_0, control_type=TYPE_BF16))
+    gguf_blocks.validate(_header(TYPE_Q8_0, control_type=TYPE_Q4_K))
 
 
 def test_the_output_head_may_be_stored_blocks_or_bf16_words():

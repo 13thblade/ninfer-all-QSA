@@ -14,8 +14,9 @@ of the grouped activation. Its values, like every source's, are in the grouped o
 that re-quantises ``ssm_out`` writes grouped columns and no gather.
 
 The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
-them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
-rounded to BF16: the one place a stored value changes.
+them as BF16 words, or as stored blocks -- Q8_0 in Underdog-Saluki and similar releases, Q4_K in
+Unsloth's UD-Q4_K_XL -- whose dequantized values are rounded to BF16: the one place a stored value
+changes.
 
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
@@ -63,8 +64,9 @@ from .ternary import (
 )
 
 MTP_BLOCK = LAYERS
-# The storage the GDN controls may have (gdn_control_source).
-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+# The storage the GDN controls may have (gdn_control_source): BF16 words, or any stored
+# block type (Q8_0 in Underdog-Saluki-style exports, Q4_K in Unsloth's UD-Q4_K_XL).
+GDN_CONTROL_TYPES = ("BF16", "blocks")
 # The storage the output head may have: stored blocks, or BF16 words (bf16_source).
 HEAD_TYPES = ("blocks", "BF16")
 
@@ -329,9 +331,9 @@ def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, Q8_0 values rounded to BF16."""
+    as stored, encoded values (Q8_0, Q4_K, ...) rounded to BF16."""
 
-    if gguf.info(tensor).type_id == GGML_Q8_0:
+    if gguf.info(tensor).type_id != TYPE_BF16:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
         return array_source(
             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
