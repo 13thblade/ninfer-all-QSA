@@ -37,19 +37,17 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-proposal.ninfer`、int8 KV、**Hybrid 前缀缓存**（`--use-alt-prefix-caching`）、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 16384`、**MTP + ngram 草稿开启**、贪心解码；`--wddm-evictable-budget` 开启，`--prefill-chunk` 保持默认 1024。每条请求 32,768 token + 512 token 输出。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-proposal.ninfer`、int8 KV、**Hybrid 前缀缓存**（`--use-alt-prefix-caching`）、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 12288`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--prefill-chunk` 保持默认 1024，`--kv-headroom-mib 0` 用于 24 GiB 卡确定性启动。每条请求 32,768 token + 512 token 输出。
 
 | 并发 | 聚合 prefill (tok/s) | 聚合 decode (tok/s) | TTFT（最小–最大） | 每请求 prompt / 输出 |
 | --- | ---: | ---: | ---: | --- |
-| 单发（1 lane） | 1,766 | 123.5 | 18.55 s | 32,768 / 512 |
-| 双并发（2 lane） | 1,752 | 222.4 | 18.79–42.01 s | 各 32,768 / 512 |
-| 四并发（4 lane）\* | 1,747 | 369.3 | 18.78–91.68 s | 各 32,768 / 512 |
+| 单发（1 lane） | 1,744 | 103.8 | 18.81 s | 32,768 / 512 |
+| 双并发（2 lane） | 1,743 | 187.6 | 18.85–43.06 s | 各 32,768 / 512 |
+| 四并发（4 lane） | 1,747 | 369.3 | 18.78–91.68 s | 各 32,768 / 512 |
 
 聚合 prefill = 各请求 prompt token 之和 ÷ 各请求 prefill 耗时之和（共享 dense-prefill staging 使 prefill 串行）；聚合 decode = 各请求输出 token 之和 ÷ 最长 decode 耗时（decode 重叠）。TTFT 阶梯来自共享 staging 的串行化。
 
-\* **四并发需降级**（24 GiB 显存限制）：`--ngram-draft-tokens 0`、`--kv-resident 12288`、`--kv-headroom-mib 0`；MTP/proposal、Hybrid、`--wddm-evictable-budget`、`--prefill-chunk 1024` 均不变。
-
-PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（NINFER_QSA_DENSE_PREFILL=0）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）；
+PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（NINFER_QSA_DENSE_PREFILL=0）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -89,17 +87,15 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-proposal.ninfer`, int8 KV, **hybrid prefix cache** (`--use-alt-prefix-caching`), `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 16384`, **MTP and ngram drafting on**, greedy decode; `--wddm-evictable-budget` on, `--prefill-chunk` left at its 1024 default. Each request is 32,768 tokens with 512 output tokens.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-proposal.ninfer`, int8 KV, **hybrid prefix cache** (`--use-alt-prefix-caching`), `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 12288`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, `--prefill-chunk` left at its 1024 default, and `--kv-headroom-mib 0` to boot the 24 GiB card deterministically. Each request is 32,768 tokens with 512 output tokens.
 
 | Concurrency | aggregate prefill (tok/s) | aggregate decode (tok/s) | TTFT (min–max) | prompt / output per request |
 | --- | ---: | ---: | ---: | --- |
-| single (1 lane) | 1,766 | 123.5 | 18.55 s | 32,768 / 512 |
-| 2 concurrent (2 lanes) | 1,752 | 222.4 | 18.79–42.01 s | 32,768 / 512 each |
-| 4 concurrent (4 lanes)\* | 1,747 | 369.3 | 18.78–91.68 s | 32,768 / 512 each |
+| single (1 lane) | 1,744 | 103.8 | 18.81 s | 32,768 / 512 |
+| 2 concurrent (2 lanes) | 1,743 | 187.6 | 18.85–43.06 s | 32,768 / 512 each |
+| 4 concurrent (4 lanes) | 1,747 | 369.3 | 18.78–91.68 s | 32,768 / 512 each |
 
 Aggregate prefill = sum of prompt tokens / sum of prefill seconds (the shared dense-prefill staging serializes prefill); aggregate decode = sum of output tokens / the longest decode interval (decodes overlap). The TTFT staircase comes from the serialization of that shared staging.
-
-\* **Four lanes need a fallback** (24 GiB memory limit): `--ngram-draft-tokens 0`, `--kv-resident 12288`, `--kv-headroom-mib 0`; MTP/proposal, hybrid caching, `--wddm-evictable-budget` and `--prefill-chunk 1024` are unchanged.
 
 PPL: whether the default dense path without QSA, or the QSA path (whose prefill is still dense attention), teacher-forced PPL is strictly identical (3.91997). Forcing QSA during the prefill phase (`NINFER_QSA_DENSE_PREFILL=0`) raises the tail PPL of the same evaluation by 5.73% (512 blocks) / 2.59% (1,024 blocks) / 1.12% (2,048 blocks) / 0.45% (4,096 blocks).
 
