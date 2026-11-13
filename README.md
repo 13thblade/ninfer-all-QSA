@@ -8,7 +8,7 @@
 
 模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。
+支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。使用本仓库中的转换脚本将GGUF格式的模型转换为ninfer格式。
 
 后续计划：
 1. 提供Dflash2和Dspine草稿的支持。
@@ -37,7 +37,7 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-proposal.ninfer`、int8 KV、**Hybrid 前缀缓存**（`--use-alt-prefix-caching`）、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 12288`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--prefill-chunk` 保持默认 1024，`--kv-headroom-mib 0` 用于 24 GiB 卡确定性启动。每条请求 32,768 token + 512 token 输出。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.ninfer`、int8 KV、**Hybrid 前缀缓存**（`--use-alt-prefix-caching`）、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 12288`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--prefill-chunk` 保持默认 1024，`--kv-headroom-mib 0` 用于 24 GiB 卡确定性启动。每条请求 32,768 token + 512 token 输出。
 
 | 并发 | 聚合 prefill (tok/s) | 聚合 decode (tok/s) | TTFT（最小–最大） | 每请求 prompt / 输出 |
 | --- | ---: | ---: | ---: | --- |
@@ -58,7 +58,7 @@ This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This mo
 - Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 - Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts.
+It supports the ViT and MTP of Qwen3.8-27B, and YaRN for longer contexts. Use the conversion script in this repository to convert the GGUF format model to the ninfer format.
 
 Planned work:
 1. Add support for DFlash2 and DSpine drafting.
@@ -87,7 +87,7 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-proposal.ninfer`, int8 KV, **hybrid prefix cache** (`--use-alt-prefix-caching`), `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 12288`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, `--prefill-chunk` left at its 1024 default, and `--kv-headroom-mib 0` to boot the 24 GiB card deterministically. Each request is 32,768 tokens with 512 output tokens.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.ninfer`, int8 KV, **hybrid prefix cache** (`--use-alt-prefix-caching`), `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 12288`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, `--prefill-chunk` left at its 1024 default, and `--kv-headroom-mib 0` to boot the 24 GiB card deterministically. Each request is 32,768 tokens with 512 output tokens.
 
 | Concurrency | aggregate prefill (tok/s) | aggregate decode (tok/s) | TTFT (min–max) | prompt / output per request |
 | --- | ---: | ---: | ---: | --- |
