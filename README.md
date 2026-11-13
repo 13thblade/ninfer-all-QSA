@@ -2,7 +2,7 @@
 
 # 中文
 
-本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，QSA注意力窗口筛选反而带来额外开销，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
 
 模型卡：https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 
@@ -53,7 +53,7 @@ PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（
 
 # English
 
-This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints. Prefill is usually compute-bound, so even dense attention can be computed over a streamed KV cache. Upstream's wide-T QSA kernel is not yet optimised and a wider attention window slows prefill sharply, so this fork runs dense attention during prefill for the best quality and speed, and switches to QSA sparse attention only for decode, with an adjustable window.
+This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints. Prefill is usually compute-bound, so even dense attention can be computed over a streamed KV cache, whereas QSA attention window filtering introduces additional overhead. Upstream's wide-T QSA kernel is not yet optimised and a wider attention window slows prefill sharply, so this fork runs dense attention during prefill for the best quality and speed, and switches to QSA sparse attention only for decode, with an adjustable window.
 
 - Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
 - Model author's llama.cpp fork: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
