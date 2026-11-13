@@ -84,13 +84,13 @@ __device__ __forceinline__ void scalar_positions(int position, int* out) {
 }
 
 __device__ __forceinline__ void call_positions(const int* __restrict__ rope_positions,
-                                                std::int32_t pos_tokens, int t,
+                                                std::int32_t axis_stride, int t,
                                                 int position, int* out) {
     if (rope_positions == nullptr) {
         scalar_positions(position, out);
     } else {
         for (int axis = 0; axis < 3; ++axis) {
-            out[axis] = rope_positions[static_cast<std::int64_t>(axis) * pos_tokens + t];
+            out[axis] = rope_positions[static_cast<std::int64_t>(axis) * axis_stride + t];
         }
     }
 }
@@ -183,7 +183,7 @@ __global__ void __launch_bounds__(kHeadDim)
                     const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
                     const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
                     const int* __restrict__ rope_positions, int* __restrict__ tail_axes,
-                    std::int32_t pos_tokens, const QsaRope rope) {
+                    std::int32_t pos_tokens, std::int32_t axis_stride, const QsaRope rope) {
     __shared__ float row[kHeadDim];
     __shared__ float reduce[4];
     const int first_position = *first;
@@ -197,7 +197,7 @@ __global__ void __launch_bounds__(kHeadDim)
     if (rope_positions != nullptr && block_first >= first_position &&
         block_first - first_position < pos_tokens) {
         for (int axis = 0; axis < 3; ++axis) {
-            block_pos3[axis] = rope_positions[static_cast<std::int64_t>(axis) * pos_tokens +
+            block_pos3[axis] = rope_positions[static_cast<std::int64_t>(axis) * axis_stride +
                                               (block_first - first_position)];
         }
     } else if (tail_axes != nullptr && block_first < first_position) {
@@ -237,7 +237,7 @@ __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
                                 const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
                                 float* __restrict__ tail,
                                 const int* __restrict__ rope_positions,
-                                int* __restrict__ tail_axes, std::int32_t pos_tokens) {
+                                int* __restrict__ tail_axes, std::int32_t axis_stride) {
     __shared__ float reduce[4];
     const int first_position = *first;
     const int last      = first_position + tokens - 1;
@@ -253,7 +253,7 @@ __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
         // a block that starts inside this incomplete block.
         if (tail_axes != nullptr && d == 0) {
             int pos3[3];
-            call_positions(rope_positions, pos_tokens, position - first_position, position, pos3);
+            call_positions(rope_positions, axis_stride, position - first_position, position, pos3);
             for (int axis = 0; axis < 3; ++axis) {
                 tail_axes[static_cast<std::int64_t>(axis) * (kBlock - 1) +
                           (position % kBlock)] = pos3[axis];
@@ -274,7 +274,7 @@ template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
                      const __nv_bfloat16* query_norm, float eps, float* queries,
-                     const int* __restrict__ rope_positions, std::int32_t pos_tokens,
+                     const int* __restrict__ rope_positions, std::int32_t axis_stride,
                      const QsaRope rope, int top_blocks) {
     __shared__ float row[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
@@ -284,7 +284,7 @@ __global__ void __launch_bounds__(kThreads)
     row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
     __syncthreads();
     int pos3[3];
-    call_positions(rope_positions, pos_tokens, t, position, pos3);
+    call_positions(rope_positions, axis_stride, t, position, pos3);
     norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, pos3, lane, reduce[head], rope);
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
@@ -594,14 +594,14 @@ __global__ void __launch_bounds__(kThreads)
                      const __nv_bfloat16* __restrict__ query_norm, float eps,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
                      int capacity, const int* __restrict__ rope_positions,
-                     std::int32_t pos_tokens, const QsaRope rope, int top_blocks) {
+                     std::int32_t axis_stride, const QsaRope rope, int top_blocks) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int t        = blockIdx.y;
     const int position = *first + t;
     const int blocks   = min((position + 1) / kBlock, capacity);
     int pos3[3];
-    call_positions(rope_positions, pos_tokens, t, position, pos3);
+    call_positions(rope_positions, axis_stride, t, position, pos3);
     const int b0       = blockIdx.x * kScoreBlocks;
     if (blocks <= top_blocks || b0 >= blocks) { return; }
     const int tid = threadIdx.x;
@@ -779,9 +779,14 @@ void require_pooled(const Tensor& pooled) {
 // Unpack the optional 3-axis inputs. A null rope_positions keeps the scalar path:
 // call_positions() then fills all three axes with the cache position.
 struct IndexerPositionArgs {
-    const int* rope        = nullptr;
+    const int* rope = nullptr;
     int* tail_axes         = nullptr;
     std::int32_t pos_tokens = 0;
+    // Element stride between the three axes of `rope`. A contiguous [tokens, 3] plane spaces the
+    // axes by `pos_tokens`; a per-part slice of a longer [T, 3] plane keeps spacing them by T. The
+    // kernels read axis*axis_stride + t, so a slice feeds them zero-copy instead of failing a
+    // contiguity assertion.
+    std::int32_t axis_stride = 0;
 };
 
 IndexerPositionArgs require_positions(const QsaIndexerPositions& positions,
@@ -789,11 +794,19 @@ IndexerPositionArgs require_positions(const QsaIndexerPositions& positions,
     IndexerPositionArgs out{};
     if (positions.rope_positions != nullptr) {
         const Tensor& p = *positions.rope_positions;
-        require(p.dtype == DType::I32 && p.is_contiguous() && p.data != nullptr &&
-                    p.ne[0] == tokens && p.ne[1] == 3 && p.ne[2] == 1 && p.ne[3] == 1,
-                "rope_positions must be contiguous I32 [tokens, 3] axis-major");
+        // Accept a per-part slice of a longer axis-major [T, 3] plane, not only a contiguous
+        // [tokens, 3]. The slice keeps a one-element token stride (so element (t, axis) stays at
+        // rope[axis*axis_stride + t]) but spaces the axes by the full T, which `is_contiguous`
+        // rejects; require that shape and carry the axis stride to the kernels instead.
+        require(p.dtype == DType::I32 && p.data != nullptr &&
+                    p.ne[0] == tokens && p.ne[1] == 3 && p.ne[2] == 1 && p.ne[3] == 1 &&
+                    p.nb[0] == static_cast<std::int64_t>(sizeof(std::int32_t)) &&
+                    p.nb[1] % p.nb[0] == 0 &&
+                    p.nb[1] >= static_cast<std::int64_t>(tokens) * p.nb[0],
+                "rope_positions must be I32 [tokens, 3] with a one-element token stride and a whole-element axis stride");
         out.rope        = static_cast<const int*>(p.data);
         out.pos_tokens  = tokens;
+        out.axis_stride = static_cast<std::int32_t>(p.nb[1] / p.nb[0]);
     }
     if (positions.tail_axes != nullptr) {
         const Tensor& t = *positions.tail_axes;
@@ -897,11 +910,11 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
             static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
             static_cast<const __nv_bfloat16*>(weights.key_norm->data), key_pre_norm, eps,
             static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
-            pos.rope, pos.tail_axes, pos.pos_tokens, rope);
+            pos.rope, pos.tail_axes, pos.pos_tokens, pos.axis_stride, rope);
         CUDA_CHECK(cudaGetLastError());
         qsa_tail_kernel<kPreNorm><<<1, kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projection.data), first, tokens, key_pre_norm, eps,
-            static_cast<float*>(tail.data), pos.rope, pos.tail_axes, pos.pos_tokens);
+            static_cast<float*>(tail.data), pos.rope, pos.tail_axes, pos.axis_stride);
         CUDA_CHECK(cudaGetLastError());
     };
     if (rope.active) {
@@ -968,7 +981,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
-                pos.rope, pos.pos_tokens, rope, top_blocks);
+                pos.rope, pos.axis_stride, rope, top_blocks);
         } else {
             Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
             auto* const query_kernel =
@@ -976,7 +989,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
             query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-                static_cast<float*>(queries.data), pos.rope, pos.pos_tokens, rope, top_blocks);
+                static_cast<float*>(queries.data), pos.rope, pos.axis_stride, rope, top_blocks);
             CUDA_CHECK(cudaGetLastError());
             const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;
             const int tile_blocks = route == ScoreRoute::Tensor ? kTensorBlocks : kTileBlocks;

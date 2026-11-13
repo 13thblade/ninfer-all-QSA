@@ -532,6 +532,130 @@ int equal_axes_equivalence(const Yarn& yarn, bool pre_norm) {
     return failures;
 }
 
+// The engine's multimodal prefill feeds the indexer a NON-CONTIGUOUS slice `rope.slice(0, col, W)`
+// of a longer axis-major [full, 3] plane, so the three axes stay spaced by `full` (not W). A
+// materialized contiguous [W, 3] copy of the same part spaces the axes by W. Both hold the same
+// per-token 3-axis positions; after the stride fix the slice must be read at axis*full + t and give
+// results bit-identical to the copy. This isolates the §12 crash path (a non-contiguous slice) and
+// proves the zero-copy stride read equals a materialized copy, over the pool/query/score/select
+// routes with distinct M-RoPE axes, YaRN/interpolation and the QSA-27B pre-norm key.
+int sliced_matches_materialized(std::uint32_t seed, const std::vector<std::array<int, 3>>* axes,
+                                int part_tokens, const Yarn& yarn, bool pre_norm) {
+    const int col     = 128;
+    const int full    = part_tokens + 256;                 // plane longer than the part: the slice is non-contiguous
+    const int base    = col;                               // first_position of the part
+    const int capacity = full / 4 + 64;                    // pooled blocks beyond top, so selection scores
+    const int top      = 4;
+    Sequence seq{full, std::vector<float>(static_cast<std::size_t>(full) * kProjection),
+                 std::vector<float>(kDim), std::vector<float>(kDim),
+                 pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
+    fill_uniform(seq.projection, seed, -2.0f, 2.0f);
+    fill_uniform(seq.query_norm, seed + 1, -0.5f, 0.5f);
+    fill_uniform(seq.key_norm, seed + 2, -0.5f, 0.5f);
+    round_to_bf16(seq.projection);
+    round_to_bf16(seq.query_norm);
+    round_to_bf16(seq.key_norm);
+    if (pre_norm) {
+        fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
+        round_to_bf16(seq.key_pre_norm);
+    }
+    // full[axis * full + p] = axes[p][axis]; the part's materialized copy mat[axis * W + t] =
+    // axes[col + t][axis] carries the same per-token positions the slice addresses at col + t.
+    std::vector<int> full_host(static_cast<std::size_t>(3) * full);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int p = 0; p < full; ++p) {
+            full_host[static_cast<std::size_t>(axis) * full + p] =
+                (*axes)[static_cast<std::size_t>(p)][axis];
+        }
+    }
+    std::vector<int> mat_host(static_cast<std::size_t>(3) * part_tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int t = 0; t < part_tokens; ++t) {
+            mat_host[static_cast<std::size_t>(axis) * part_tokens + t] =
+                (*axes)[static_cast<std::size_t>(col + t)][axis];
+        }
+    }
+    GuardedDeviceBuffer d_projection(static_cast<std::size_t>(full) * kProjection * 2),
+        d_qn(kDim * 2), d_kn(kDim * 2), d_kpn(kDim * 2), d_first(4),
+        d_full_rope(static_cast<std::size_t>(3) * full * 4),
+        d_mat_rope(static_cast<std::size_t>(3) * part_tokens * 4),
+        a_pooled(static_cast<std::size_t>(capacity) * kDim * 4), b_pooled(a_pooled.bytes()),
+        a_tail(3 * kDim * 4), b_tail(a_tail.bytes()), a_sel(static_cast<std::size_t>(top) * part_tokens * 4),
+        b_sel(a_sel.bytes()), a_cnt(part_tokens * 4), b_cnt(a_cnt.bytes()),
+        a_tail_axes(9 * 4), b_tail_axes(9 * 4);
+    const auto bits = encode_bf16(seq.projection), qn = encode_bf16(seq.query_norm),
+               kn = encode_bf16(seq.key_norm), kpn = encode_bf16(seq.key_pre_norm);
+    d_projection.copy_from_host(bits.data(), d_projection.bytes());
+    d_qn.copy_from_host(qn.data(), qn.size() * sizeof(std::uint16_t));
+    d_kn.copy_from_host(kn.data(), kn.size() * sizeof(std::uint16_t));
+    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), kpn.size() * sizeof(std::uint16_t));
+    d_full_rope.copy_from_host(full_host.data(), full_host.size() * sizeof(int));
+    d_mat_rope.copy_from_host(mat_host.data(), mat_host.size() * sizeof(int));
+    d_first.copy_from_host(&base, 4);
+    for (auto* b : {&a_pooled, &b_pooled, &a_tail, &b_tail, &a_tail_axes, &b_tail_axes}) {
+        CUDA_CHECK(cudaMemset(b->data(), 0, b->bytes()));
+    }
+    // The part's projection columns begin at element col * kProjection of the sequence projection.
+    auto* const part_column = static_cast<std::uint16_t*>(d_projection.data()) +
+                              static_cast<std::size_t>(col) * kProjection;
+    Tensor t_proj(part_column, DType::BF16, {kProjection, part_tokens});
+    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
+        t_kpn(d_kpn.data(), DType::BF16, {kDim});
+    Tensor t_first(d_first.data(), DType::I32, {1});
+    Tensor t_full_rope(d_full_rope.data(), DType::I32, {full, 3});
+    Tensor t_rope_sliced = t_full_rope.slice(0, col, part_tokens); // non-contiguous: axis stride full
+    Tensor t_mat_rope(d_mat_rope.data(), DType::I32, {part_tokens, 3}); // contiguous: axis stride W
+    Tensor t_tail_axes_a(a_tail_axes.data(), DType::I32, {3, 3}),
+        t_tail_axes_b(b_tail_axes.data(), DType::I32, {3, 3});
+    Tensor a_pool(a_pooled.data(), DType::FP32, {kDim, capacity}),
+        b_pool(b_pooled.data(), DType::FP32, {kDim, capacity});
+    Tensor a_t(a_tail.data(), DType::FP32, {kDim, 3}), b_t(b_tail.data(), DType::FP32, {kDim, 3});
+    Tensor a_s(a_sel.data(), DType::I32, {top, part_tokens}),
+        b_s(b_sel.data(), DType::I32, {top, part_tokens});
+    Tensor a_c(a_cnt.data(), DType::I32, {part_tokens}), b_c(b_cnt.data(), DType::I32, {part_tokens});
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
+    // The reference (materialized) uses an axis stride equal to the part width; the sliced uses the
+    // plane's full stride, so the kernels must resolve the same positions for the same tokens.
+    const ops::QsaIndexerPositions pos_mat{&t_mat_rope, &t_tail_axes_a, nullptr};
+    const ops::QsaIndexerPositions pos_sli{&t_rope_sliced, &t_tail_axes_b, nullptr};
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(part_tokens, capacity, top));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), a_pool, a_t, stream, pos_mat);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), a_pool, workspace, a_s, a_c,
+                            stream, pos_mat, top);
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), b_pool, b_t, stream, pos_sli);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), b_pool, workspace, b_s, b_c,
+                            stream, pos_sli, top);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int failures = 0;
+    const auto pa = from_device<float>(a_pooled.data(), static_cast<std::size_t>(capacity) * kDim);
+    const auto pb = from_device<float>(b_pooled.data(), static_cast<std::size_t>(capacity) * kDim);
+    const auto ta = from_device<float>(a_tail.data(), 3 * kDim);
+    const auto tb = from_device<float>(b_tail.data(), 3 * kDim);
+    const auto sa = from_device<int>(a_sel.data(), static_cast<std::size_t>(top) * part_tokens);
+    const auto sb = from_device<int>(b_sel.data(), static_cast<std::size_t>(top) * part_tokens);
+    const auto ca = from_device<int>(a_cnt.data(), part_tokens);
+    const auto cb = from_device<int>(b_cnt.data(), part_tokens);
+    for (const auto& [label, equal] : {std::pair<const char*, bool>{"pooled", pa == pb},
+                                       {"tail", ta == tb}, {"selected", sa == sb},
+                                       {"counts", ca == cb}}) {
+        if (!equal) {
+            std::cerr << "sliced non-contiguous read differs from the materialized copy: " << label
+                      << " (tokens=" << part_tokens << (pre_norm ? " pre-norm" : "")
+                      << (yarn.active() ? " yarn" : "") << ")\n";
+            ++failures;
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (auto* b : {&d_projection, &d_qn, &d_kn, &d_kpn, &d_first, &d_full_rope, &d_mat_rope,
+                    &a_pooled, &b_pooled, &a_tail, &b_tail, &a_sel, &b_sel, &a_cnt, &b_cnt,
+                    &a_tail_axes, &b_tail_axes}) {
+        failures += b->verify_guards("sliced");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -590,6 +714,16 @@ int main() {
     failures += run(8700u, Yarn{2.25, 262144.0}, false, &mrope_axes);
     failures += run(8800u, Yarn{4.0, 262144.0}, true, &mrope_axes);
     failures += run(8900u, Yarn{2.25, 262144.0, 3.0, 2050}, false, &mrope_axes);
+    // The engine's multimodal prefill feeds the indexer a NON-CONTIGUOUS slice of the full
+    // [T,3] axis-major plane (axis stride T, not the part width). Slicing such a plane and
+    // comparing the stride-aware read against a materialized contiguous copy of the same part
+    // proves the zero-copy read equals direction 1's copy, reproducing the §12 crash path. YaRN
+    // and pre-norm variants exercise the pool/query/score/select routes' interpolation branch.
+    failures += sliced_matches_materialized(9000u, &mrope_axes, 700,   Yarn{},                    false);
+    failures += sliced_matches_materialized(9010u, &mrope_axes, 64,    Yarn{},                    false);
+    failures += sliced_matches_materialized(9020u, &mrope_axes, 129,   Yarn{2.25, 262144.0},      true);
+    failures += sliced_matches_materialized(9030u, &mrope_axes, 512,   Yarn{2.25, 262144.0, 3.0, 2050}, false);
+    failures += sliced_matches_materialized(9040u, &mrope_axes, 512,   Yarn{4.0, 262144.0},       true);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " qsa_indexer\n";
     return failures == 0 ? 0 : 1;
 }

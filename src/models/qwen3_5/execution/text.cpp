@@ -1772,6 +1772,10 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         // rotation), while an image/video prompt writes distinct t/h/w. Blocks that
         // start inside the previous call's tail read those axes back.
         ops::QsaIndexerPositions indexer_positions{};
+        // A multimodal part's 3-axis positions, held in the loop-body scope so its address stays
+        // valid for the append/select calls below (declare it outside the inner block; a Tensor
+        // scoped to the block would dangle and the indexer would read reused stack memory).
+        Tensor part_rope;
         if (!verifying) {
             if (rope_positions.ne[1] == 3) {
                 if (rope_positions.ne[0] != T || rope_positions.ne[2] != 1 ||
@@ -1779,7 +1783,7 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                     throw std::logic_error(
                         "QSA sparse attention 3-D RoPE positions do not match the call width");
                 }
-                const Tensor part_rope = rope_positions.slice(0, part.column, W);
+                part_rope = rope_positions.slice(0, part.column, W);
                 indexer_positions.rope_positions = &part_rope;
             }
             indexer_positions.tail_axes = &state.tail_axes;
