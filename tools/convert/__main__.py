@@ -331,7 +331,11 @@ def main(argv=None):
         if args.layers is not None and not flash_next:
             raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.
-        block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
+        # "indexer" is the QSA donor of qsa_graft_recipe.py: its F32 tensors are read
+        # directly, so it must open as a GGUFFile rather than through gguf-py.
+        block_sources = frozenset(
+            ("ternary", "gguf", "ngram", "indexer") + (("mtp",) if flash_next else ())
+        )
         sources = SourceInputs(base, paths, stack, block_sources)
         if args.components is None:
             components = ("text", "ngram") if flash_next else ("text",)
