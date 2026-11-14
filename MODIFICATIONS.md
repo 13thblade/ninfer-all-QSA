@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `40d913db` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 16 files added, 74 modified; no upstream file deleted |
+| Scope | 18 files added, 74 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -64,6 +64,11 @@ offered under the same Apache-2.0 license.
   workspaces, and the streamed-KV pool from the same selection budget, reserves
   the dense operator's transient capacity beside the sparse one, and admits up to
   eight concurrent lanes.
+- A prefix-append prefill keeps the prompt's `rope_delta` in `io_.rope_delta` and
+  rotates its continuation at `token index + rope_delta`, so a cached media prompt
+  resumes at the same absolute M-RoPE position as a cold prefill of the whole
+  prompt. `execution/rope_axes.h` holds the axis-count rule; `execution/text.cpp`
+  applies it to new queries, new K/V rows and the first generated token.
 
 ### `program/prefix` and `state` — the hybrid prefix cache over streamed KV
 
@@ -145,6 +150,9 @@ offered under the same Apache-2.0 license.
 - Options: `tests/test_cli_options.cpp` and `tests/test_serve_options.cpp` cover
   the three flags and the hybrid-only constraint; `test_kv_capacity.cpp` and
   `test_context_cache_defaults.cpp` cover the capacity policy they select.
+- Positions: `tests/models/qwen3_5/test_prefill_rope_axes.cpp` pins the axis
+  count of cold, prefix-append and multimodal prefills, and the post-media
+  `index + rope_delta` equivalence a prefix-append prefill relies on.
 - Converter: `tests/convert/test_qwen3_8_27b_qsa_gguf.py` and
   `test_gguf_blocks.py`.
 
@@ -176,7 +184,7 @@ offered under the same Apache-2.0 license.
 
 ## Files
 
-### Added (16)
+### Added (18)
 
 Root (1)
 
@@ -190,6 +198,10 @@ scripts (1)
 
 - `scripts/verify_qsa_gguf.py`
 
+src/models/qwen3_5/execution (1)
+
+- `src/models/qwen3_5/execution/rope_axes.h`
+
 src/product (1)
 
 - `src/product/qsa_top_blocks_options.h`
@@ -198,9 +210,10 @@ tests/convert (1)
 
 - `tests/convert/test_qwen3_8_27b_qsa_gguf.py`
 
-tests/models/qwen3_5 (1)
+tests/models/qwen3_5 (2)
 
 - `tests/models/qwen3_5/test_hybrid_stream_layout.cpp`
+- `tests/models/qwen3_5/test_prefill_rope_axes.cpp`
 
 tools/bench (3)
 

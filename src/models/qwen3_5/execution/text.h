@@ -15,6 +15,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/rope_axes.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
 #include "models/qwen3_5/execution/steering.h"
@@ -504,7 +505,6 @@ private:
     // During prefill_final_batch: each column's KV table row, the lane its steering scales are read
     // from.
     const Tensor* active_column_rows_                                              = nullptr;
-    std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;

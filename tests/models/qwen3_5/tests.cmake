@@ -252,3 +252,9 @@ set_tests_properties(ninfer_qwen3_5_structured_round_test PROPERTIES SKIP_RETURN
 ninfer_add_test(ninfer_qwen3_5_hybrid_stream_layout_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hybrid_stream_layout.cpp"
   LIBRARIES ninfer_model_runtime)
+
+# The M-RoPE axis count of a cold, prefix-append and multimodal text prefill, plus the
+# post-media `index + rope_delta` equivalence a prefix-append prefill relies on (CPU only).
+ninfer_add_test(ninfer_qwen3_5_prefill_rope_axes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefill_rope_axes.cpp"
+  LIBRARIES ninfer_model_runtime)

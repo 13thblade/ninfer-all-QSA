@@ -3283,11 +3283,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (multimodal->vision == nullptr) {
             throw std::invalid_argument("multimodal prefill requires a Vision session");
         }
-        rope_delta_ = multimodal->rope_delta;
+        ops::set_i32_scalar(io_.rope_delta, multimodal->rope_delta, s);
     } else if (text_kv_base_ == 0) {
-        rope_delta_ = 0;
+        ops::set_i32_scalar(io_.rope_delta, 0, s);
     }
-    ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
+    // A prefix-append prefill resumes after cached media tokens, whose grid advanced the M-RoPE
+    // axes past the token indices. The program already wrote that offset into io_.rope_delta;
+    // keep it so the continuation rotates at the same absolute position as a cold prefill of
+    // the whole prompt.
 
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
     // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
@@ -3382,7 +3385,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
+            const std::int32_t rope_axes = prefill_rope_axes(multimodal != nullptr, base);
             const bool overlay_staging   = !vision_chunk.host_embeddings.empty();
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
@@ -3406,7 +3409,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
                 }
                 copy_i32(rope_positions_host.data(), rope_positions, s);
-            } else if (rope_delta_ != 0) {
+            } else if (base != 0) {
                 rope_positions = roots.rope_positions;
                 ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
             }
@@ -3495,7 +3498,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
-                ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
+                if (base != 0) {
+                    Tensor base_scalar = work_.alloc(DType::I32, {1});
+                    ops::set_i32_scalar(base_scalar, base_i + T, s);
+                    ops::add_i32_scalars(base_scalar, io_.rope_delta, io_.rope_pos, s);
+                } else {
+                    ops::set_i32_scalar(io_.rope_pos, base_i + T, s);
+                }
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count),
@@ -3721,7 +3730,6 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
     work_.reset();
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(columns));
-    rope_delta_ = 0;
     ops::set_i32_scalar(io_.rope_delta, 0, s);
     const auto roots = workspace::text_prefill_roots(work_, config_, columns, 0, 0);
     Tensor ids_device = roots.ids;
