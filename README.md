@@ -19,7 +19,7 @@
 | `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
-`--kv-resident` 的自动下限是「一列验证的选区 + 本次调用写入的页数」= `--qsa-top-blocks` + `ceil(验证列数 / 4)` 个块（乘 4 换算成 token，验证列数最多 16）。当各列选中的块并集超过池时，流式 resolve 优先保住 column 0 的选区与本次写入的块、丢弃草稿列的块，该轮就地退化为「只采信 column 0、草稿全丢」；若连 column 0 都放不下则拒绝该轮并提示调大 `--kv-resident`。显式给更大的 `--kv-resident` 仍生效；当此下限 ×4 token 不小于上下文时流式关闭、整段历史全驻留。典型用法：
+`--kv-resident` 的自动下限是「一列验证的选区 + 本次调用写入的页数」= `--qsa-top-blocks` + `ceil(验证列数 / 4)` 个块（乘 4 换算成 token，验证列数最多 16）。当各列选中的块并集超过池时，流式 resolve 优先保住 column 0 的选区与本次写入的块、丢弃草稿列的块，并在 device 侧 acceptance 之前撤回该轮全部草稿，由 acceptance kernel 自己按「只采信 column 0」给出一致的 token 与状态记账；若连 column 0 都放不下则拒绝该轮并提示调大 `--kv-resident`。显式给更大的 `--kv-resident` 仍生效；当此下限 ×4 token 不小于上下文时流式关闭、整段历史全驻留。典型用法：
 
 ```bash
 # 启用QSA + 2048 token 注意力窗口 + KV 全驻留
@@ -87,7 +87,7 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 
-The `--kv-resident` pool's automatic floor is one verification column's shortlist plus the pages the call writes: `--qsa-top-blocks` + `ceil(verification columns / 4)` blocks (four tokens each), with at most 16 columns. When the columns' union exceeds the pool, the streamed resolve keeps column 0's selection and the blocks the call wrote, drops the draft columns' blocks, and the round degrades in place to accepting column 0 alone with no drafts; a round whose column 0 shortlist cannot be kept complete is refused with a hint to raise `--kv-resident`. An explicit larger `--kv-resident` still takes effect; when this floor times four tokens is not below the context, streaming is disabled and the whole history stays resident. Typical use:
+The `--kv-resident` pool's automatic floor is one verification column's shortlist plus the pages the call writes: `--qsa-top-blocks` + `ceil(verification columns / 4)` blocks (four tokens each), with at most 16 columns. When the columns' union exceeds the pool, the streamed resolve keeps column 0's selection and the blocks the call wrote, drops the draft columns' blocks, and withholds every draft on the device before acceptance, so the acceptance kernel itself commits column 0's target token with consistent state bookkeeping; a round whose column 0 shortlist cannot be kept complete is refused with a hint to raise `--kv-resident`. An explicit larger `--kv-resident` still takes effect; when this floor times four tokens is not below the context, streaming is disabled and the whole history stays resident. Typical use:
 
 ```bash
 # QSA on, a 2048-token attention window, every layer's KV resident

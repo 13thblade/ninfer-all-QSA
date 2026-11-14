@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_snapshot.h"
 #include "core/pinned_memory.h"
 #include "core/vmm.h"
@@ -1062,6 +1063,15 @@ public:
     // stay per lane and the next sequence on a lane reuses them from position zero.
     std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
     std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
+    // --kv-resident: one device word per lane, zeroed before each decode round and set by the
+    // resolve kernels to the worst overflow code any of the lane's layers reported. The MTP
+    // acceptance path reads it on the device, before the host synchronization point.
+    std::optional<DeviceBuffer> qsa_stream_round_flags;
+    // The batch rows' lane ids on the device, uploaded at the start of each decode round so the
+    // acceptance path can map a row to its round flag without a host round trip.
+    std::optional<DeviceBuffer> qsa_stream_row_lanes;
+    // Pinned staging for the row->lane upload, so the copy stays asynchronous inside a round.
+    std::optional<PinnedHostBuffer> qsa_stream_row_lanes_host;
     // --kv-resident: the (lane, layer) stream pool overflow words staged by each decode round.
     std::optional<PinnedHostBuffer> qsa_stream_overflow_host;
     // Lanes whose stream pool overflowed in the round just synchronized. A round keeps column 0's
@@ -2010,10 +2020,10 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
-    // --kv-resident: enqueues an async copy of every (lane, layer) stream pool overflow word
-    // after a decode round's forward pass; the round's device sync covers the copy, and
-    // check_qsa_stream_overflow records the lanes that degrade to column 0 alone (or refuses a
-    // round whose column 0 shortlist could not be kept complete).
+    // --kv-resident: clears the per-lane device round flags before a decode batch, and reads
+    // back every (lane, layer) overflow word after it for diagnostics and the code-2 refusal.
+    // The in-phase degradation itself happens on the device, before acceptance.
+    void clear_qsa_stream_round_flags(std::span<const std::uint32_t> lanes);
     void queue_qsa_stream_overflow_fetch();
     void check_qsa_stream_overflow();
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,

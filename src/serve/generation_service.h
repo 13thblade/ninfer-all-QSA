@@ -48,6 +48,10 @@ struct GenerationMetrics {
     std::uint64_t speculative_draft_tokens    = 0;
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
+    // --qwen38-27b-qsa --kv-resident: stream pool overflow / in-phase degradation diagnostics.
+    std::uint64_t qsa_stream_overflow_rounds   = 0;
+    std::uint64_t qsa_stream_degraded_rounds   = 0;
+    std::int32_t  qsa_stream_max_overflow_code = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     bool speculative_adaptive                    = false;
     std::uint64_t speculative_window_transitions = 0;

@@ -1,6 +1,5 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/stream_fallback.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
@@ -707,6 +706,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence_lanes};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        clear_qsa_stream_round_flags(lanes);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size())); }
@@ -954,8 +954,17 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             qsa_kv_views,
             sequence_lanes};
         schedule_state.sampled_drafts = gumbel_sampling;
+        schedule_state.qsa_round_flags =
+            qsa_stream_round_flags.has_value()
+                ? static_cast<const std::int32_t*>(qsa_stream_round_flags->p)
+                : nullptr;
+        schedule_state.qsa_row_lanes =
+            qsa_stream_row_lanes.has_value()
+                ? static_cast<const std::uint32_t*>(qsa_stream_row_lanes->p)
+                : nullptr;
 
         mark_workspace_usage(workspace_plan.mtp_round);
+        clear_qsa_stream_round_flags(lanes);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     verify_window, draft_window, envelopes, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
@@ -968,24 +977,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             device.synchronize();
         }
         check_qsa_stream_overflow();
-        // A stream pool that could not hold every verification column's union keeps column 0's
-        // shortlist complete and drops the draft columns' blocks. Degrade this round in place:
-        // accept no draft, license only column 0's token, and enter the next round with no drafts
-        // so the device's next_drafts from the just-finished round are not consumed. The sync
-        // above already made the overflow words visible; no extra launch or sync is needed.
-        if (qsa_stream_overflow_mask != 0) {
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                const std::uint32_t lane = lanes[row];
-                if (!qsa_stream_lane_degraded(qsa_stream_overflow_mask, lane)) { continue; }
-                const MtpRowMetadata degraded       = degrade_mtp_row();
-                mtp_host_egress->accepted_drafts[row] = degraded.accepted_drafts;
-                mtp_host_egress->licensed_counts[row] = degraded.licensed_counts;
-                mtp_host_egress->next_extents[row]    = degraded.next_extents;
-                SequenceState& sequence     = active_sequence(lane);
-                sequence.mtp_draft_count    = 0;
-                sequence.mtp_drafts_pending = false;
-            }
-        }
+        // --kv-resident: an overflowed lane's drafts were withheld on the device before
+        // acceptance, so the egress, the selected hidden state and the next round are already in
+        // phase. check_qsa_stream_overflow refuses code 2 and records the round's diagnostics;
+        // patching the host egress here would be both too late and a second source of truth.
         observe_masks(lanes);
         timing.end_wait();
 
@@ -1273,6 +1268,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule_state.neural_proposal_drafts = neural_drafts;
 
         mark_workspace_usage(workspace_plan.dflash_round);
+        clear_qsa_stream_round_flags(lanes);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        verify_drafts, envelopes, target_envelope, executable);
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }

@@ -844,6 +844,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 "--kv-resident");
         }
         stream.layer_states.reserve(stream_regions);
+        qsa_stream_round_flags.emplace(static_cast<std::size_t>(stream.lanes) *
+                                       sizeof(std::int32_t));
+        qsa_stream_round_flags->fill(0);
+        qsa_stream_row_lanes.emplace(static_cast<std::size_t>(stream.lanes) *
+                                     sizeof(std::uint32_t));
+        qsa_stream_row_lanes->fill(0);
+        qsa_stream_row_lanes_host.emplace(static_cast<std::size_t>(stream.lanes) *
+                                          sizeof(std::uint32_t));
         for (std::uint32_t lane = 0; lane < stream.lanes; ++lane) {
             for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
                 qsa_stream_host.push_back(
@@ -851,8 +859,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 const std::size_t index = static_cast<std::size_t>(lane) * stream.layers + layer;
                 const Tensor pool_region = plan.persistent.qsa_stream_pool[index].bind(backing);
                 const Tensor map_region = plan.persistent.qsa_stream_map[index].bind(backing);
-                const ops::KvStreamMap map = ops::kv_stream_map(
+                ops::KvStreamMap map = ops::kv_stream_map(
                     map_region.data, static_cast<std::int32_t>(plan.stream_blocks), slots);
+                map.round_flags = static_cast<std::int32_t*>(qsa_stream_round_flags->p);
+                map.lane        = lane;
                 QsaStreamLayerState layer_state{};
                 layer_state.map  = map;
                 layer_state.host = make_view(qsa_stream_host.back()->data(), kPagedKVPageSize, pages,
@@ -1124,6 +1134,24 @@ void ProgramImpl::synchronize_transfer_streams() const {
     }
 }
 
+void ProgramImpl::clear_qsa_stream_round_flags(std::span<const std::uint32_t> lanes) {
+    if (!qsa_stream_round_flags.has_value() || !qsa_stream_row_lanes.has_value() ||
+        !qsa_stream_row_lanes_host.has_value()) { return; }
+    // On the same stream as the resolve kernels and the acceptance path: the flags describe the
+    // round about to be submitted, never the previous one. The row->lane table is a few words;
+    // staging it through pinned memory keeps the upload asynchronous inside a round.
+    CUDA_CHECK(cudaMemsetAsync(qsa_stream_round_flags->p, 0, qsa_stream_round_flags->bytes,
+                               device.stream));
+    if (lanes.empty() || lanes.size() * sizeof(std::uint32_t) > qsa_stream_row_lanes->bytes) {
+        throw std::logic_error("QSA stream round lane table exceeds its allocation");
+    }
+    std::copy_n(lanes.begin(), lanes.size(),
+                static_cast<std::uint32_t*>(qsa_stream_row_lanes_host->data()));
+    CUDA_CHECK(cudaMemcpyAsync(qsa_stream_row_lanes->p, qsa_stream_row_lanes_host->data(),
+                               lanes.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImpl::queue_qsa_stream_overflow_fetch() {
     if (!qsa_stream_state.has_value()) { return; }
     const qwen3_5::QsaStreamState& stream = *qsa_stream_state;
@@ -1149,8 +1177,21 @@ void ProgramImpl::check_qsa_stream_overflow() {
     const std::int32_t* words = static_cast<const std::int32_t*>(qsa_stream_overflow_host->data());
     for (std::uint32_t lane = 0;
          lane < stream.lanes && lane < kQsaStreamLaneMaskBits; ++lane) {
-        if (!fold_qsa_stream_lane(words + static_cast<std::size_t>(lane) * stream.layers,
-                                  stream.layers, lane, qsa_stream_overflow_mask)) {
+        const std::int32_t* lane_words =
+            words + static_cast<std::size_t>(lane) * stream.layers;
+        std::int32_t worst = 0;
+        for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
+            worst = qsa_stream_worst_code(worst, lane_words[layer]);
+        }
+        if (worst != 0) {
+            SpeculativeStats& stats = requests[lane].speculative_stats;
+            ++stats.qsa_stream_overflow_rounds;
+            if (worst < kQsaStreamOverflowUnsafe) { ++stats.qsa_stream_degraded_rounds; }
+            stats.qsa_stream_max_overflow_code = qsa_stream_worst_code(
+                static_cast<std::int32_t>(stats.qsa_stream_max_overflow_code), worst);
+        }
+        if (!fold_qsa_stream_lane(lane_words, stream.layers, lane,
+                                  qsa_stream_overflow_mask)) {
             // Column 0 is dirty: no in-place degradation can return a correct token.
             throw std::logic_error(
                 "QSA streamed KV pool overflow: lane " + std::to_string(lane) +

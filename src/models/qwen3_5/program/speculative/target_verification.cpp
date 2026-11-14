@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/structured_round.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
@@ -28,6 +29,17 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (execution.io.structured != nullptr) { execution.io.structured->wait(execution.device.stream); }
     // Before acceptance adds this round's tokens to the penalty counts.
     gather_logprobs(execution, frame.target_logits, frame.sampling, &frame.drafts);
+    if (frame.qsa_round_flags != nullptr) {
+        // --kv-resident: an overflowed lane's draft columns lost their KV blocks. Withhold the
+        // drafts *before* acceptance so the kernel licenses column 0's target token with its own
+        // lengths/anchors/selected-hidden bookkeeping, in phase with the device-side state. A
+        // host-side patch after device.synchronize() would be too late: licensed_tokens[0] of an
+        // accepted draft is a draft token, and select_accepted_hidden/scatter already ran.
+        ops::kv_stream_degrade_verify_extents(
+            frame.qsa_round_flags, frame.qsa_row_lanes,
+            static_cast<std::int32_t*>(frame.current_extents.data),
+            static_cast<std::int32_t>(frame.current_extents.ne[0]), execution.device.stream);
+    }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,

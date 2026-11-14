@@ -148,6 +148,11 @@ struct MtpBatchContext {
     std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
     // --qwen38-27b-qsa: the lane of each batch row, in row order; empty without the flag.
     std::span<const std::uint32_t> sequence_lanes;
+    // --qwen38-27b-qsa --kv-resident: device I32 [lanes] set by this round's resolve kernels,
+    // and device U32 [rows] mapping batch rows to lanes. Null when streaming is off, in which
+    // case no verification round is ever degraded.
+    const std::int32_t*  qsa_round_flags = nullptr;
+    const std::uint32_t* qsa_row_lanes   = nullptr;
     // --gumbel-sampling: each row's proposals are draws under frame.draft_sampling at the keys of
     // the verification columns they fill; otherwise every proposal is the drafter's argmax.
     bool sampled_drafts = false;
@@ -202,6 +207,8 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    const std::int32_t* qsa_round_flags    = nullptr; // --kv-resident: device I32 [lanes]
+    const std::uint32_t* qsa_row_lanes     = nullptr; // --kv-resident: device U32 [rows]
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;

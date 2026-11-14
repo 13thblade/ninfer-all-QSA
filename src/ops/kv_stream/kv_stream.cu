@@ -85,7 +85,7 @@ __device__ __forceinline__ unsigned long long* counters(const KvStreamMap& m) {
 
 __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(KvStreamMap m, const int* __restrict__ first_word,
-                   const int* __restrict__ selected, const int* __restrict__ counts, int tokens,
+                   const int* __restrict__ selected, int* __restrict__ counts, int tokens,
                    int selected_stride) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut, s_primary;
     __shared__ int s_listed, s_written; // compact copy-list indices, independent of s_misses
@@ -303,6 +303,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.copy_block[placed + threadIdx.x] = refresh_block[threadIdx.x];
         m.copy_slot[placed + threadIdx.x]  = refresh_slot[threadIdx.x];
     }
+    __syncthreads();
     if (threadIdx.x == 0) {
         const int copies = placed + s_refreshes;
         m.control[0]     = epoch;
@@ -312,7 +313,16 @@ __global__ void __launch_bounds__(kResolveThreads)
             // Code 2 means even the blocks the fallback must keep did not fit: column 0's
             // shortlist would be dirty, so no in-place degradation is safe and the caller
             // refuses the round instead of returning a bad token.
-            m.control[3] = s_primary <= placed ? 1 : 2;
+            const int code = s_primary <= placed ? 1 : 2;
+            m.control[3]   = code;
+            if (m.round_flags != nullptr) {
+                atomicMax(m.round_flags + m.lane, code);
+                // The dropped draft blocks are -1 in the table. sparse_softmax_attention indexes
+                // the table without a bounds check, so empty the draft columns' shortlists: they
+                // then read only their own incomplete block, which the call wrote and resolve
+                // kept. The MTP acceptance path withholds their drafts entirely.
+                for (int q = 1; q < tokens; ++q) { counts[q] = 0; }
+            }
         }
         m.control[10]    = need;
         m.control[11]    = placed;
@@ -400,6 +410,16 @@ __global__ void evict_kernel(KvStreamMap m, int first_block, int end_block) {
             m.slot_block[slot] = -1;
         }
     }
+}
+
+// An overflowed lane offers no drafts. Zeroing the extent before acceptance makes the acceptance
+// kernel license column 0's target token with its own lengths/anchors/selected-hidden bookkeeping,
+// instead of the host patching three egress words after the device has already moved on.
+__global__ void degrade_extents_kernel(const std::int32_t* __restrict__ flags,
+                                       const std::uint32_t* __restrict__ row_lanes,
+                                       std::int32_t* __restrict__ extents, int rows) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row < rows && flags[row_lanes[row]] != 0) { extents[row] = 0; }
 }
 
 void require(bool condition, const char* message) {
@@ -515,7 +535,7 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const Planes planes = planes_of(map, host, pool);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         map, static_cast<const int*>(first_position.data), static_cast<const int*>(selected.data),
-        static_cast<const int*>(counts.data), tokens, stride);
+        static_cast<int*>(counts.data), tokens, stride);
     CUDA_CHECK(cudaGetLastError());
     copy_kernel<<<kCopyBlocks, kCopyThreads, 0, stream>>>(map, planes, prefix);
     CUDA_CHECK(cudaGetLastError());
@@ -529,6 +549,19 @@ void kv_stream_evict(const KvStreamMap& map, std::int32_t first_block, std::int3
     if (first_block >= end_block) { return; }
     const int grid = std::clamp((end_block - first_block + 255) / 256, 1, 1024);
     evict_kernel<<<grid, 256, 0, stream>>>(map, first_block, end_block);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void kv_stream_degrade_verify_extents(const std::int32_t* round_flags,
+                                      const std::uint32_t* row_lanes,
+                                      std::int32_t* current_extents, std::int32_t rows,
+                                      cudaStream_t stream) {
+    require(round_flags != nullptr && row_lanes != nullptr && current_extents != nullptr &&
+                rows > 0,
+            "the round fallback needs flags, row lanes and extents");
+    const int grid = (rows + 255) / 256;
+    degrade_extents_kernel<<<grid, 256, 0, stream>>>(round_flags, row_lanes, current_extents,
+                                                     rows);
     CUDA_CHECK(cudaGetLastError());
 }
 

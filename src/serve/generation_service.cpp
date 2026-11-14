@@ -879,6 +879,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_draft_tokens     = result.speculative.drafted_tokens;
     outcome.metrics.speculative_accepted_tokens  = result.speculative.accepted_tokens;
     outcome.metrics.speculative_fallback_steps   = result.speculative.fallback_steps;
+    outcome.metrics.qsa_stream_overflow_rounds   = result.speculative.qsa_stream_overflow_rounds;
+    outcome.metrics.qsa_stream_degraded_rounds   = result.speculative.qsa_stream_degraded_rounds;
+    outcome.metrics.qsa_stream_max_overflow_code =
+        result.speculative.qsa_stream_max_overflow_code;
     outcome.metrics.ngram_rounds                 = result.speculative.ngram_rounds;
     outcome.metrics.ngram_drafted_tokens         = result.speculative.ngram_drafted_tokens;
     outcome.metrics.ngram_accepted_tokens        = result.speculative.ngram_accepted_tokens;

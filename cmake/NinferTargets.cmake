@@ -145,7 +145,7 @@ endfunction()
 #
 # ninfer / ninfer-serve (and fully-linked test binaries) statically import the
 # FFmpeg + libcurl runtime DLLs (avutil/avcodec/avformat/swscale/swresample/libcurl
-# plus their own deps, e.g. z.dll). The vcpkg IMPORTED_LINK_DEPENDENT_LIBRARIES hook
+# plus their own deps, e.g. zlib.dll). The vcpkg IMPORTED_LINK_DEPENDENT_LIBRARIES hook
 # does not reliably stage them into the output tree, and the Windows loader will not
 # search the vcpkg bin dir when the exe is launched directly -- it only searches the
 # exe's own directory, system dirs, and PATH. An unresolved import aborts the process
@@ -161,7 +161,7 @@ function(ninfer_runtime_dll_list out_var)
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
-      "swresample-*.dll" "libcurl*.dll" "z.dll")
+      "swresample-*.dll" "libcurl*.dll" "zlib*.dll")
       file(GLOB _ninfer_dlls "${FFMPEG_VCPKG_TREE}/bin/${_ninfer_dll_glob}")
       list(APPEND _list ${_ninfer_dlls})
     endforeach()

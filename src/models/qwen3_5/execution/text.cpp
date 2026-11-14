@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen3_5/program/stream_fallback.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -1609,6 +1610,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         // The rows the attention call would append, through the same launch on its prompt route;
         // a call on a small-T route appends inside its kernels, so it runs whole below and its
         // output goes unused.
+        if (qsa_indexer_ != nullptr && qsa_indexer_->stream != nullptr) {
+            throw std::logic_error("a K/V-only layer cannot run under streamed QSA KV");
+        }
         if (active_sequence_batch_ != 0 || !active_segments_.empty()) {
             throw std::logic_error("a K/V-only layer runs one prompt chunk");
         }
@@ -3350,8 +3354,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                           : text_prefill != nullptr
                                               ? text_prefill->token_ids.size()
                                               : static_cast<std::size_t>(base) + ids.size();
+        const bool qsa_stream_active =
+            qsa_indexer_ != nullptr && qsa_indexer_->stream != nullptr;
         bool kv_only =
-            last_layer_kv_only_allowed_ && !is_last && !prepare_mtp_prompt &&
+            qwen3_5::detail::kv_only_pass_supported(qsa_stream_active) &&
+            last_layer_kv_only_allowed_ &&
+            !is_last && !prepare_mtp_prompt &&
             static_cast<std::size_t>(prompt_t0) + static_cast<std::size_t>(len) < prompt_tokens &&
             config_.layer_types.back() == MixerKind::FullAttention &&
             !(split_rel > 0 && t0 + len == split_rel &&

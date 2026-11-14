@@ -11,10 +11,25 @@ inline constexpr std::uint32_t kQsaStreamLaneMaskBits = 32;
 inline constexpr std::int32_t kQsaStreamOverflowDraftOnly = 1;
 inline constexpr std::int32_t kQsaStreamOverflowUnsafe    = 2;
 
-// Whether this lane's pools reported a recoverable draft-column overflow this round.
-[[nodiscard]] constexpr bool
-qsa_stream_lane_degraded(std::uint32_t mask, std::uint32_t lane) noexcept {
-    return lane < kQsaStreamLaneMaskBits && (mask & (std::uint32_t{1} << lane)) != 0;
+// A K/V-only pass appends the last layer's rows straight into the device text-KV view. Under
+// --kv-resident the authoritative copy is the pinned host layer and the device text cache has a
+// single shared staging layer, so the pass has neither the layers it indexes nor the right
+// destination. The prefill planner turns it off at its only entry point.
+[[nodiscard]] constexpr bool kv_only_pass_supported(bool qsa_stream_active) noexcept {
+    return !qsa_stream_active;
+}
+
+// The device-side fallback: an overflowed lane offers no drafts to the acceptance kernel, so it
+// commits column 0 alone with the kernel's own complete bookkeeping.
+[[nodiscard]] constexpr std::int32_t
+qsa_stream_degraded_extent(std::int32_t round_flag, std::int32_t extent) noexcept {
+    return round_flag != 0 ? 0 : extent;
+}
+
+// Every (lane, layer) pool reports its own overflow word; a round keeps the worst one.
+[[nodiscard]] constexpr std::int32_t
+qsa_stream_worst_code(std::int32_t current, std::int32_t word) noexcept {
+    return word > current ? word : current;
 }
 
 // Fold one lane's per-layer overflow words into the round mask. Returns false when a layer says
@@ -35,16 +50,5 @@ fold_qsa_stream_lane(const std::int32_t* words, std::uint32_t layers, std::uint3
     if (degraded) { mask |= std::uint32_t{1} << lane; }
     return safe;
 }
-
-// The row metadata an MTP egress validator requires (`accepted + 1 == licensed`, and a next
-// extent within the draft window). An overflowed round accepts no draft, licenses column 0's
-// token alone and enters the next round without drafts.
-struct MtpRowMetadata {
-    std::int32_t accepted_drafts;
-    std::int32_t licensed_counts;
-    std::int32_t next_extents;
-};
-
-[[nodiscard]] constexpr MtpRowMetadata degrade_mtp_row() noexcept { return {0, 1, 0}; }
 
 } // namespace ninfer::models::qwen3_5::detail

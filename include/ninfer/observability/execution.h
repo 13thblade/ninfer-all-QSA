@@ -66,6 +66,12 @@ struct SpeculativeStats {
     std::uint64_t drafted_tokens  = 0;
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
+    // --qwen38-27b-qsa --kv-resident: rounds whose device KV stream pool overflowed, rounds the
+    // MTP verification degraded to column 0 on the device, and the worst overflow code seen
+    // (1 = only draft blocks were dropped, 2 = column 0's shortlist could not be kept complete).
+    std::uint64_t qsa_stream_overflow_rounds   = 0;
+    std::uint64_t qsa_stream_degraded_rounds   = 0;
+    std::int32_t  qsa_stream_max_overflow_code = 0;
     std::vector<std::uint64_t> accepted_per_position;
     // Adaptive MTP: rounds verified at each width 1..draft_window, and width changes.
     bool adaptive                    = false;

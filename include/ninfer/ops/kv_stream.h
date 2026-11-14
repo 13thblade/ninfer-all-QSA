@@ -58,6 +58,11 @@ struct KvStreamMap {
     std::int32_t* copy_slot    = nullptr; // [slots + 8] and its slot
     std::int32_t* copy_primary = nullptr; // [slots + 8] 1 for column 0 or a written block
     std::int32_t* control      = nullptr; // [16] epoch/hand/copies/overflow, counters, diagnostics
+    // Shared by every (lane, layer) map: one word per lane, zeroed before each decode round.
+    // resolve writes the worst overflow code of its layer here; the MTP acceptance path reads it
+    // on the device, before the host synchronizes, so the round degrades in phase.
+    std::int32_t* round_flags = nullptr; // device I32 [lanes], owned by ProgramImpl
+    std::uint32_t lane        = 0;
     std::int32_t blocks = 0, slots = 0;
 };
 
@@ -129,6 +134,16 @@ inline void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_positi
 // Evicts the resident blocks among [first_block, end_block).
 void kv_stream_evict(const KvStreamMap& map, std::int32_t first_block, std::int32_t end_block,
                      cudaStream_t stream);
+
+// Before acceptance, withhold every draft of a lane whose pools overflowed this round. An
+// acceptance with extent zero licenses column 0's target token and records accepted = 0 with the
+// kernel's own lengths/anchors bookkeeping, which keeps the device-side hidden selection, scatter
+// and next-round preparation in phase with the host. `round_flags` is I32 [lanes], `row_lanes`
+// U32 [rows] maps batch rows to lanes, `current_extents` is I32 [rows].
+void kv_stream_degrade_verify_extents(const std::int32_t* round_flags,
+                                      const std::uint32_t* row_lanes,
+                                      std::int32_t* current_extents, std::int32_t rows,
+                                      cudaStream_t stream);
 
 struct KvStreamCounters {
     std::uint64_t calls = 0, lookups = 0, copies = 0;

@@ -115,9 +115,17 @@ offered under the same Apache-2.0 license.
   copy list (at most one entry per slot, then the written pages), drops the
   draft columns' blocks, resets their table entries and reports the round's
   overflow without ever writing past the list.
-- `program/stream_fallback.h` folds the per-lane overflow words into a round
-  mask; `decode.cpp` degrades an MTP verification to accepting column 0 alone,
-  and refuses a round whose column 0 shortlist could not be kept complete.
+- An overflowing round degrades on the device, before acceptance:
+  `resolve_kernel` writes the worst overflow code into a per-lane device flag and
+  empties the draft columns' shortlists (their blocks are `-1` in the table),
+  `kv_stream_degrade_verify_extents()` then withholds those lanes' drafts so the
+  acceptance kernel itself licenses column 0's target token with consistent
+  lengths, anchors and selected hidden state. `program/stream_fallback.h` folds
+  the per-lane words for the code-2 refusal and the K/V-only pass gate; a
+  streamed QSA layer never runs the last-layer K/V-only fast path, whose device
+  text-KV index has only the shared staging layer. `request_done.speculative`
+  reports `qsa_stream_overflow_rounds`, `qsa_stream_degraded_rounds` and
+  `qsa_stream_max_overflow_code`.
 
 ### `serve`, `apps/cli` — the flag surface
 
@@ -163,11 +171,19 @@ offered under the same Apache-2.0 license.
   count of cold, prefix-append and multimodal prefills, and the post-media
   `index + rope_delta` equivalence a prefix-append prefill relies on.
 - Overflow fallback: `tests/models/qwen3_5/test_qsa_stream_fallback.cpp` covers
-  the per-lane overflow words, the degradation mask and the degraded MTP row
-  metadata; `tests/ops/test_kv_stream.cpp` pins the one-column pool floor, and
-  `tests/test_prefill_pacing.cpp` covers the QSA step floor.
+  the per-lane overflow words, the streamed K/V-only gate and the device-side
+  degradation rules; `tests/ops/test_kv_stream.cpp` pins the one-column pool
+  floor, column 0's residency, the truncated draft shortlists and the round
+  flag; `tests/test_prefill_pacing.cpp` covers the QSA step floor.
 - Converter: `tests/convert/test_qwen3_8_27b_qsa_gguf.py` and
   `test_gguf_blocks.py`.
+
+### Build
+
+- `cmake/NinferTargets.cmake` stages the FFmpeg/curl runtime closure next to
+  every binary. The vcpkg zlib port outputs `zlib.dll`, so the closure glob
+  matches `zlib*.dll`; the previous `z.dll` name matched nothing and the staged
+  binaries aborted at load time with an unresolved `zlib.dll` import.
 
 ### Benchmarks and diagnostics
 

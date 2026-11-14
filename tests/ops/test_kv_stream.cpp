@@ -325,6 +325,13 @@ public:
 
     void advance(int t) { position_ += t; }
 
+    // The shortlist counts after a resolve: an overflowed round empties the draft columns but
+    // keeps column 0's complete selection.
+    [[nodiscard]] std::vector<std::int32_t> counts(int t, cudaStream_t stream) const {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return from_device<std::int32_t>(in_.counts.p, static_cast<std::size_t>(t));
+    }
+
 private:
     Layer& layer_;
     std::mt19937 random_;
@@ -415,6 +422,10 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     constexpr int kTop = 8, kColumns = 8;
     const int slots = ops::kv_stream_single_column_slots(kTop, kColumns);
     Layer layer(storage, 4096, slots);
+    DeviceBuffer round_flags(sizeof(std::int32_t));
+    round_flags.fill(0);
+    layer.map.round_flags = static_cast<std::int32_t*>(round_flags.p);
+    layer.map.lane        = 0;
     Sequence sequence(layer, seed, 64, kTop);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -442,6 +453,16 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     check(control[3] == 1, "a draft-only overflow is recoverable");
     check(control[12] >= kTop && control[12] == control[13],
           "every block the fallback must keep was placed");
+    const auto flags = from_device<std::int32_t>(round_flags.p, 1);
+    check(flags[0] == 1, "the device round flag reports the recoverable overflow");
+    const auto shortlists = sequence.counts(kColumns, stream);
+    check(shortlists[0] == kTop, "column 0 keeps its complete shortlist");
+    bool drafts_withheld = true;
+    for (int q = 1; q < kColumns; ++q) {
+        if (shortlists[std::size_t(q)] != 0) { drafts_withheld = false; }
+    }
+    check(drafts_withheld,
+          "draft columns read no block that the overflow left out of the pool");
     for (int b = 0; b < kTop; ++b) {
         check(table[std::size_t(b)] >= 0, "column 0's block is resident");
     }
@@ -452,7 +473,8 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     check(dropped, "a draft column's block was dropped");
     failures += layer.check(label, stream);
 
-    // The next resolve starts from a clean overflow word even though this round overflowed.
+    // The next round clears its flags before submitting, then resolves without an overflow.
+    round_flags.fill(0);
     sequence.append(1, stream);
     const std::vector<std::int32_t> anchor(selected.begin(), selected.begin() + kTop);
     sequence.set_selection(1, anchor, std::vector<std::int32_t>(1, kTop), stream);
@@ -460,6 +482,8 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto next = from_device<std::int32_t>(layer.map.control, 16);
     check(next[3] == 0, "the overflow word is cleared on the next resolve");
+    check(from_device<std::int32_t>(round_flags.p, 1)[0] == 0,
+          "a clean round leaves the device round flag clear");
 
     std::cout << label << ": need=" << control[10] << " placed=" << control[11]
               << " must_keep=" << control[12] << " kept=" << control[13] << '\n';
