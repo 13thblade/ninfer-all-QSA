@@ -88,6 +88,7 @@ __global__ void __launch_bounds__(kResolveThreads)
                    const int* __restrict__ selected, const int* __restrict__ counts, int tokens,
                    int selected_stride) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut, s_primary;
+    __shared__ int s_listed, s_written; // compact copy-list indices, independent of s_misses
     __shared__ int warp_sums[32];
     __shared__ int read_written[kWrittenBlocks];
     __shared__ int refresh_block[kWrittenBlocks], refresh_slot[kWrittenBlocks];
@@ -95,11 +96,17 @@ __global__ void __launch_bounds__(kResolveThreads)
     const int low   = first / kKvStreamPageTokens;
     const int high  = (first + tokens - 1) / kKvStreamPageTokens; // inclusive
     const int epoch = m.control[0] + 1;
+    // s_misses counts every distinct miss, including those beyond the copy list. The list
+    // itself stays compact: at most one entry per pool slot for column selections, then the
+    // blocks this call wrote. Column 0 ran first, so its whole shortlist is always listed.
+    const int capacity = m.slots + kWrittenBlocks;
     if (threadIdx.x == 0) {
         s_misses    = 0;
         s_lookups   = 0;
         s_refreshes = 0;
         s_primary   = 0;
+        s_listed    = 0;
+        s_written   = 0;
         // These words describe this resolve only. A round that overflowed degrades in place and
         // reads them back, so a previous round's value must not linger into the next one.
         m.control[3]  = 0;
@@ -136,9 +143,12 @@ __global__ void __launch_bounds__(kResolveThreads)
                 m.slot_stamp[slot] = epoch;
                 m.slot_ref[slot]   = 1;
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
-                const int at       = atomicAdd(&s_misses, 1);
-                m.copy_block[at]   = b;
-                m.copy_primary[at] = 1;
+                const int at = atomicAdd(&s_misses, 1);
+                if (at < m.slots) {
+                    const int pos       = atomicAdd(&s_listed, 1);
+                    m.copy_block[pos]   = b;
+                    m.copy_primary[pos] = 1;
+                }
             }
         }
     }
@@ -161,9 +171,12 @@ __global__ void __launch_bounds__(kResolveThreads)
                 m.slot_stamp[slot] = epoch;
                 m.slot_ref[slot]   = 1;
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
-                const int at       = atomicAdd(&s_misses, 1);
-                m.copy_block[at]   = b;
-                m.copy_primary[at] = 0;
+                const int at = atomicAdd(&s_misses, 1);
+                if (at < m.slots) {
+                    const int pos       = atomicAdd(&s_listed, 1);
+                    m.copy_block[pos]   = b;
+                    m.copy_primary[pos] = 0;
+                }
             }
         }
     }
@@ -185,10 +198,16 @@ __global__ void __launch_bounds__(kResolveThreads)
                 refresh_block[r]   = b;
                 refresh_slot[r]    = slot;
             } else {
-                const int at      = atomicAdd(&s_misses, 1);
-                m.table[b]        = -2;
-                m.copy_block[at]  = b;
-                m.copy_primary[at] = 1; // a block the call wrote: column 0 must see it
+                (void)atomicAdd(&s_misses, 1);
+                m.table[b] = -2;
+                // Written blocks are listed after the column selections in a compact tail, so
+                // an overflowing union can never crowd them out of the copy list.
+                const int w   = atomicAdd(&s_written, 1);
+                const int pos = s_listed + w;
+                if (pos < capacity) {
+                    m.copy_block[pos]   = b;
+                    m.copy_primary[pos] = 1; // a block the call wrote: column 0 must see it
+                }
             }
         } else if (slot >= 0) {
             m.table[b]         = -1;
@@ -202,16 +221,20 @@ __global__ void __launch_bounds__(kResolveThreads)
     //    call uses (stamped with this epoch) is never taken; a referenced one loses its bit as the
     //    hand passes and is taken on the next pass.
     const int need = s_misses, n = m.slots;
+    // Only `n` slots exist. An overflowing union cannot be satisfied, so stop the sweep at
+    // the pool size instead of spinning through every scan for an unreachable `need`.
+    const int listed = s_listed + s_written;
+    const int target = need < n ? need : n;
     const int window = n < kResolveThreads ? n : kResolveThreads;
     const bool sweeps = static_cast<int>(threadIdx.x) < window;
     int hand = m.control[1], got = 0;
-    for (int scanned = 0; got < need && scanned < 3 * n; scanned += window) {
+    for (int scanned = 0; got < target && scanned < 3 * n; scanned += window) {
         const int j      = static_cast<int>((static_cast<long long>(hand) + threadIdx.x) % n);
         const bool mine  = sweeps && m.slot_stamp[j] == epoch;
         const bool taken = sweeps && !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
         int total        = 0;
         const int rank   = block_scan(taken ? 1 : 0, warp_sums, total);
-        const int want   = need - got;
+        const int want   = target - got;
         if (threadIdx.x == 0) s_cut = window;
         __syncthreads();
         // The hand stops just past the last slot taken.
@@ -230,14 +253,14 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
 
     const int placed = got < need ? got : need;
-    // 3b. Overflow: partition the copy list so column 0's blocks and the blocks this call wrote
-    // occupy the first `placed` entries. The one-column floor (startup.cpp) guarantees they fit;
-    // only draft columns' blocks are then dropped, leaving column 0's shortlist complete so the
-    // round can fall back to accepting column 0 alone. One thread does the stable partition: a
-    // pool that cannot hold the columns' union is rare, and the kernel is single-CTA anyway.
+    // 3b. Overflow: partition the listed copy blocks so column 0's blocks and the blocks this
+    // call wrote occupy the first `placed` entries. The one-column floor (startup.cpp) guarantees
+    // they fit; only draft columns' blocks are then dropped, leaving column 0's shortlist
+    // complete so the round can fall back to accepting column 0 alone. One thread does the stable
+    // partition: the kernel is single-CTA and the list is bounded by the pool size.
     if (placed < need && threadIdx.x == 0) {
         int write = 0;
-        for (int k = 0; k < need; ++k) {
+        for (int k = 0; k < listed; ++k) {
             if (m.copy_primary[k] == 0) { continue; }
             if (write != k) {
                 const int block   = m.copy_block[write];
@@ -254,7 +277,7 @@ __global__ void __launch_bounds__(kResolveThreads)
     __syncthreads();
 
     // 4. Re-point the table; the rewritten blocks join the copies in their own slots.
-    for (int k = threadIdx.x; k < need; k += kResolveThreads) {
+    for (int k = threadIdx.x; k < listed; k += kResolveThreads) {
         const int b = m.copy_block[k];
         if (k >= placed) {
             m.table[b] = -1; // a draft column's block the pool could not hold
@@ -266,6 +289,15 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.slot_block[slot] = b;
         m.slot_ref[slot]   = 1;
         m.table[b]         = slot;
+    }
+    if (placed < need) {
+        // Blocks claimed beyond the copy list are still -2 in the table. Reset them so the
+        // map and the attention's block table agree; only an overflowing round pays this scan.
+        __syncthreads();
+        for (int b = threadIdx.x; b < m.blocks; b += kResolveThreads) {
+            if (m.table[b] == -2) { m.table[b] = -1; }
+        }
+        __syncthreads();
     }
     if (threadIdx.x < s_refreshes) {
         m.copy_block[placed + threadIdx.x] = refresh_block[threadIdx.x];

@@ -111,8 +111,10 @@ offered under the same Apache-2.0 license.
   authoritative KV to pinned host memory behind one shared staging layer and pin
   the device pool to one verification column's shortlist plus the pages the call
   writes (`kv_stream_single_column_slots`). When the columns' union exceeds the
-  pool, the resolve keeps column 0's blocks and the written pages, drops the
-  draft columns' blocks and reports the round's overflow.
+  pool, the resolve keeps column 0's blocks and the written pages in a compact
+  copy list (at most one entry per slot, then the written pages), drops the
+  draft columns' blocks, resets their table entries and reports the round's
+  overflow without ever writing past the list.
 - `program/stream_fallback.h` folds the per-lane overflow words into a round
   mask; `decode.cpp` degrades an MTP verification to accepting column 0 alone,
   and refuses a round whose column 0 shortlist could not be kept complete.

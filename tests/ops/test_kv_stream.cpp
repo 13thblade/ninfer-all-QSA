@@ -272,6 +272,27 @@ public:
         attend(t, layer_.pool_view, out_stream_.p, stream);
     }
 
+    // A caller-supplied shortlist: the overflow-fallback test gives every column a disjoint
+    // selection. resolve() skips attention, since a degraded round's draft shortlists are
+    // deliberately incomplete and only column 0 is compared.
+    void set_selection(int t, const std::vector<std::int32_t>& blocks,
+                       const std::vector<std::int32_t>& shortlist_counts, cudaStream_t stream) {
+        CUDA_CHECK(cudaMemcpyAsync(in_.selected.p, blocks.data(), blocks.size() * 4,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(in_.counts.p, shortlist_counts.data(),
+                                   shortlist_counts.size() * 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    void resolve(int t, cudaStream_t stream) {
+        append_kernels(t, layer_.host_view, stream);
+        const Tensor first(in_.first.p, DType::I32, {1});
+        const Tensor selected(in_.selected.p, DType::I32, {top_, t});
+        const Tensor counts(in_.counts.p, DType::I32, {t});
+        ops::kv_stream_resolve(layer_.map, first, selected, counts, layer_.host_view,
+                               layer_.pool_view, stream);
+    }
+
     void attend(int t, const PagedKVLayerView& cache, void* out, cudaStream_t stream) {
         const Tensor q(in_.q.p, DType::BF16, {kDim, kQHeads, t});
         const Tensor first(in_.first.p, DType::I32, {1});
@@ -387,6 +408,65 @@ int run(KvCacheStorage storage, const Plan& plan, std::uint32_t seed) {
     return failures;
 }
 
+// A verification whose columns' union exceeds the pool must still leave column 0's shortlist
+// complete. The copy list is bounded by the pool, so this also pins the overflow path's
+// no-out-of-bounds guarantee and the per-resolve clearing of the overflow word.
+int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
+    constexpr int kTop = 8, kColumns = 8;
+    const int slots = ops::kv_stream_single_column_slots(kTop, kColumns);
+    Layer layer(storage, 4096, slots);
+    Sequence sequence(layer, seed, 64, kTop);
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    int failures = 0;
+    const std::string label = "kv_stream overflow fallback";
+    const auto check = [&](bool ok, const char* what) {
+        if (!ok) { std::cerr << label << ": " << what << '\n'; ++failures; }
+    };
+    for (int i = 0; i < 8; ++i) { sequence.wide(64, stream); } // 512 written positions
+
+    sequence.append(kColumns, stream);
+    std::vector<std::int32_t> selected(std::size_t(kTop) * kColumns, -1);
+    for (int q = 0; q < kColumns; ++q) {
+        for (int i = 0; i < kTop; ++i) {
+            selected[std::size_t(q) * kTop + i] = q * kTop + i;
+        }
+    }
+    sequence.set_selection(kColumns, selected, std::vector<std::int32_t>(kColumns, kTop), stream);
+    sequence.resolve(kColumns, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const auto control = from_device<std::int32_t>(layer.map.control, 16);
+    const auto table   = from_device<std::int32_t>(layer.map.table, std::size_t(layer.blocks));
+    check(control[10] > slots, "the columns' union exceeds the pool");
+    check(control[3] == 1, "a draft-only overflow is recoverable");
+    check(control[12] >= kTop && control[12] == control[13],
+          "every block the fallback must keep was placed");
+    for (int b = 0; b < kTop; ++b) {
+        check(table[std::size_t(b)] >= 0, "column 0's block is resident");
+    }
+    bool dropped = false;
+    for (int b = kTop; b < kTop * kColumns; ++b) {
+        if (table[std::size_t(b)] == -1) { dropped = true; break; }
+    }
+    check(dropped, "a draft column's block was dropped");
+    failures += layer.check(label, stream);
+
+    // The next resolve starts from a clean overflow word even though this round overflowed.
+    sequence.append(1, stream);
+    const std::vector<std::int32_t> anchor(selected.begin(), selected.begin() + kTop);
+    sequence.set_selection(1, anchor, std::vector<std::int32_t>(1, kTop), stream);
+    sequence.resolve(1, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto next = from_device<std::int32_t>(layer.map.control, 16);
+    check(next[3] == 0, "the overflow word is cleared on the next resolve");
+
+    std::cout << label << ": need=" << control[10] << " placed=" << control[11]
+              << " must_keep=" << control[12] << " kept=" << control[13] << '\n';
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -421,6 +501,7 @@ int main() {
           KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16}) {
         for (const Plan& plan : plans) { failures += run(storage, plan, seed++); }
     }
+    failures += run_overflow_fallback(KvCacheStorage::BFloat16, seed++);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " kv_stream\n";
     return failures == 0 ? 0 : 1;
 }
