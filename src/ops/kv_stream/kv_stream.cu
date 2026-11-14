@@ -30,8 +30,10 @@ constexpr int kWrittenBlocks = kKvStreamMaxTokens / kKvStreamPageTokens + 1;
 constexpr int kCopyThreads   = 256;
 constexpr int kCopyBlocks    = 64;
 
-// control words: [0] epoch, [1] hand, [2] copies of the last call, [3] overflow, then u64 calls,
-// lookups and copies.
+// control words: [0] epoch, [1] hand, [2] copies, [3] this round's overflow (0 clean, 1 a
+// recoverable draft-column overflow, 2 column 0 cannot be kept complete), [4..9] u64 calls /
+// lookups / copies, [10] distinct blocks needed, [11] blocks placed, [12] blocks the fallback
+// must keep, [13] of those actually placed, [14..15] unused.
 constexpr int kControlWords = 16;
 
 static_assert(kHostPage % kKvStreamPageTokens == 0);
@@ -85,7 +87,7 @@ __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(KvStreamMap m, const int* __restrict__ first_word,
                    const int* __restrict__ selected, const int* __restrict__ counts, int tokens,
                    int selected_stride) {
-    __shared__ int s_misses, s_lookups, s_refreshes, s_cut;
+    __shared__ int s_misses, s_lookups, s_refreshes, s_cut, s_primary;
     __shared__ int warp_sums[32];
     __shared__ int read_written[kWrittenBlocks];
     __shared__ int refresh_block[kWrittenBlocks], refresh_slot[kWrittenBlocks];
@@ -97,6 +99,14 @@ __global__ void __launch_bounds__(kResolveThreads)
         s_misses    = 0;
         s_lookups   = 0;
         s_refreshes = 0;
+        s_primary   = 0;
+        // These words describe this resolve only. A round that overflowed degrades in place and
+        // reads them back, so a previous round's value must not linger into the next one.
+        m.control[3]  = 0;
+        m.control[10] = 0; // distinct blocks this call needs
+        m.control[11] = 0; // blocks the pool could place
+        m.control[12] = 0; // blocks the fallback must keep
+        m.control[13] = 0; // of those, the blocks the pool could place
     }
     if (threadIdx.x < kWrittenBlocks) read_written[threadIdx.x] = 0;
     __syncthreads();
@@ -104,8 +114,36 @@ __global__ void __launch_bounds__(kResolveThreads)
     // 1. Every block a query reads: a resident one takes this call's stamp and its reference
     //    bit, a missing one is claimed exactly once (-1 -> -2). The blocks this call wrote wait
     //    for step 2. A query's own incomplete block is always among them.
+    //    1a runs column 0 alone: a block can appear in several columns' shortlists, and without
+    //    the barrier a draft column could claim it first and it would never be marked as a block
+    //    the fallback has to keep. 1b then handles the draft columns.
     int lookups = 0;
-    for (int q = 0; q < tokens; ++q) {
+    {
+        const int p      = first;
+        const int count  = counts[0];
+        const bool tail  = (p + 1) % kKvStreamPageTokens != 0;
+        const int* list  = selected;
+        const int blocks = count + (tail ? 1 : 0);
+        for (int i = threadIdx.x; i < blocks; i += kResolveThreads) {
+            const int b = i < count ? list[i] : p / kKvStreamPageTokens;
+            if (b >= low && b <= high) {
+                read_written[b - low] = 1;
+                continue;
+            }
+            ++lookups;
+            const int slot = m.table[b];
+            if (slot >= 0) {
+                m.slot_stamp[slot] = epoch;
+                m.slot_ref[slot]   = 1;
+            } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
+                const int at       = atomicAdd(&s_misses, 1);
+                m.copy_block[at]   = b;
+                m.copy_primary[at] = 1;
+            }
+        }
+    }
+    __syncthreads();
+    for (int q = 1; q < tokens; ++q) {
         const int p      = first + q;
         const int count  = counts[q];
         const bool tail  = (p + 1) % kKvStreamPageTokens != 0;
@@ -123,7 +161,9 @@ __global__ void __launch_bounds__(kResolveThreads)
                 m.slot_stamp[slot] = epoch;
                 m.slot_ref[slot]   = 1;
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
-                m.copy_block[atomicAdd(&s_misses, 1)] = b;
+                const int at       = atomicAdd(&s_misses, 1);
+                m.copy_block[at]   = b;
+                m.copy_primary[at] = 0;
             }
         }
     }
@@ -145,8 +185,10 @@ __global__ void __launch_bounds__(kResolveThreads)
                 refresh_block[r]   = b;
                 refresh_slot[r]    = slot;
             } else {
-                m.table[b]                            = -2;
-                m.copy_block[atomicAdd(&s_misses, 1)] = b;
+                const int at      = atomicAdd(&s_misses, 1);
+                m.table[b]        = -2;
+                m.copy_block[at]  = b;
+                m.copy_primary[at] = 1; // a block the call wrote: column 0 must see it
             }
         } else if (slot >= 0) {
             m.table[b]         = -1;
@@ -187,12 +229,35 @@ __global__ void __launch_bounds__(kResolveThreads)
         __syncthreads();
     }
 
-    // 4. Re-point the table; the rewritten blocks join the copies in their own slots.
     const int placed = got < need ? got : need;
+    // 3b. Overflow: partition the copy list so column 0's blocks and the blocks this call wrote
+    // occupy the first `placed` entries. The one-column floor (startup.cpp) guarantees they fit;
+    // only draft columns' blocks are then dropped, leaving column 0's shortlist complete so the
+    // round can fall back to accepting column 0 alone. One thread does the stable partition: a
+    // pool that cannot hold the columns' union is rare, and the kernel is single-CTA anyway.
+    if (placed < need && threadIdx.x == 0) {
+        int write = 0;
+        for (int k = 0; k < need; ++k) {
+            if (m.copy_primary[k] == 0) { continue; }
+            if (write != k) {
+                const int block   = m.copy_block[write];
+                const int primary = m.copy_primary[write];
+                m.copy_block[write]   = m.copy_block[k];
+                m.copy_primary[write] = m.copy_primary[k];
+                m.copy_block[k]   = block;
+                m.copy_primary[k] = primary;
+            }
+            ++write;
+        }
+        s_primary = write;
+    }
+    __syncthreads();
+
+    // 4. Re-point the table; the rewritten blocks join the copies in their own slots.
     for (int k = threadIdx.x; k < need; k += kResolveThreads) {
         const int b = m.copy_block[k];
         if (k >= placed) {
-            m.table[b] = -1; // overflow: a pool below kv_stream_minimum_slots
+            m.table[b] = -1; // a draft column's block the pool could not hold
             continue;
         }
         const int slot = m.copy_slot[k];
@@ -211,7 +276,16 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.control[0]     = epoch;
         m.control[1]     = hand;
         m.control[2]     = copies;
-        if (placed < need) m.control[3] = 1;
+        if (placed < need) {
+            // Code 2 means even the blocks the fallback must keep did not fit: column 0's
+            // shortlist would be dirty, so no in-place degradation is safe and the caller
+            // refuses the round instead of returning a bad token.
+            m.control[3] = s_primary <= placed ? 1 : 2;
+        }
+        m.control[10]    = need;
+        m.control[11]    = placed;
+        m.control[12]    = s_primary;
+        m.control[13]    = placed < s_primary ? placed : s_primary;
         unsigned long long* c = counters(m);
         c[0] += 1ull;
         c[1] += static_cast<unsigned long long>(s_lookups);
@@ -349,7 +423,7 @@ Planes planes_of(const KvStreamMap& map, const PagedKVLayerView& host,
 std::size_t kv_stream_map_bytes(std::int32_t blocks, std::int32_t slots) {
     require(blocks > 0 && slots > 0, "a map needs blocks and slots");
     const auto words = [](std::int64_t n) { return aligned(std::size_t(n) * 4); };
-    return words(blocks) + 3 * words(slots) + 2 * words(std::int64_t(slots) + kWrittenBlocks) +
+    return words(blocks) + 3 * words(slots) + 3 * words(std::int64_t(slots) + kWrittenBlocks) +
            words(kControlWords);
 }
 
@@ -368,9 +442,10 @@ KvStreamMap kv_stream_map(void* memory, std::int32_t blocks, std::int32_t slots)
     map.slot_block = take(slots);
     map.slot_stamp = take(slots);
     map.slot_ref   = take(slots);
-    map.copy_block = take(std::int64_t(slots) + kWrittenBlocks);
-    map.copy_slot  = take(std::int64_t(slots) + kWrittenBlocks);
-    map.control    = take(kControlWords);
+    map.copy_block   = take(std::int64_t(slots) + kWrittenBlocks);
+    map.copy_slot    = take(std::int64_t(slots) + kWrittenBlocks);
+    map.copy_primary = take(std::int64_t(slots) + kWrittenBlocks);
+    map.control      = take(kControlWords);
     (void)kv_stream_map_bytes(blocks, slots);
     return map;
 }
@@ -394,15 +469,11 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const std::int32_t tokens = selected.ne[1];
     const std::int32_t stride = selected.ne[0];
     require(tokens <= kKvStreamMaxTokens, "a resolved call has at most 16 queries");
-    // A verify's columns sit at consecutive positions and can pick disjoint indexer selections,
-    // so the pool must hold the disjoint worst case. kv_stream_minimum_slots(width, query_blocks)
-    // gives that count; the engine's automatic floor (startup.cpp) now sizes the pool to it, and
-    // direct callers/tests use the same bound. This per-call check only enforces the lighter
-    // overlapping bound (one query's selection plus the blocks the call writes) as a cheap sanity
-    // floor; the real overflow guard is resolve_kernel's control[3] below (step 4).
-    const std::int32_t written_blocks =
-        (tokens + kKvStreamPageTokens - 1) / kKvStreamPageTokens;
-    require(map.slots >= stride + written_blocks,
+    // A verify's columns can pick disjoint selections, but the pool only has to hold one column's
+    // shortlist plus the blocks the call writes. On overflow resolve_kernel places those first and
+    // drops the draft columns' blocks, so the round can accept column 0 alone. This per-call
+    // check enforces that bound; control[3] reports the round's overflow to the caller.
+    require(map.slots >= kv_stream_single_column_slots(stride, tokens),
             "the pool cannot hold the blocks of one call");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,

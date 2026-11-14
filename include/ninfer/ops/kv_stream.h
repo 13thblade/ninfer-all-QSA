@@ -32,7 +32,11 @@ namespace ninfer::ops {
  * caller names per 64-position block run. Blocks the append wrote
  * (first / 4 .. (first + tokens - 1) / 4) are copied again when the call reads them and evicted
  * when it does not, so no slot ever holds bytes older than the host copy. The map's counters
- * record the calls, the blocks looked up and the blocks copied.
+ * record the calls, the blocks looked up and the blocks copied. If the columns' union exceeds the
+ * pool, column 0's blocks and the blocks the call wrote are placed first and the remaining draft
+ * columns' blocks are dropped; control[3] reports this round's overflow (1 = only draft blocks
+ * were dropped, the caller accepts column 0 alone; 2 = column 0 could not be kept complete, the
+ * caller must refuse the round).
  *
  * A wide call (a prompt chunk) reads its layer from a fully resident staging copy instead, and
  * kv_stream_evict then drops the blocks it wrote from the pool.
@@ -46,13 +50,14 @@ inline constexpr std::int32_t kKvStreamMaxTokens  = 16;
 inline constexpr std::int32_t kKvStreamQueryBlocks = kQsaTopBlocksDefault + 1;
 
 struct KvStreamMap {
-    std::int32_t* table      = nullptr; // [blocks] block -> slot, or -1
-    std::int32_t* slot_block = nullptr; // [slots] slot -> block, or -1
-    std::int32_t* slot_stamp = nullptr; // [slots] the resolve that last used the slot
-    std::int32_t* slot_ref   = nullptr; // [slots] the clock's reference bit
-    std::int32_t* copy_block = nullptr; // [slots + 8] a resolve's copies: block
-    std::int32_t* copy_slot  = nullptr; // [slots + 8] and its slot
-    std::int32_t* control    = nullptr; // epoch, hand, copies, overflow, then u64 counters
+    std::int32_t* table        = nullptr; // [blocks] block -> slot, or -1
+    std::int32_t* slot_block   = nullptr; // [slots] slot -> block, or -1
+    std::int32_t* slot_stamp   = nullptr; // [slots] the resolve that last used the slot
+    std::int32_t* slot_ref     = nullptr; // [slots] the clock's reference bit
+    std::int32_t* copy_block   = nullptr; // [slots + 8] a resolve's copies: block
+    std::int32_t* copy_slot    = nullptr; // [slots + 8] and its slot
+    std::int32_t* copy_primary = nullptr; // [slots + 8] 1 for column 0 or a written block
+    std::int32_t* control      = nullptr; // [16] epoch/hand/copies/overflow, counters, diagnostics
     std::int32_t blocks = 0, slots = 0;
 };
 
@@ -62,6 +67,14 @@ struct KvStreamMap {
 kv_stream_minimum_slots(std::int32_t tokens,
                         std::int32_t query_blocks = kKvStreamQueryBlocks) noexcept {
     return tokens * query_blocks;
+}
+
+// The slots a QSA verification needs when only column 0's shortlist is guaranteed: one query's
+// `stride` selected blocks plus the pages the call itself wrote. The planning floor and
+// kv_stream_resolve's per-call check share this function so they cannot drift apart.
+[[nodiscard]] constexpr std::int32_t
+kv_stream_single_column_slots(std::int32_t stride, std::int32_t tokens) noexcept {
+    return stride + (tokens + kKvStreamPageTokens - 1) / kKvStreamPageTokens;
 }
 
 // Device bytes of one map, and the map laid out in `memory` (256-byte aligned, that many bytes).

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/stream_fallback.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
@@ -718,6 +719,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             device.synchronize();
         }
         check_qsa_stream_overflow();
+        if (qsa_stream_overflow_mask != 0) {
+            // Only an MTP verification round can degrade to column 0 in place. These paths have
+            // no draft columns to discard, so a reported overflow must not be consumed silently.
+            throw std::logic_error(
+                "QSA streamed KV pool overflow outside an MTP verification round; "
+                "raise --kv-resident to widen the pool");
+        }
         observe_masks(lanes);
         timing.end_wait();
 
@@ -960,6 +968,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             device.synchronize();
         }
         check_qsa_stream_overflow();
+        // A stream pool that could not hold every verification column's union keeps column 0's
+        // shortlist complete and drops the draft columns' blocks. Degrade this round in place:
+        // accept no draft, license only column 0's token, and enter the next round with no drafts
+        // so the device's next_drafts from the just-finished round are not consumed. The sync
+        // above already made the overflow words visible; no extra launch or sync is needed.
+        if (qsa_stream_overflow_mask != 0) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint32_t lane = lanes[row];
+                if (!qsa_stream_lane_degraded(qsa_stream_overflow_mask, lane)) { continue; }
+                const MtpRowMetadata degraded       = degrade_mtp_row();
+                mtp_host_egress->accepted_drafts[row] = degraded.accepted_drafts;
+                mtp_host_egress->licensed_counts[row] = degraded.licensed_counts;
+                mtp_host_egress->next_extents[row]    = degraded.next_extents;
+                SequenceState& sequence     = active_sequence(lane);
+                sequence.mtp_draft_count    = 0;
+                sequence.mtp_drafts_pending = false;
+            }
+        }
         observe_masks(lanes);
         timing.end_wait();
 
@@ -1259,6 +1285,13 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             device.synchronize();
         }
         check_qsa_stream_overflow();
+        if (qsa_stream_overflow_mask != 0) {
+            // Only an MTP verification round can degrade to column 0 in place. These paths have
+            // no draft columns to discard, so a reported overflow must not be consumed silently.
+            throw std::logic_error(
+                "QSA streamed KV pool overflow outside an MTP verification round; "
+                "raise --kv-resident to widen the pool");
+        }
         observe_masks(lanes);
         timing.end_wait();
 

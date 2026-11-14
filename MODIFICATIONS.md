@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `40d913db` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 18 files added, 74 modified; no upstream file deleted |
+| Scope | 20 files added, 77 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -96,6 +96,10 @@ offered under the same Apache-2.0 license.
   or disk tier, no anchors, no shared prefixes — and names the flags to lower when
   a request asks for more. Without `--qwen38-27b-qsa` this normalization does not
   run and the catalog behaves exactly as upstream.
+- `runtime/engine/prefill_pacing.h` lets `--prefill-stall-budget-ms` cut a QSA
+  dense prefill step down to one 128-token alignment instead of the 512-token
+  floor every other model keeps; `engine_core.h` selects the finer floor from
+  `EngineOptions::qwen38_27b_qsa`. No cuBLAS option is involved.
 
 ### `ops/kv_stream` — streamed KV
 
@@ -104,11 +108,14 @@ offered under the same Apache-2.0 license.
   the layers stream from pinned host memory. `auto` follows the upstream preset
   (all with device experts, 32,768 with host or disk experts).
 - `src/ops/kv_stream/kv_stream.cu` and `include/ninfer/ops/kv_stream.h` move the
-  authoritative KV to pinned host memory behind one shared staging layer, pin the
-  device pool to the logical page count, and size the pool floor from the
-  attention window and the verification width
-  (`(window blocks + 1) × width`), so a verify's disjoint selections cannot
-  overflow it.
+  authoritative KV to pinned host memory behind one shared staging layer and pin
+  the device pool to one verification column's shortlist plus the pages the call
+  writes (`kv_stream_single_column_slots`). When the columns' union exceeds the
+  pool, the resolve keeps column 0's blocks and the written pages, drops the
+  draft columns' blocks and reports the round's overflow.
+- `program/stream_fallback.h` folds the per-lane overflow words into a round
+  mask; `decode.cpp` degrades an MTP verification to accepting column 0 alone,
+  and refuses a round whose column 0 shortlist could not be kept complete.
 
 ### `serve`, `apps/cli` — the flag surface
 
@@ -153,6 +160,10 @@ offered under the same Apache-2.0 license.
 - Positions: `tests/models/qwen3_5/test_prefill_rope_axes.cpp` pins the axis
   count of cold, prefix-append and multimodal prefills, and the post-media
   `index + rope_delta` equivalence a prefix-append prefill relies on.
+- Overflow fallback: `tests/models/qwen3_5/test_qsa_stream_fallback.cpp` covers
+  the per-lane overflow words, the degradation mask and the degraded MTP row
+  metadata; `tests/ops/test_kv_stream.cpp` pins the one-column pool floor, and
+  `tests/test_prefill_pacing.cpp` covers the QSA step floor.
 - Converter: `tests/convert/test_qwen3_8_27b_qsa_gguf.py` and
   `test_gguf_blocks.py`.
 
@@ -177,14 +188,16 @@ offered under the same Apache-2.0 license.
 ## Known limits
 
 - QSA runs on one device without tensor parallelism, with the hybrid prefix
-  cache, and with CUDA graphs off above one concurrent request (a per-row lane
-  indirection inside the captured kernels is the follow-up).
+  cache, and with CUDA graphs off above one concurrent request. Upstream
+  `qwen4_exp` (native QSA) also runs batches of several sequences eagerly, so a
+  per-row lane indirection inside captured kernels has no upstream
+  implementation to follow.
 - Under QSA the checkpoint catalog is restricted to one conversation's own next
   turn; the hybrid cache is the supported cache for the flag.
 
 ## Files
 
-### Added (18)
+### Added (20)
 
 Root (1)
 
@@ -202,6 +215,10 @@ src/models/qwen3_5/execution (1)
 
 - `src/models/qwen3_5/execution/rope_axes.h`
 
+src/models/qwen3_5/program (1)
+
+- `src/models/qwen3_5/program/stream_fallback.h`
+
 src/product (1)
 
 - `src/product/qsa_top_blocks_options.h`
@@ -210,10 +227,11 @@ tests/convert (1)
 
 - `tests/convert/test_qwen3_8_27b_qsa_gguf.py`
 
-tests/models/qwen3_5 (2)
+tests/models/qwen3_5 (3)
 
 - `tests/models/qwen3_5/test_hybrid_stream_layout.cpp`
 - `tests/models/qwen3_5/test_prefill_rope_axes.cpp`
+- `tests/models/qwen3_5/test_qsa_stream_fallback.cpp`
 
 tools/bench (3)
 
@@ -234,7 +252,7 @@ tools/convert (5)
 - `tools/convert/qsa_gguf.py`
 - `tools/convert/qsa_graft_recipe.py`
 
-### Modified (74)
+### Modified (77)
 
 Root (1)
 
@@ -363,10 +381,12 @@ src/runtime/contract (1)
 
 - `src/runtime/contract/resources.h`
 
-src/runtime/engine (2)
+src/runtime/engine (4)
 
+- `src/runtime/engine/engine_core.h`
 - `src/runtime/engine/kv_capacity.cpp`
 - `src/runtime/engine/model_instance.cpp`
+- `src/runtime/engine/prefill_pacing.h`
 
 src/runtime/prefix_cache (2)
 
@@ -396,11 +416,12 @@ tests/ops (3)
 - `tests/ops/test_qsa_indexer.cpp`
 - `tests/ops/test_sparse_attention.cpp`
 
-tests (5)
+tests (6)
 
 - `tests/test_cli_options.cpp`
 - `tests/test_context_cache_defaults.cpp`
 - `tests/test_kv_capacity.cpp`
+- `tests/test_prefill_pacing.cpp`
 - `tests/test_prefix_cache_index.cpp`
 - `tests/test_serve_options.cpp`
 

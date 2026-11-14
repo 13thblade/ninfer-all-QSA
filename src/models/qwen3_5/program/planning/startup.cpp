@@ -1895,24 +1895,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->steering_vectors    = inputs.steering_vectors;
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
-        // A resolve's verification columns sit at consecutive positions and may pick disjoint
-        // indexer selections, so the pool must hold the disjoint worst case: width columns each
-        // holding its own (budget + 1) blocks. kv_stream_minimum_slots(width, budget + 1) gives
-        // that count, which keeps a verify from ever exceeding the pool or raising the kv_stream
-        // overflow flag. The cost is a larger pool: when worst_case * 4 tokens is not below the
-        // context, streaming is disabled and the whole history stays resident. An explicit
-        // --kv-resident larger than this floor is still honoured.
+        // One verification column holds at most `budget` selected blocks, plus the pages the call
+        // writes. Reserving that bound keeps column 0's shortlist complete when the columns' union
+        // exceeds the pool: resolve_kernel drops the overflowing draft columns' blocks and the
+        // round falls back to column 0 alone, so a disjoint union needs no reservation. When this
+        // floor times four tokens is not below the context, streaming is off and every
+        // full-attention layer keeps its KV resident. An explicit --kv-resident above the floor is
+        // still honoured.
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
+        const std::uint32_t one_column = static_cast<std::uint32_t>(
+            ops::kv_stream_single_column_slots(static_cast<std::int32_t>(budget),
+                                               static_cast<std::int32_t>(width)));
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
-            static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
-                static_cast<std::int32_t>(width),
-                static_cast<std::int32_t>(budget) + 1)));
+            one_column);
         const std::uint32_t pages = page_count(inputs.capacity);
         if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
             impl->stream_slots  = slots;
@@ -1924,17 +1925,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                             .text.attention->num_key_value_heads
                                       : 0;
         } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
-            // The disjoint-selection floor makes a streamed call hold width * (budget + 1) blocks,
-            // which no longer fits the --kv-resident pool against this context; streaming is off and
-            // every full-attention layer keeps its KV resident. A smaller --max-context or
-            // --qsa-top-blocks restores streaming.
+            // The one-column floor still exceeds the context: streaming is off and every
+            // full-attention layer keeps its KV resident.
             impl->stream_warning =
                 "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
-                " tokens: a streamed call holds " +
-                std::to_string(ops::kv_stream_minimum_slots(
-                    static_cast<std::int32_t>(width),
-                    static_cast<std::int32_t>(budget) + 1)) +
-                " blocks (disjoint verification columns), so the " +
+                " tokens: a streamed call needs " + std::to_string(one_column) +
+                " blocks for one verification column, so the " +
                 std::to_string(inputs.capacity) +
                 "-token context no longer fits the --kv-resident pool and every full-attention "
                 "layer keeps its KV resident; a smaller --max-context or "

@@ -258,3 +258,9 @@ ninfer_add_test(ninfer_qwen3_5_hybrid_stream_layout_test
 ninfer_add_test(ninfer_qwen3_5_prefill_rope_axes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefill_rope_axes.cpp"
   LIBRARIES ninfer_model_runtime)
+
+# The streamed-KV overflow fallback: per-lane overflow words, the degradation mask and the
+# MTP row metadata a degraded round publishes (CPU only).
+ninfer_add_test(ninfer_qwen3_5_qsa_stream_fallback_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_stream_fallback.cpp"
+  LIBRARIES ninfer_core)

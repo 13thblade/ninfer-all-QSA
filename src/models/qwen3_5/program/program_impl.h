@@ -1064,6 +1064,9 @@ public:
     std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
     // --kv-resident: the (lane, layer) stream pool overflow words staged by each decode round.
     std::optional<PinnedHostBuffer> qsa_stream_overflow_host;
+    // Lanes whose stream pool overflowed in the round just synchronized. A round keeps column 0's
+    // shortlist complete and degrades to accepting column 0 alone instead of aborting the request.
+    std::uint32_t qsa_stream_overflow_mask = 0;
     // --qwen38-27b-qsa (Legacy cache): the continuation that last wrote each lane's QSA
     // planes (the indexer state and, under --kv-resident, that lane's pinned KV copy). The
     // Legacy StateImage carries no QSA region, so a catalogued continuation can resume its
@@ -2009,7 +2012,8 @@ private:
                         runtime::ExecutionTiming* failed_timing);
     // --kv-resident: enqueues an async copy of every (lane, layer) stream pool overflow word
     // after a decode round's forward pass; the round's device sync covers the copy, and
-    // check_qsa_stream_overflow then refuses a round that reported an overflow.
+    // check_qsa_stream_overflow records the lanes that degrade to column 0 alone (or refuses a
+    // round whose column 0 shortlist could not be kept complete).
     void queue_qsa_stream_overflow_fetch();
     void check_qsa_stream_overflow();
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,

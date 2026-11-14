@@ -116,7 +116,12 @@ public:
           // The Program's step, which may differ from the requested chunk: pacing and the
           // charges of cut steps use the unit the service projection counts.
           prefill_chunk_(std::max<std::uint32_t>(instance.program->prefill_chunk(), 1)),
-          pacing_(options.prefill_stall_budget_ms, context_cost),
+          // QSA dense prefill attends the whole prompt history in one step, so a 512-token
+          // minimum still holds the GPU far past a small stall budget. Its steps may be cut to
+          // one 128-token alignment instead; every other model keeps the 512 floor.
+          pacing_(options.prefill_stall_budget_ms, context_cost,
+                  options.qwen38_27b_qsa ? kPacedPrefillMinimumQsaStep
+                                        : kMinimumPacedPrefillTokens),
           resources_(make_resource_manager(options, std::move(context_cost))),
           suspend_options_(options.suspend) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||

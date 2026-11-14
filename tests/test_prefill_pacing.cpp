@@ -56,6 +56,14 @@ int main() {
     // Nothing goes below 512 tokens, even when 512 itself overruns the budget.
     failures += check(PrefillPacing(1, model).step_cap(0, 2048) == 512,
                       "a step is never cut below the minimum");
+    // QSA dense prefill opts into a finer floor; the default stays byte-for-byte as above.
+    const std::uint32_t qsa_floor = ninfer::runtime::kPacedPrefillMinimumQsaStep;
+    failures += check(PrefillPacing(1, model, qsa_floor).step_cap(0, 2048) == qsa_floor,
+                      "QSA dense prefill may cut a step to one 128-token alignment");
+    failures += check(PrefillPacing(1, model, qsa_floor).step_cap(0, qsa_floor) == 0,
+                      "a step no larger than the QSA minimum stays planned");
+    failures += check(PrefillPacing(1, model, 512).step_cap(0, 2048) == 512,
+                      "an explicit default floor behaves exactly as the unset one");
 
     // 120 ms: 1152 tokens from token zero; after 100K tokens each token also attends to the
     // prefix (0.2 ms more per token), so the step shrinks to 384 by time, and to the minimum.

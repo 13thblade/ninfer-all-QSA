@@ -15,12 +15,15 @@ namespace ninfer::runtime {
 //
 // The Engine runs a whole prefill step between two decode rounds, so a stream decoding next to a
 // long prompt waits one step for each token: about a second per 2048-token chunk of a 27B on an
-// RTX 3090. With a budget the step is cut to the largest multiple of 128 tokens, at least 512, that
-// the prefill cost model predicts to fit it. The model's static costs are scaled by the ratio of
-// observed to predicted step times, so the cap follows the card and model it runs on; a deeper
-// prefix, with more attention per token, is cut harder. Nothing here touches the GPU.
-inline constexpr std::uint32_t kPacedPrefillAlignment     = 128;
-inline constexpr std::uint32_t kMinimumPacedPrefillTokens = 512;
+// RTX 3090. With a budget the step is cut to the largest multiple of 128 tokens, never below the
+// configured minimum, that the prefill cost model predicts to fit it. The model's static costs are
+// scaled by the ratio of observed to predicted step times, so the cap follows the card and model
+// it runs on; a deeper prefix, with more attention per token, is cut harder. QSA dense prefill
+// attends the whole history once per step, so it admits a finer minimum; every other model keeps
+// the default. Nothing here touches the GPU.
+inline constexpr std::uint32_t kPacedPrefillAlignment       = 128;
+inline constexpr std::uint32_t kMinimumPacedPrefillTokens   = 512;
+inline constexpr std::uint32_t kPacedPrefillMinimumQsaStep  = 128;
 inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 
 // Predicted time of one prefill step of `tokens` after `prefix` tokens.
@@ -56,15 +59,17 @@ inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 class PrefillPacing {
 public:
     PrefillPacing() = default;
-    PrefillPacing(std::uint32_t stall_budget_ms, ContextMachineCostModel costs) noexcept
-        : budget_ns_(static_cast<double>(stall_budget_ms) * 1e6), costs_(costs) {}
+    PrefillPacing(std::uint32_t stall_budget_ms, ContextMachineCostModel costs,
+                  std::uint32_t minimum_step = kMinimumPacedPrefillTokens) noexcept
+        : budget_ns_(static_cast<double>(stall_budget_ms) * 1e6), costs_(costs),
+          minimum_step_(minimum_step) {}
 
     [[nodiscard]] bool enabled() const noexcept { return budget_ns_ > 0.0; }
 
     // The tokens the next step may take, or 0 for the planned step. `planned` is the step the plan
     // would run (already clipped to the rest of the prompt) after `prefix` tokens.
     [[nodiscard]] std::uint32_t step_cap(std::uint64_t prefix, std::uint32_t planned) const noexcept {
-        if (!enabled() || planned <= kMinimumPacedPrefillTokens) { return 0; }
+        if (!enabled() || planned <= minimum_step_) { return 0; }
         const auto fits = [&](std::uint64_t tokens) {
             return static_cast<double>(predicted_prefill_step_ns(costs_, prefix, tokens)) *
                        correction_ <=
@@ -72,8 +77,8 @@ public:
         };
         if (fits(planned)) { return 0; }
         // The prediction grows with the step: the largest affordable multiple of the alignment,
-        // by bisection over multiples, and never below the minimum step.
-        std::uint32_t low  = kMinimumPacedPrefillTokens / kPacedPrefillAlignment;
+        // by bisection over multiples, and never below the configured minimum.
+        std::uint32_t low  = minimum_step_ / kPacedPrefillAlignment;
         std::uint32_t high = (planned - 1U) / kPacedPrefillAlignment;
         if (high < low) { return 0; }
         while (low < high) {
@@ -109,6 +114,7 @@ private:
     double budget_ns_ = 0.0;
     ContextMachineCostModel costs_;
     double correction_ = 1.0;
+    std::uint32_t minimum_step_ = kMinimumPacedPrefillTokens;
 };
 
 } // namespace ninfer::runtime

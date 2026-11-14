@@ -1,6 +1,7 @@
 #include "core/device_wait.h"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/stream_fallback.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -1142,17 +1143,20 @@ void ProgramImpl::queue_qsa_stream_overflow_fetch() {
 }
 
 void ProgramImpl::check_qsa_stream_overflow() {
+    qsa_stream_overflow_mask = 0;
     if (!qsa_stream_state.has_value() || !qsa_stream_overflow_host) { return; }
     const qwen3_5::QsaStreamState& stream = *qsa_stream_state;
     const std::int32_t* words = static_cast<const std::int32_t*>(qsa_stream_overflow_host->data());
-    for (std::uint32_t lane = 0; lane < stream.lanes; ++lane) {
-        for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
-            if (words[lane * stream.layers + layer] != 0) {
-                throw std::logic_error(
-                    "QSA streamed KV pool overflow: lane " + std::to_string(lane) + " layer " +
-                    std::to_string(layer) + " needed more of its " + std::to_string(stream.slots) +
-                    "-slot pool than it has; raise --kv-resident to widen the pool");
-            }
+    for (std::uint32_t lane = 0;
+         lane < stream.lanes && lane < kQsaStreamLaneMaskBits; ++lane) {
+        if (!fold_qsa_stream_lane(words + static_cast<std::size_t>(lane) * stream.layers,
+                                  stream.layers, lane, qsa_stream_overflow_mask)) {
+            // Column 0 is dirty: no in-place degradation can return a correct token.
+            throw std::logic_error(
+                "QSA streamed KV pool overflow: lane " + std::to_string(lane) +
+                " could not keep column 0's shortlist in its " +
+                std::to_string(stream.slots) +
+                "-slot pool; raise --kv-resident to widen the pool");
         }
     }
 }

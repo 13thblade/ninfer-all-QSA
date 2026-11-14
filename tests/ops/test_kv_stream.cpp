@@ -390,6 +390,12 @@ int run(KvCacheStorage storage, const Plan& plan, std::uint32_t seed) {
 } // namespace
 
 int main() {
+    // The one-column floor shared by startup planning and kv_stream_resolve: one query's
+    // selection plus the pages the call wrote, not the disjoint union of every column.
+    static_assert(ops::kv_stream_single_column_slots(2048, 4) == 2049);
+    static_assert(ops::kv_stream_single_column_slots(512, 16) == 516);
+    static_assert(ops::kv_stream_single_column_slots(2048, 4) <
+                  ops::kv_stream_minimum_slots(4, 2049));
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
