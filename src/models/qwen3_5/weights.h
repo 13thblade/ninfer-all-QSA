@@ -64,9 +64,16 @@ struct VisionOverlayLayout {
     std::size_t staging_bytes = 0;
 };
 
+/// The five indexer parameters of a QSA-27B full-attention text layer. The MTP
+/// block has no trained indexer (the QSA fork's qwen35.cpp keeps every MTP key).
+struct QsaIndexerWeights {
+    WeightId query, key, query_norm, key_norm, key_pre_norm;
+};
+
 struct AttentionWeights {
     WeightId query, key, gate, value;
     WeightId query_norm, key_norm, output;
+    std::optional<QsaIndexerWeights> qsa;
 };
 
 struct GdnWeights {

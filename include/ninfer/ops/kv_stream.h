@@ -2,6 +2,7 @@
 
 #include "core/paged_kv_view.h"
 #include "core/tensor.h"
+#include "ninfer/ops/qsa_budget.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -26,7 +27,9 @@ namespace ninfer::ops {
  * first .. first + tokens - 1, after the append that wrote those positions into the host copy,
  * kv_stream_resolve makes resident every block the attention reads: each query's selected blocks
  * and its own incomplete block. A block that is missing takes a slot no block of this call uses,
- * by a CLOCK sweep (second chance), and is copied from the host copy. Blocks the append wrote
+ * by a CLOCK sweep (second chance), and is copied from the host copy -- or, when the host copy
+ * does not hold it (the lane's prefix under the streamed tier), from the prefix source the
+ * caller names per 64-position block run. Blocks the append wrote
  * (first / 4 .. (first + tokens - 1) / 4) are copied again when the call reads them and evicted
  * when it does not, so no slot ever holds bytes older than the host copy. The map's counters
  * record the calls, the blocks looked up and the blocks copied.
@@ -39,8 +42,8 @@ namespace ninfer::ops {
  */
 inline constexpr std::int32_t kKvStreamPageTokens = 4;
 inline constexpr std::int32_t kKvStreamMaxTokens  = 16;
-// The most blocks one query references: its 512 selected blocks and its own incomplete block.
-inline constexpr std::int32_t kKvStreamQueryBlocks = 513;
+// The most blocks one query references: its selected blocks and its own incomplete block.
+inline constexpr std::int32_t kKvStreamQueryBlocks = kQsaTopBlocksDefault + 1;
 
 struct KvStreamMap {
     std::int32_t* table      = nullptr; // [blocks] block -> slot, or -1
@@ -53,9 +56,12 @@ struct KvStreamMap {
     std::int32_t blocks = 0, slots = 0;
 };
 
-// The slots a pool needs so that one call of `tokens` queries always fits.
-[[nodiscard]] constexpr std::int32_t kv_stream_minimum_slots(std::int32_t tokens) noexcept {
-    return tokens * kKvStreamQueryBlocks;
+// The slots a pool needs so that one call of `tokens` queries always fits, each query holding
+// `query_blocks` blocks (its selection plus its own incomplete block).
+[[nodiscard]] constexpr std::int32_t
+kv_stream_minimum_slots(std::int32_t tokens,
+                        std::int32_t query_blocks = kKvStreamQueryBlocks) noexcept {
+    return tokens * query_blocks;
 }
 
 // Device bytes of one map, and the map laid out in `memory` (256-byte aligned, that many bytes).
@@ -65,12 +71,47 @@ struct KvStreamMap {
 // Every block evicted, every slot free, the counters zero. Capturable.
 void kv_stream_reset(const KvStreamMap& map, cudaStream_t stream);
 
-// See above. `selected` I32 [512, tokens] and `counts` I32 [tokens] are the indexer's blocks,
-// `first_position` a device I32 word; `host` the host copy (identity layout), `pool` the device
-// pool (its block_table the map's table). Capturable: every size it launches with is fixed.
+// One run of the lane's prefix blocks: the 64-position blocks
+// [first_block, first_block + count) whose block records live in one pinned source
+// (a writer's per-sequence stream image, or a snapshot's tail slab record), the first
+// block's record at `base`. A block record packs the streamed layer pages in layer
+// order; the record-to-record distance is the caller's `record_stride`, and each
+// layer page's planes sit at `plane_offset[a]` within the record (exclusive of the
+// plane's own within-page offset). The source's page layout is the host copy's: one
+// 64-position page of [leading, 64, heads] per plane.
+struct KvStreamPrefixSegment {
+    std::uint64_t base        = 0; // pinned host memory, one block record at a time
+    std::uint32_t first_block = 0;
+    std::uint32_t count       = 0;
+};
+
+// Where the copy kernel takes the blocks the host copy does not hold (the lane's
+// prefix, streamed tier): a device-readable table of segments and the record geometry.
+// Every segment's source must stay valid for the lane's whole lifetime.
+struct KvStreamPrefixSource {
+    const KvStreamPrefixSegment* segments = nullptr;
+    std::uint32_t segment_count           = 0;
+    std::uint64_t record_stride           = 0;
+    std::uint64_t plane_offset[4]         = {0, 0, 0, 0};
+};
+
+// See above. `selected` I32 [top_blocks, tokens], its width the indexer's budget, and `counts`
+// I32 [tokens] are the indexer's blocks, `first_position` a device I32 word; `host` the host copy
+// (identity layout), `pool` the device pool (its block_table the map's table). A block the host
+// copy does not hold (the lane's prefix, streamed tier) names its source in `prefix` instead.
+// Capturable: every size it launches with is fixed; the selection width is read from `selected`.
 void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const Tensor& selected, const Tensor& counts, const PagedKVLayerView& host,
-                       const PagedKVLayerView& pool, cudaStream_t stream);
+                       const PagedKVLayerView& pool, const KvStreamPrefixSource& prefix,
+                       cudaStream_t stream);
+// The dense-tier form: every block the host copy does not hold is impossible, so the prefix
+// source is empty.
+inline void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
+                              const Tensor& selected, const Tensor& counts,
+                              const PagedKVLayerView& host, const PagedKVLayerView& pool,
+                              cudaStream_t stream) {
+    kv_stream_resolve(map, first_position, selected, counts, host, pool, {}, stream);
+}
 
 // Evicts the resident blocks among [first_block, end_block).
 void kv_stream_evict(const KvStreamMap& map, std::int32_t first_block, std::int32_t end_block,

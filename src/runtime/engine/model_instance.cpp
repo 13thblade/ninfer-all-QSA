@@ -19,6 +19,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/expert_admission.h"
+#include "ninfer/ops/qsa_budget.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
 #include "runtime/contract/rope_scaling.h"
@@ -134,6 +135,12 @@ void validate_options(const EngineOptions& options) {
         (options.rope_yarn || options.rope_yarn_factor > 1.0F)) {
         throw std::invalid_argument(
             "Engine rope_scaling_factor excludes rope_yarn and rope_yarn_factor");
+    }
+    // --qsa-top-blocks: a block count within the ops' cap; no token conversion here.
+    constexpr std::uint32_t kQsaMaxBlocks = static_cast<std::uint32_t>(ops::kQsaTopBlocksMax);
+    if (options.qsa_top_blocks > kQsaMaxBlocks) {
+        throw std::invalid_argument("Engine qsa_top_blocks must be at most " +
+                                    std::to_string(kQsaMaxBlocks));
     }
 }
 
@@ -339,6 +346,60 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // A direct graft lives in a pinned Legacy shared-prefix slot; the hybrid tree has none.
         throw std::invalid_argument("direct grafts require the legacy context cache");
     }
+    if (options.qwen38_27b_qsa && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
+        // The sparse branch keeps its per-layer indexer planes per lane, and under
+        // --kv-resident the authoritative pinned KV copy, in per-Program state that the
+        // Legacy StateImage does not carry. A catalogued continuation can therefore resume
+        // only while it still owns the lane admission will give it (the lowest free one):
+        // one conversation's own next turn, which is the reuse that matters (a prompt that
+        // only grows) and the only one the lane's planes can support without being repooled.
+        // Keep exactly that much of the catalog:
+        //  - one Device checkpoint slot, no Host or disk tier: a spilled continuation would come
+        //    back beside a lane another sequence has since repooled;
+        //  - no anchors and no shared prefixes: every one of them restores a state image at a
+        //    frontier the lane's planes have already passed;
+        //  - no stop-string hold images, for the same reason (a hold rewinds the state).
+        // Under the hybrid cache the indexer planes ride in the StateImage (pooled keys, live
+        // tail, tail axes), so a snapshot carries the QSA state out and a resume lands it back;
+        // that shape falls through to the generic hybrid normalization below.
+        if (cache.host_cache_budget_bytes || cache.host_cache_auto) {
+            throw std::invalid_argument(
+                "the QSA sparse branch cannot spill its one conversation to a Host cache: the "
+                "indexer planes stay in Device scratch");
+        }
+        if ((cache.device_state_slots && *cache.device_state_slots > 1) ||
+            (cache.max_private_continuations && *cache.max_private_continuations != 1) ||
+            (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
+            (cache.max_long_anchors_per_continuation &&
+             *cache.max_long_anchors_per_continuation != 0)) {
+            throw std::invalid_argument(
+                "the QSA sparse branch retains one conversation beside its indexer scratch: the "
+                "context cache accepts one Device state slot, one private continuation, no "
+                "shared prefixes and no long anchors");
+        }
+        cache.device_state_slots                = 1;
+        cache.max_private_continuations         = 1;
+        cache.max_shared_prefixes               = 0;
+        cache.max_long_anchors_per_continuation = 0;
+        cache.host_state_slots                  = 0;
+        cache.host_kv_capacity_bytes            = 0;
+        cache.max_cache_markers_per_request     = 0;
+        cache.disk_kv_path.clear();
+        cache.disk_kv_restore       = false;
+        cache.disk_kv_directstorage = false;
+        cache.rolling_retention            = false;
+        cache.release_diverged_checkpoints = false;
+        cache.thorough_admission_search    = false;
+        cache.recency_eviction             = false;
+        cache.value_aware_demote           = false;
+        cache.kv_lease_growth              = false;
+        cache.automatic_long_anchors       = false;
+        cache.branch_anchors               = false;
+        cache.endpoint_anchors             = false;
+        cache.progress_anchor_tokens       = 0;
+        cache.stop_hold_images             = false;
+        return options;
+    }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
         if (cache.device_state_slots || cache.max_private_continuations ||
             cache.max_shared_prefixes || cache.max_long_anchors_per_continuation) {
@@ -440,7 +501,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.progress_anchor_tokens       = 0;
         return options;
     }
-
     cache.device_state_slots = cache.device_state_slots.value_or(concurrency) + direct_grafts;
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
@@ -487,7 +547,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+    : model(std::move(source)), parameters(*model, options.qsa_top_blocks),
       steering(load_engine_steering(options, model->config().text)),
       frontend(models::qwen3_5::make_frontend(
           model->resources(),
@@ -933,6 +993,41 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             plan_sequences();
         }
     };
+    // --qwen38-27b-qsa: each lane carries its own KV pages and indexer planes beside its
+    // stream state, so a multi-lane request multiplies the per-lane cost. The generic
+    // resolver's failure hint only names --kv-capacity and --max-context, so when the
+    // explicit window cannot be held on every lane, reject earlier with the lane levers
+    // named (plan: an actionable refusal, not a generic OOM).
+    if (options.qwen38_27b_qsa && options.max_concurrency > 1 &&
+        options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        const auto& base       = planner->capacity_curve();
+        SequenceCapacityCurve fitted = base;
+        if (base.state_slots_automatic && base.bytes_per_state_slot != 0) {
+            // Default slots yield to the capacity, as resolve_kv_capacity would do.
+            while (fitted.state_slots > base.minimum_state_slots &&
+                   !kv_capacity_fits(options.kv_capacity, fitted, free_by_rank.front(),
+                                      extra_free)) {
+                fitted.state_slots -= 1;
+                fitted.minimum_device_reservation_bytes -= base.bytes_per_state_slot;
+                for (auto& rank : fitted.extra_ranks) {
+                    rank.minimum_device_reservation_bytes -= rank.bytes_per_state_slot;
+                }
+            }
+        }
+        if (!kv_capacity_fits(options.kv_capacity, fitted, free_by_rank.front(), extra_free)) {
+            std::string hint = "lower --max-context, or lower --max-concurrency";
+            if (!options.kv_resident_positions.has_value()) {
+                hint += ", or add --kv-resident to move each lane's KV copy from device "
+                        "memory to pinned host memory";
+            }
+            throw std::invalid_argument(
+                "the QSA sparse branch keeps each lane's KV pages and indexer planes beside "
+                "its stream state, and the explicit --max-context window does not fit " +
+                std::to_string(options.max_concurrency) +
+                " concurrent lanes after weights; " + hint);
+        }
+    }
     auto resolution = resolve_capacity();
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
@@ -992,6 +1087,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // Publishing that shape to the options the Engine keeps — and to the frontend grid built
     // before the plan existed — keeps the reported options, the ResourceManager and the Program
     // on the same capacity instead of a silently divergent default.
+    if (!sequence.stream_warning().empty()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                           sequence.stream_warning().c_str());
+    }
     EngineOptions resolved = options;
     resolved.context_cache = sequence.context_cache_options();
     instance->frontend.publish_long_anchor_limit(

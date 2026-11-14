@@ -1,0 +1,682 @@
+{
+  "asset_bytes": 209747816,
+  "asset_sha256": "51708f03b5187db0da3881fdec41716159d6335af060a120b342f7bc5d82bb4e",
+  "git_note": "*.safetensors is gitignored; ship as a GitHub Release attachment verified against asset_sha256, or rebuild from a donor GGUF",
+  "precision": "F32 (donor native, verbatim)",
+  "source_donor": "Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf",
+  "tensor_count": 80,
+  "tensors": {
+    "blk.11.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "a16b1b27e27148747d664a1829ae13632fcc345a61a53f50f381cf1eef725fb6",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.11.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "ea98a99652dd9ee0a8434f42fa68af18dcfb67d0f1c94256a8b85d650259cec1",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.11.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "bbc6f71ed17656f893d9af5fc2c22e36d786a161bd99ea30f1592563a73fd99c",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.11.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "2450bb1af81f7b187c812d257ec1979b5324f1a16bc4e266ac996695175f1c7f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.11.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "fc8d5248cee59ee4308b1671bd840a50fa26fc6d25ab038f8758dc0f6f4e03e9",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.15.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "18ce6e8095375994b7b7cb4c887eb48cac927f678d600e6946170e0ce4892657",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.15.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "6311fc217f47ac56a0e729a8400ab7cc06721aedc001a5b211b7b2f8274fd064",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.15.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "6b25c2380fec6f015bd8f525143444c720c51a1b4d332cb39c3ff7ae6440fb03",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.15.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "6b84ad28d89c76f245a3ac404e7826514667abada1b411e39f2043446877e948",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.15.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "9895e369e9ed9e49361e24d27709332353598b691d0bc96370905002a7d64076",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.19.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "7538128061906b62bc2573636ccaacc21ea16c161e6de937cc320e6675c112d5",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.19.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "2b9dbad6a1c9aa4fd5cce6e90ae177c0130ef492d3fd692941c5b7f25543f200",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.19.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "a6d2930023737f7a50da59eaf19ac33711854068a1dbb93565192e5d839292a0",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.19.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "79d26e504423ff2d2e7119886425481fc82cbc6aa1c15b994ad3c52e58bb121f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.19.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "15acad1ab6a84cc739d49c2e262b2fe7e9d07eeae7102a3e85a770e5a22b3be9",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.23.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "8ab85d872bbf309404a81f0caa5f3aa27338aae8d09171adea639b105221eb6d",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.23.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f7253eea703d42794964567782b0cab1b58d3e0dbe7aa0258da8f3079761a924",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.23.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "b2737b1ec1695062fbfa13de05c840be8f1b499dad8c9af2f6d8bdc94c95087d",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.23.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "da2a72a49e8b81366437156ac5f8ee5345be21e9ae0d6a925166a4951ba7902c",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.23.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "b78ed721eb8362c11ce9f40295ebb600e37d9233ea27f559db138c87154c21c5",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.27.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "71db375bc0c301041a4557579fa898114699d0804cd0abac260968f7cf262e42",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.27.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "8ed11df7239726a578f035b330afbca33f1182d2559ebae412a39382db98a05c",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.27.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "e8c461f6097bfeeba35cf136e280356d225e12fed417e878a7a03b268fdcdf53",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.27.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "3e197f4fe020bee1cb00a93b6396838468237204066010fa7743d65b00fdeecb",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.27.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "89e8143012f5b265dd54f3db3813a4c2e87cfc4743a71c4806b6a6b6ece4c80e",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.3.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "3827f4deebcd0043e1f94b61aa1717ea71e109e7f2c74d2fda1b28a30fc55aa2",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.3.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "816ffa1d98763443c3cd37e2c1802ea665dc780991b139e041c8c9532705b666",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.3.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "1389f5598a5cb8589c1c45191ccaf63de7ae36a0cafb3211f469971fa7bc9cc3",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.3.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "872a740188a44f5596cdfeae96c0d0f39085c02795e5eb57ab014502626f13f3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.3.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "3b6a506b9d390791dd7aea9c9dacc1e4c4872937ed894e9a36b220e2f22e52e7",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.31.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "4de501ee22511580fe257c3cc2c3c1c7f8cec00c072888b6644b68f7c87c89fb",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.31.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f9d1028a770113f5f8994cd20f5efe73b35bb756eb0d7155b35973bfba1b6b24",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.31.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "011bacb09a4c2ff60cdab329d72319fed138a1ef86739abe6d79dae294403900",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.31.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "c283853167b4074e79739cc569aafbe21414ad07d2975a25b1afe1ab82871181",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.31.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "0f01bcb91910b8fe2d5d1e322943cc9e64df020e58cadc02e4d72e27ffa88087",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.35.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "e0f258a750bef5bbfe909d42a638457aae695aa74de00d57e8b17a756e677cf3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.35.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5c42cdb4cffecd4df706aaf53df87136ab2eb396dac69fa283ff09618bf17d66",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.35.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "ccc0302a6d3fc4c13f4ec712106f7f775113bdbe51915bad8484b291cb8ab530",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.35.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5d6da354cc189c0efa82ee0ec974837a91a006c33c0c92b5bad800285bd03afa",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.35.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "9ecf154d3afb0bbb817a69963ea7e839a54693c78eba9c1336e0817dac3254be",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.39.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "b2489b607565e5465a14e1e21dcf89f9c0edd9e92b0ec96d10a235d7ea4871c5",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.39.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "950ca1b1913fef0ee2fec645712a87a60e613fdd5b48815f8420aaf98cbcb465",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.39.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "e48e955c8aaf5656216d643fb7589eeafff27cc6e040f0e04f71aedf784acc5a",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.39.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "cc51912d76efe525332b62c6435821d8aeca2a2cd77fc4b2e20c85e2c7275d81",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.39.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "f9f7420ef17b8827b98a92423075d7103192cb46d79aab4914a73f6cbf13f544",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.43.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "2338f2cad11df6ef6f6461c0831471e24eca474d1eca8a3d4ee3cd0200352b5b",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.43.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e3634f2426c8e8c19cbb2b3e125a5cf27c662c0540ff76d8759cc2acdeda77f1",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.43.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "10939d40c7bf26ca22d2952686613fc08021a2428392b0d2622adafc25404262",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.43.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "a477467b77044dda545b4fa3c94fc45534c238d0c0b229ca134916bd804ac31d",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.43.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "778c91e3a123341e48f3126ebc310608a09235e5df60a60b72460cc46addff68",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.47.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "27602b7eb7720946882f9f931a936a12d71ae7861831698c019530e2b115dd99",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.47.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "666986c1be0aad8dfa35cecb5935445c2f5a1f38b49e053cecf416e8d3d239fe",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.47.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "97cf1e9ac5cbd9bf8a378e93467dffb71c2692886d619d45cbe839f46af206ea",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.47.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5edb22a35f45747bec79b4829dc955c96f6eccc86dfd66cdd0f41a49e949d7c3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.47.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "e43440ec6d9e9791ef04b9687cd265640fc30222eb6a01018d6b55d11ae838de",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.51.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "9811ba03be87bd78be70f704c5f4838b1e4dbfc6a2b89cbe3cbd0ff2b82afe76",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.51.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "44ae8dad654c2e961191c810e1a014c331d84259fd986c0bb426e80224c93acf",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.51.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "71ab2e4fb1f00036820936a766a07243616b7e478c3959967f7cf6f2bafc416b",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.51.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "29f04fbb31c9496d19d08071644bfa96fedf1d7f7454641d867f7333db79e436",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.51.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "84858919ac64b390b6c82a8c769ee2482c1ab38e1b7cde6b6320ee608c57d5da",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.55.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "745ca6043fb8b4aa1440152c3f0b72e6959f79d3d700ee7ffa412ae42fc850a4",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.55.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "85c40f0a343c9c241ca652a9ac34ed1fa157b67cdc1b025ce51d7bc92cfcca18",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.55.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "6187568aa2136720aaa528c97215cce8795000a8ef190b4dd9225c66ad729782",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.55.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "cab41f2bdb5bf8c388d8466ac694bfdf02d77a095ffec82a4e8e5bdc29b790b0",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.55.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "06058566a221a3ca2c91b5928614c509322b2f1fb364e644fc3a939e9ad5b0db",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.59.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "82e505841936410b3a963328e2ea78d9cd8f7ea290b871c43c0d28041cf2e568",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.59.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "20a5f91e9f36370bf2e60626c2714e3cc947a92d5381c7ab9ec4ccc6e109494e",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.59.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "b6b56c9aa644eff2d3090ac8dcd7176d58969397fbd7689e9c65a96da0bba1ef",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.59.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "a58d704ca482baf985ae144853ccfe40b04d3663a2d7853822b9088ec9c94e21",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.59.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "a183575ef64b044cdbc002298bcbe570cd6d5e13a9c9b7cc39b61ddcd2647f96",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.63.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "7133fa4f04ef00f4f83dd604b85bb395665dfd4911260764be9a1e0bd66c56a2",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.63.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "36cf56d171c6428adb712bf57cc6cc1a5bbab7863a3e1d4774ed57209be04be9",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.63.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "911f16af36b54cf2e3a07eaf2eaaf99b6d5da1a41efaeb072ba74864ecc028d7",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.63.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e755aee6fc1255b6f9496bf71a1c7c385e22ad9816a6074e9fc822db23c854d7",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.63.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "394c52b72300e62b6cd81113199c80e35e334d36bad47a6205838d3230f7eaad",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.7.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "2d8deed87ae132d49244b815ea409b35e4fed81a283a98e3b840dfbdd22bb3fd",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.7.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "da8f67fc718944310fb7b9a07845ac8488a95461211d0c67a6649e01b05be973",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.7.indexer.k_proj.weight": {
+      "dtype": "F32",
+      "sha256": "2145588de5e72a685858239fdc6db8e9a856c395cd7c99305732e083e6823467",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.7.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "70b8583b4c9e26cc19656c9530e48aad2e676865f5b8ff8e989b950d71829f8f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    },
+    "blk.7.indexer.q_proj.weight": {
+      "dtype": "F32",
+      "sha256": "726440c13200c49031fe10af336cb5018cf3abcdd0c44b0a7e23b7f88ff10207",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "verbatim donor value (norms still carry 1 + w)"
+    }
+  }
+}

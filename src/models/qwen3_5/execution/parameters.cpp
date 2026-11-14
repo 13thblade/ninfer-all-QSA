@@ -4,6 +4,8 @@
 
 #include "core/weight_view.h"
 
+#include "ninfer/ops/qsa_budget.h"
+
 #include <array>
 #include <limits>
 #include <type_traits>
@@ -25,7 +27,9 @@ auto with_context(const std::string& context, Function&& function) {
 
 class Prepare {
 public:
-    explicit Prepare(const Model& model) : model_(model) {}
+    // `qsa_block_budget` is --qsa-top-blocks in blocks, or zero for the artifact's own.
+    explicit Prepare(const Model& model, std::uint32_t qsa_block_budget = 0)
+        : model_(model), qsa_block_budget_(qsa_block_budget) {}
 
     // The integer-activation route is an sm_86 addition: it feeds groupwise-int weights to the s8
     // tensor cores, which Ampere has and which no A16 route uses. It is registered per exact shape
@@ -417,8 +421,30 @@ public:
                                7168, 5120);
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
-            out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
-                                            tensor(a->key_norm), std::move(attention_output)};
+            if (a->qsa) {
+                // The indexer reads the normalized residual the attention input does: the
+                // fused norm and projection routes skip staging it, so a QSA layer forces
+                // the unfused path at execution, and its projections take the same basis
+                // the attention input's do.
+                QsaIndexerParameters qsa;
+                qsa.query = rotated_linear(a->qsa->query);
+                qsa.key   = rotated_linear(a->qsa->key);
+                qsa.query_norm   = tensor(a->qsa->query_norm);
+                qsa.key_norm     = tensor(a->qsa->key_norm);
+                qsa.key_pre_norm = tensor(a->qsa->key_pre_norm);
+                const auto& q = model_.config().text.qsa.value();
+                qsa.query_rows     = static_cast<std::uint32_t>(
+                    std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim);
+                qsa.key_rows       = q.indexer_head_dim;
+                qsa.compress_ratio = q.indexer_compress_ratio;
+                qsa.block_budget   = qsa_block_budget_ != 0 ? qsa_block_budget_ : q.block_budget();
+                out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
+                                                tensor(a->key_norm), std::move(attention_output),
+                                                std::move(qsa)};
+            } else {
+                out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
+                                                tensor(a->key_norm), std::move(attention_output)};
+            }
             out.projection_prefetch =
                 prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {
@@ -676,12 +702,25 @@ public:
 
 private:
     const Model& model_;
+    // --qsa-top-blocks in blocks: nonzero replaces the artifact's indexer budget.
+    std::uint32_t qsa_block_budget_ = 0;
 };
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
-    const Prepare prepare(model);
+Parameters::Parameters(const Model& source, std::uint32_t qsa_top_blocks) : model(source) {
+    // --qsa-top-blocks: the indexer's selection width, already in blocks. Zero keeps the
+    // artifact's own budget; anything else must sit inside the range the ops compile in
+    // (validate_options checks it too).
+    if (qsa_top_blocks > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)) {
+        throw std::invalid_argument("qsa_top_blocks must be at most " +
+                                    std::to_string(static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)));
+    }
+    const std::uint32_t qsa_blocks = qsa_top_blocks;
+    if (const auto& artifact_qsa = model.config().text.qsa) {
+        text.qsa_block_budget = qsa_blocks != 0 ? qsa_blocks : artifact_qsa->block_budget();
+    }
+    const Prepare prepare(model, qsa_blocks);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head        = prepare.head(w.text.output_head_use);

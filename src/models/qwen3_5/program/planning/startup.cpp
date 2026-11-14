@@ -15,6 +15,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/paged_kv_storage.h"
 #include "core/tensor_parallel.h"
 #include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -26,15 +27,20 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/sparse_attention.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "models/dspine/drafter.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
+#include "ninfer/base.h"
+#include "ninfer/model_enums.h"
 #include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
@@ -49,6 +55,19 @@ namespace {
 
 using execution::dimension;
 namespace workspace = execution::workspace;
+
+// --kv-resident's "auto" is resolved exactly as upstream qwen4_exp_core.cpp:337-338
+// does: device experts keep every position resident, while host/disk experts
+// trade device KV for expert slots using the default hot window. QSA-27B has
+// no host experts by default (EngineOptions::expert_residency == Device), so
+// enabling --qwen38-27b-qsa alone leaves streaming off, matching upstream.
+// An explicit N / all / auto goes through the shared parse_kv_resident_option.
+std::uint32_t resolved_kv_resident_positions(const EngineOptions& options) {
+    return options.kv_resident_positions.value_or(
+        options.expert_residency == ExpertResidency::Device
+            ? 0U
+            : kDefaultKvResidentPositions);
+}
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
@@ -222,10 +241,40 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.features.mtp() && parameters.mtp && !parameters.mtp->rank_attention.empty()) {
         mtp_kv_head_shares = kv_head_shares;
     }
+    // --kv-resident under QSA: the authoritative KV of every full-attention layer lives in
+    // pinned host memory at the full history size, and a wide prefill stages that history into
+    // one shared 64-position device layer before reading it densely. Keep exactly one device
+    // layer instead of sixteen. Neither device pool may shrink below the full history -- the
+    // staging layer holds ceil(F / 64) pages at frontier F, and the MTP pool reads its complete
+    // history on every verification (dense, never streamed).
+    //
+    // Under stream that single device text layer has TWO jobs: it is the shared dense-prefill
+    // staging buffer (one full history = logical_pages), and it is the physical page pool every
+    // lane's text address space reserves its entitlement from. Those reserved pages are
+    // bookkeeping placeholders the sparse branch never reads (the pinned host copy is the
+    // authority), but admission and block publication still need distinct page ids for each live
+    // lane: pinning the pool to logical_pages makes C near-full-history sessions look like C*L
+    // pages against an L-page pool, so a later turn is refused with a Paged KV pool reservation
+    // error even though host RAM already holds all C histories. Give the pool C*L page groups;
+    // the staging copy still addresses only its first L pages through the identity table, the MTP
+    // pool stays at L (+draft window), and every address space keeps its L-page cap.
+    const std::uint32_t stream_text_pages = static_cast<std::uint32_t>(checked_i32(
+        static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages,
+        "QSA streamed text KV page pool exceeds int32"));
+    const std::uint32_t text_page_groups =
+        plan.stream_slots != 0 ? stream_text_pages : physical_pages;
+    const std::uint32_t mtp_page_groups =
+        plan.stream_slots != 0
+            ? static_cast<std::uint32_t>(
+                  checked_i32(static_cast<std::uint64_t>(logical_pages) + mtp_extra_pages,
+                              "MTP Paged KV physical pages exceed int32"))
+            : mtp_physical_pages;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
         builder_pointers, qwen3_5::DecoderStateSpec{
-                              .full_attention_layers = config.full_attention_layers,
+                              .full_attention_layers = plan.stream_slots != 0
+                                                           ? 1U
+                                                           : config.full_attention_layers,
                               .mtp_layers            = 1,
                               .capacity              = plan.capacity,
                               .kv_heads = dimension(config.attention->num_key_value_heads),
@@ -233,14 +282,93 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .kv_storage         = plan.kv_storage,
                               .enable_mtp         = plan.features.mtp(),
                               .kv_table_rows      = static_cast<std::int32_t>(plan.max_concurrency),
-                              .text_physical_page_groups = physical_pages,
-                              .mtp_physical_page_groups  = mtp_physical_pages,
+                              .text_physical_page_groups = text_page_groups,
+                              .mtp_physical_page_groups  = mtp_page_groups,
                               .text_layer_rank           = std::move(attention_layer_rank),
                               .text_kv_head_shares       = std::move(kv_head_shares),
                               .text_kv_position_ranks    = kv_position_ranks,
                               .mtp_kv_head_shares        = std::move(mtp_kv_head_shares),
                               .invariant_attention       = plan.invariant_attention,
                           });
+    // The QSA block indexer's per-(lane, layer) state, on rank 0, in lane-major order:
+    // the pooled block keys by block (one slot per block the capacity can complete,
+    // plus one), the incomplete block's tail, and a scratch tail for speculative
+    // verification, in one FP32 plane per (lane, layer).
+    if (plan.qsa) {
+        const auto& qsa        = config.qsa.value();
+        const std::uint32_t lanes  = plan.max_concurrency;
+        const std::uint32_t blocks = plan.capacity / qsa.indexer_compress_ratio + 1U;
+        const std::int32_t rows    = dimension(qsa.indexer_head_dim);
+        const std::int32_t tail    = static_cast<std::int32_t>(qsa.indexer_compress_ratio - 1);
+        const std::int32_t cols    = static_cast<std::int32_t>(blocks) + 2 * tail;
+        out.qsa_indexer.reserve(static_cast<std::size_t>(lanes) * config.full_attention_layers);
+        out.qsa_tail_axes.reserve(static_cast<std::size_t>(lanes) * config.full_attention_layers);
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+                out.qsa_indexer.push_back(add_tensor(
+                    builder, DType::FP32, {rows, cols}, "QSA indexer pooled keys, tail and scratch"));
+                out.qsa_tail_axes.push_back(add_tensor(
+                    builder, DType::I32, {3, 3}, "QSA indexer tail M-RoPE axes"));
+            }
+        }
+        // A speculative verification writes its indexer projection at a stable address so
+        // the captured decode graph can replay it, and commit() re-pools only the accepted
+        // columns into the live state. The stride is the widest verification width, once
+        // per (lane, layer) in layer-major order.
+        if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+            const std::uint32_t record_width = widest_verify_window(plan) + 1U;
+            const std::int32_t projection_rows = dimension(
+                (qsa.indexer_n_heads + 1U) * qsa.indexer_head_dim);
+            const std::int32_t record_columns = checked_i32(
+                static_cast<std::uint64_t>(lanes) * config.full_attention_layers * record_width,
+                "QSA indexer record columns");
+            out.qsa_index_records = add_tensor(
+                builder, DType::BF16, {projection_rows, record_columns},
+                "QSA indexer verification projections");
+            out.qsa_first_position = add_tensor(
+                builder, DType::I32, {static_cast<std::int32_t>(lanes)},
+                "QSA indexer verification first position");
+        }
+        if (plan.stream_slots != 0) {
+            // One device pool of 4-token pages per (lane, QSA layer), one KvStreamMap per
+            // (lane, layer), and a shared identity block table for the pinned host copy.
+            // The host planes themselves are PinnedHostBuffers owned by ProgramImpl, one
+            // per (lane, layer).
+            const auto kv = paged_kv_storage_layout(plan.kv_storage, kD256KVCacheHeadDim);
+            const std::array<std::pair<std::int32_t, DType>, 4> planes{{
+                {kv.key.data_leading_extent, kv.key.data_dtype},
+                {kv.value.data_leading_extent, kv.value.data_dtype},
+                {kv.key.has_scale() ? kv.key.scale_leading_extent : 0, kv.key.scale_dtype},
+                {kv.value.has_scale() ? kv.value.scale_leading_extent : 0, kv.value.scale_dtype},
+            }};
+            std::uint64_t pool_bytes = 0;
+            for (const auto& [leading, dtype] : planes) {
+                if (leading == 0) { continue; }
+                pool_bytes += static_cast<std::uint64_t>(leading) * ops::kKvStreamPageTokens *
+                              plan.stream_heads * plan.stream_slots * dtype_size(dtype);
+            }
+            const std::int32_t pool_words = checked_i32(pool_bytes, "QSA KV stream pool");
+            const std::int32_t map_words = checked_i32(
+                ops::kv_stream_map_bytes(static_cast<std::int32_t>(plan.stream_blocks),
+                                         static_cast<std::int32_t>(plan.stream_slots)),
+                "QSA KV stream map");
+            const std::size_t stream_regions =
+                static_cast<std::size_t>(plan.max_concurrency) * config.full_attention_layers;
+            out.qsa_stream_pool.reserve(stream_regions);
+            out.qsa_stream_map.reserve(stream_regions);
+            for (std::uint32_t lane = 0; lane < plan.max_concurrency; ++lane) {
+                for (std::uint32_t layer = 0; layer < config.full_attention_layers; ++layer) {
+                    out.qsa_stream_pool.push_back(builder.add_tensor(
+                        DType::I8, {pool_words}, 256, "QSA KV stream device pool"));
+                    out.qsa_stream_map.push_back(builder.add_tensor(
+                        DType::I8, {map_words}, 256, "QSA KV stream residency map"));
+                }
+            }
+            out.qsa_stream_identity = add_tensor(
+                builder, DType::I32, {static_cast<std::int32_t>(plan.stream_pages)},
+                "QSA KV stream identity block table");
+        }
+    }
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.
     out.host_kv_text_page_stride =
@@ -274,8 +402,40 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             };
         }
     }
+    if (plan.qsa && plan.context_cache.enabled &&
+        plan.context_cache.mode == ContextCacheMode::Hybrid) {
+        // The hybrid snapshot carries the QSA indexer state out of the shared device planes:
+        // every StateImage slot's host slab holds the pooled block keys, the live tail and the
+        // tail axes. The Legacy cache keeps the continuation live on the device, so its images
+        // carry no QSA region and cost nothing there.
+        const auto& qsa = config.qsa.value();
+        state_image_spec.qsa = qwen3_5::QsaStateSpec{
+            .layers   = config.full_attention_layers,
+            .head_dim = dimension(qsa.indexer_head_dim),
+            .blocks   = plan.capacity / qsa.indexer_compress_ratio + 1U,
+            .tail     = qsa.indexer_compress_ratio - 1,
+        };
+    }
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
+    if (state_image_spec.qsa) {
+        // The image's QSA region binds the shared indexer planes on rank 0, all lanes in
+        // lane-major order: each (lane, layer)'s pooled prefix and live tail from its
+        // combined plane, plus the tail axes. The speculative scratch half and the
+        // verification records stay out of the image; a capture and a restore name the
+        // lane their planes belong to.
+        out.state_images.qsa = qwen3_5::QsaStateDeviceLayout{
+            .planes    = out.qsa_indexer,
+            .tail_axes = out.qsa_tail_axes,
+            .lanes     = plan.max_concurrency,
+            .blocks    = state_image_spec.qsa->blocks,
+            .tail      = state_image_spec.qsa->tail,
+        };
+    }
+    if (plan.qsa && plan.context_cache.enabled &&
+        plan.context_cache.mode == ContextCacheMode::Hybrid && !out.state_images.qsa) {
+        throw std::logic_error("QSA hybrid state image is missing the QSA indexer region");
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         // A stage records only the GDN layers it holds, in its own device's memory; a
         // tensor-parallel rank only its heads.
@@ -611,12 +771,49 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout,
-                            ops::causal_softmax_attention_workspace_capacity_bytes(
-                                {dimension(share.attention->head_dim),
-                                 dimension(share.attention->num_attention_heads),
-                                 dimension(share.attention->num_key_value_heads)},
-                                plan.kv_storage, envelope, batch_size, min_width, max_width));
+                    if (attention->qsa && plan.qsa) {
+                        // The QSA sparse branch: the indexer's rows of the normalized residual,
+                        // its selection, and the sparse attention over the selected blocks.
+                        const auto& qsa = *attention->qsa;
+                        const std::uint32_t blocks = plan.capacity / qsa.compress_ratio + 1U;
+                        // The assembled [query + key, tokens] projection, plus the two
+                        // contiguous destinations ops::linear writes before staging it.
+                        (void)workspace::matrix(layout, DType::BF16,
+                                                static_cast<std::int32_t>(qsa.query_rows +
+                                                                          qsa.key_rows),
+                                                last);
+                        (void)workspace::matrix(layout, DType::BF16,
+                                                static_cast<std::int32_t>(qsa.query_rows +
+                                                                          qsa.key_rows),
+                                                last);
+                        linear_scratch(layout, qsa.query, first, last);
+                        linear_scratch(layout, qsa.key, first, last);
+                        (void)workspace::matrix(layout, DType::I32,
+                                                static_cast<std::int32_t>(qsa.block_budget), last);
+                        (void)workspace::matrix(layout, DType::I32, 1, last);
+                        scratch(layout, ops::qsa_indexer_select_workspace_bytes(
+                                            last, static_cast<std::int32_t>(blocks),
+                                            static_cast<std::int32_t>(qsa.block_budget)));
+                        scratch(layout, ops::sparse_softmax_attention_workspace_bytes(
+                                            last, static_cast<std::int32_t>(qsa.block_budget)));
+                        // The hybrid prefill route calls the read-only dense causal Op over the
+                        // layer's complete KV, so this stage needs that Op's transient capacity
+                        // too. The layout keeps the peak of its scratch allocations, so the
+                        // sparse decode/verify stages do not pay for both at once.
+                        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                            {dimension(share.attention->head_dim),
+                                             dimension(share.attention->num_attention_heads),
+                                             dimension(share.attention->num_key_value_heads)},
+                                            plan.kv_storage, envelope, batch_size, min_width,
+                                            max_width));
+                    } else {
+                        scratch(layout,
+                                ops::causal_softmax_attention_workspace_capacity_bytes(
+                                    {dimension(share.attention->head_dim),
+                                     dimension(share.attention->num_attention_heads),
+                                     dimension(share.attention->num_key_value_heads)},
+                                    plan.kv_storage, envelope, batch_size, min_width, max_width));
+                    }
                     residual_scratch(attention->output);
                     if (positions) {
                         // The merge of a position-split rank's query heads, a pass of its own.
@@ -1452,6 +1649,61 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // --qsa-top-blocks widens the QSA indexer's selection. Without the sparse branch it has
+    // no effect, so it is refused rather than silently dropped.
+    if (options.qsa_top_blocks != 0 && !options.qwen38_27b_qsa) {
+        throw std::invalid_argument(
+            "qsa_top_blocks requires qwen38_27b_qsa (the QSA sparse attention branch)");
+    }
+    // --qwen38-27b-qsa: the sparse path keeps one rank-0 copy of every full-attention
+    // layer's indexer state per concurrent sequence (lane), so several sequences run
+    // side by side, each on its own planes.
+    if (options.qwen38_27b_qsa) {
+        if (!parameters.model.config().text.qsa) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa requires an artifact carrying the QSA block indexer");
+        }
+        if (options.devices.size() > 1 || options.tensor_parallel) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa runs on one device without tensor parallelism");
+        }
+        // --vision is supported: a multimodal prefill supplies axis-major [T,3]
+        // M-RoPE positions, which run_qsa forwards to the indexer's append/select
+        // so pooled keys rotate at their block's first-token t/h/w. Text and
+        // speculative-verification columns still have three equal axes.
+        // The artifact's own MTP head is the one speculative backend the sparse branch
+        // supports: a verification is one N-column target pass, the verification pools
+        // into a scratch tail and commit() re-pools the accepted columns. Masked draft
+        // backends keep their own KV and replay contract, which is not wired up yet.
+        if (options.speculative.backend != SpeculativeBackend::None &&
+            options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument(
+                "qwen38_27b_qsa supports only the model's own MTP speculative backend "
+                "(DFlash/DFlash2/DSpark are not wired to the QSA indexer)");
+        }
+        // kv_stream_resolve accepts at most kKvStreamMaxTokens query columns. The pool's
+        // automatic floor is budget + ceil(width / 4) blocks (consecutive verify columns
+        // share their selections); budget is the indexer's selection width, 512 blocks by
+        // default and wider with --qsa-top-blocks. Cap the widest verification when
+        // --kv-resident actually streams (a wider call takes the staging route).
+        if (resolved_kv_resident_positions(options) != 0) {
+            const std::uint32_t widest = std::max(options.speculative.draft_tokens,
+                                                  options.speculative.ngram_draft_tokens);
+            if (widest + 1U > static_cast<std::uint32_t>(ops::kKvStreamMaxTokens)) {
+                throw std::invalid_argument(
+                    "QSA streamed KV needs a verification window of at most 15 drafts "
+                    "(--kv-resident with --draft-tokens / --ngram-draft-tokens)");
+            }
+        }
+    } else if (options.kv_resident_positions.has_value() &&
+               resolved_kv_resident_positions(options) != 0) {
+        // Only an EXPLICIT --kv-resident is refused without the QSA flag. An
+        // unset value (upstream "auto") is left to the upstream preset and must
+        // not change the dense path or raise a new error here.
+        throw std::invalid_argument(
+            "--kv-resident needs --qwen38-27b-qsa on this model (Qwen3.8-Flash-Next "
+            "uses its own executor)");
+    }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
@@ -1620,6 +1872,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
     impl->invariant_attention = inputs.invariant_attention;
+    impl->qsa                 = inputs.qsa;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -1640,6 +1893,54 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_storage          = inputs.kv_storage;
     impl->steering_adapters   = inputs.steering_adapters;
     impl->steering_vectors    = inputs.steering_vectors;
+    impl->kv_resident_positions = inputs.kv_resident_positions;
+    if (inputs.qsa && inputs.kv_resident_positions != 0) {
+        // A resolve's verification columns sit at consecutive positions and may pick disjoint
+        // indexer selections, so the pool must hold the disjoint worst case: width columns each
+        // holding its own (budget + 1) blocks. kv_stream_minimum_slots(width, budget + 1) gives
+        // that count, which keeps a verify from ever exceeding the pool or raising the kv_stream
+        // overflow flag. The cost is a larger pool: when worst_case * 4 tokens is not below the
+        // context, streaming is disabled and the whole history stays resident. An explicit
+        // --kv-resident larger than this floor is still honoured.
+        const std::uint32_t width = widest_verify_window(*impl) + 1U;
+        const std::uint32_t budget =
+            inputs.parameters->text.qsa_block_budget != 0
+                ? inputs.parameters->text.qsa_block_budget
+                : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
+        const std::uint32_t slots = std::max(
+            (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
+                ops::kKvStreamPageTokens,
+            static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
+                static_cast<std::int32_t>(width),
+                static_cast<std::int32_t>(budget) + 1)));
+        const std::uint32_t pages = page_count(inputs.capacity);
+        if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
+            impl->stream_slots  = slots;
+            impl->stream_width  = width;
+            impl->stream_pages  = pages;
+            impl->stream_blocks = pages * (kPagedKVPageSize / ops::kKvStreamPageTokens);
+            impl->stream_heads  = inputs.parameters->model.config().text.attention
+                                      ? inputs.parameters->model.config()
+                                            .text.attention->num_key_value_heads
+                                      : 0;
+        } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
+            // The disjoint-selection floor makes a streamed call hold width * (budget + 1) blocks,
+            // which no longer fits the --kv-resident pool against this context; streaming is off and
+            // every full-attention layer keeps its KV resident. A smaller --max-context or
+            // --qsa-top-blocks restores streaming.
+            impl->stream_warning =
+                "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
+                " tokens: a streamed call holds " +
+                std::to_string(ops::kv_stream_minimum_slots(
+                    static_cast<std::int32_t>(width),
+                    static_cast<std::int32_t>(budget) + 1)) +
+                " blocks (disjoint verification columns), so the " +
+                std::to_string(inputs.capacity) +
+                "-token context no longer fits the --kv-resident pool and every full-attention "
+                "layer keeps its KV resident; a smaller --max-context or "
+                "--qsa-top-blocks restores streaming";
+        }
+    }
     impl->persistent          = persistent_layout(*impl);
     if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
         // The whole Host budget is the hybrid slab pool that KV blocks and state snapshots share
@@ -1966,6 +2267,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .invariant_attention        = options.invariant_attention,
+        .qsa                        = options.qwen38_27b_qsa,
+        .kv_resident_positions      = resolved_kv_resident_positions(options),
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,
@@ -1990,6 +2293,25 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
         .steering_vectors           = !options.control_vectors.empty(),
     };
+    // --qwen38-27b-qsa: a captured decode graph bakes the lane's QSA state pointers and its
+    // row-bound KV views, but a multi-lane replay batch is an arbitrary subset of lanes, so no
+    // single capture can serve it. QSA with more than one lane runs without CUDA graphs.
+    if (inputs.qsa && inputs.max_concurrency > 1) {
+        inputs.use_cuda_graph = false;
+    }
+    // --qwen38-27b-qsa: the QSA indexer state now rides in the StateImage (the pooled block keys,
+    // the live tail and the tail axes), so the cache may serve two shapes: the Legacy
+    // single-conversation live continuation (one Device checkpoint slot, nothing else) and the
+    // Hybrid snapshot tree, whose images carry the QSA region. engine/model_instance.cpp
+    // normalizes the options to one of the two; the Program refuses any other shape instead of
+    // resuming a continuation whose scores belong to another sequence (matched_prefix_tokens).
+    if (inputs.qsa &&
+        (inputs.context_cache.max_shared_prefixes != 0 ||
+         inputs.context_cache.max_long_anchors_per_continuation.value_or(0) != 0 ||
+         inputs.context_cache.host_state_slots != 0 ||
+         inputs.context_cache.host_kv_capacity_bytes != 0)) {
+        throw std::logic_error("Qwen3.8-27B-QSA context cache options are not normalized");
+    }
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.
     const std::uint64_t minimum_pages64 =
@@ -2013,6 +2335,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .kv_host_resident                     = planner->minimum->stream_slots != 0,
           .resident_main_pages                  = resident_main_pages,
     };
     for (const std::size_t bytes : planner->minimum->extra_rank_reservation_bytes) {
@@ -2062,11 +2385,20 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     }
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
+        const std::size_t minimum_bytes = planner->minimum->device_reservation_bytes;
+        // --kv-resident (QSA only) pins the Main Text KV to the logical page count in pinned host
+        // memory and keeps one shared staging layer on the device, so a further Main page group
+        // costs the device nothing; the Host budget bounds that capacity instead. Every other
+        // layout still has to grow, and no layout may shrink.
+        if (adjacent->device_reservation_bytes < minimum_bytes) {
+            throw std::logic_error("Qwen3.5 sequence layout has a negative KV capacity stride");
+        }
+        if (adjacent->device_reservation_bytes == minimum_bytes &&
+            planner->minimum->stream_slots == 0) {
             throw std::logic_error("Qwen3.5 sequence layout has a nonpositive KV capacity stride");
         }
         planner->curve.bytes_per_additional_main_page_group =
-            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
+            adjacent->device_reservation_bytes - minimum_bytes;
         // A further device's stride may legitimately be zero: a stage with no attention layers holds
         // no KV.
         for (std::size_t rank = 0; rank < planner->curve.extra_ranks.size(); ++rank) {

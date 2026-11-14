@@ -319,7 +319,7 @@ void ProgramImpl::prepare_graphs() {
             }
         }
     };
-    const auto execution_core = [&] {
+    const auto execution_core = [&](bool with_qsa = false) {
         return execution::ExecutionCore{device,
                                         parameters,
                                         work,
@@ -332,7 +332,8 @@ void ProgramImpl::prepare_graphs() {
                                         stage_runtime.get(),
                                         rope_yarn,
                                         fast_prefill_kernel,
-                                        mtp_attention_window, experts.get(), steering.get()};
+                                        mtp_attention_window, experts.get(), steering.get(),
+                                        with_qsa && qsa_indexer_state ? &*qsa_indexer_state : nullptr};
     };
 
     const auto& text_attention = *parameters.model.config().text.attention;
@@ -341,15 +342,33 @@ void ProgramImpl::prepare_graphs() {
         static_cast<std::int32_t>(text_attention.num_attention_heads),
         static_cast<std::int32_t>(text_attention.num_key_value_heads)};
 
+    // --qwen38-27b-qsa: every captured graph binds the sparse branch's row-bound view
+    // to the capture's own row; the gate pins row 0, so replay reads that row's
+    // published table. An MTP verification graph needs the same binding.
+    // A captured graph is single-row: with QSA, multi-concurrency programs never
+    // capture (graphs are off above one concurrency), so the sparse branch's one
+    // part runs row 0 on lane 0, through row 0's view.
+    qwen3_5::PagedKVCacheView qsa_kv;
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    std::vector<std::uint32_t> qsa_lanes;
+    if (qsa_indexer_state.has_value()) {
+        qsa_kv = decoder->text_kv.execution_view(
+            text_kv_addresses->execution_row(text_capture_allocations.front()));
+        qsa_kv_views.push_back(qsa_kv);
+        qsa_lanes.push_back(0);
+    }
+    const std::span<const std::uint32_t> qsa_sequence_lanes(qsa_lanes.data(), qsa_lanes.size());
+
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles =
             ordinary_graph_profiles(capacity, attention_geometry, kv_storage);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
         execution::OrdinaryBatchContext ordinary_state{
-            execution_core(),      decoder->text_kv,
+            execution_core(true),  decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
-            *ordinary_host_egress, state_images->continuation_hidden_store()};
+            *ordinary_host_egress, state_images->continuation_hidden_store(),
+            qsa_kv,                qsa_kv_views, qsa_sequence_lanes};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1, 0);
         device.synchronize();
@@ -395,13 +414,14 @@ void ProgramImpl::prepare_graphs() {
                 }
             }
             qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
-            execution::MtpBatchContext mtp_state{execution_core(),
+            execution::MtpBatchContext mtp_state{execution_core(true),
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  frame,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 state_images->continuation_hidden_store()};
+                                                 state_images->continuation_hidden_store(),
+                                                 qsa_kv, qsa_kv_views, qsa_sequence_lanes};
             mtp_state.sampled_drafts              = gumbel_sampling;
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);
@@ -444,13 +464,14 @@ void ProgramImpl::prepare_graphs() {
                                                              attention_geometry, kv_storage);
             validate_graph_profiles(planned_profiles, capacity - 1, "ngram MTP");
             qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
-            execution::MtpBatchContext mtp_state{execution_core(),
+            execution::MtpBatchContext mtp_state{execution_core(true),
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  frame,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 state_images->continuation_hidden_store()};
+                                                 state_images->continuation_hidden_store(),
+                                                 qsa_kv, qsa_kv_views, qsa_sequence_lanes};
             mtp_state.sampled_drafts              = gumbel_sampling;
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);

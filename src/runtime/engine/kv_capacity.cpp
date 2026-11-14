@@ -37,7 +37,7 @@ void validate_curve(const SequenceCapacityCurve& curve) {
         }
     }
     if (curve.minimum_main_page_groups < curve.maximum_main_page_groups &&
-        curve.bytes_per_additional_main_page_group == 0) {
+        curve.bytes_per_additional_main_page_group == 0 && !curve.kv_host_resident) {
         throw std::invalid_argument("expandable sequence capacity curve has zero byte stride");
     }
     // The slots that may be given up are part of each device's smallest reservation.
@@ -191,12 +191,18 @@ KvCapacityResolution resolve_on_curve(const KvCapacityPolicy& policy,
                 (curve.extra_ranks.empty() ? std::string() : " on " + device_name(0)) + hint);
         }
         if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
-            // The capacity is the smallest any device allows. Start from the primary device.
-            const std::size_t additional =
-                (capacity_budget - curve.minimum_device_reservation_bytes) /
-                curve.bytes_per_additional_main_page_group;
-            std::uint64_t candidate =
-                static_cast<std::uint64_t>(curve.minimum_main_page_groups) + additional;
+            // The capacity is the smallest any device allows. Start from the primary device, whose
+            // zero stride (a host-resident KV layout) leaves the page count at the minimum: the
+            // Host budget bounds that capacity, and this curve cannot price it.
+            std::uint64_t candidate = curve.minimum_main_page_groups;
+            if (curve.bytes_per_additional_main_page_group != 0) {
+                const std::size_t additional =
+                    (capacity_budget - curve.minimum_device_reservation_bytes) /
+                    curve.bytes_per_additional_main_page_group;
+                candidate = std::min<std::uint64_t>(
+                    static_cast<std::uint64_t>(curve.minimum_main_page_groups) + additional,
+                    curve.maximum_main_page_groups);
+            }
             for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
                 const RankCapacityCurve& rank = curve.extra_ranks[index];
                 const std::size_t available   = extra_rank_available_bytes[index];

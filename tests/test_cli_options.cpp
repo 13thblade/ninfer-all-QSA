@@ -312,6 +312,26 @@ int run_tests() {
                               "CLI accepted an invalid --kv-resident");
         }
     }
+    {
+        // --qsa-top-blocks: a block count within the ops' 65536-block cap, no token conversion.
+        const auto blocks = [&](std::vector<std::string> tail) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            return parse(args).qsa_top_blocks;
+        };
+        failures += check(blocks({}) == 0U && blocks({"--qsa-top-blocks", "1"}) == 1U &&
+                              blocks({"--qsa-top-blocks", "512"}) == 512U &&
+                              blocks({"--qsa-top-blocks", "5003"}) == 5003U &&
+                              blocks({"--qsa-top-blocks", "8192"}) == 8192U &&
+                              blocks({"--qsa-top-blocks", "65536"}) == 65536U &&
+                              blocks({"--qsa-top-blocks", "4096", "--kv-resident", "16384"}) ==
+                                  4096U,
+                          "CLI did not preserve --qsa-top-blocks");
+        for (const auto* value : {"65537", "262144", "8192x", "-4", ""}) {
+            failures += check(rejects([&] { (void)blocks({"--qsa-top-blocks", value}); }),
+                              "CLI accepted an invalid --qsa-top-blocks");
+        }
+    }
     for (const auto* share : {"0", "0.25", "1"}) {
         const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-residency", "host", "--expert-dma-share", share,

@@ -21,9 +21,17 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+namespace ninfer::models::qwen3_5 {
+struct QsaStreamState;
+}
+
 namespace ninfer::models::qwen3_5::detail {
+
+// No streamed lane in a restore batch (the ordinary Device-fill batch).
+constexpr std::uint32_t kNoStreamLane = 0xFFFFFFFFU;
 
 // Physical binding of the hybrid prefix index (docs/maintainer/hybrid-prefix-cache-spec.md) to
 // the Program's KV page stores, StateImage store and pinned Host slab pool. The index decides;
@@ -54,6 +62,7 @@ struct HybridCacheCounters {
     std::uint64_t endpoints_created   = 0;
     std::uint64_t host_image_writes   = 0;
     std::uint64_t host_block_writes   = 0;
+    std::uint64_t stream_image_writes = 0; // per-sequence images compacted at a lane release
     std::uint64_t host_image_restores = 0;
     std::uint64_t host_block_restores = 0; // prefetched blocks included
     std::uint64_t prefetched_blocks   = 0;
@@ -95,6 +104,7 @@ public:
                       LogicalKVPageStore* backend_pages, StateImageStore& states,
                       qwen3_5::StateImageDevicePool& state_pool, const HybridHostLayout& host,
                       std::vector<HybridRestoreLayer> layers,
+                      const qwen3_5::QsaStreamState* stream = nullptr,
                       StartupPhaseScope* pin_progress = nullptr);
     ~HybridPrefixCache() override;
 
@@ -116,6 +126,11 @@ public:
     [[nodiscard]] const HybridCacheCounters& counters() const noexcept { return counters_; }
 
     [[nodiscard]] bool host_tier() const noexcept { return !host_chunks_.empty(); }
+
+    // True under --kv-resident: the pinned stream host pages are the block content's
+    // authority, and the pool pages are bookkeeping placeholders never read by the
+    // sparse branch.
+    [[nodiscard]] bool kv_streamed() const noexcept { return stream_ != nullptr; }
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
@@ -151,16 +166,37 @@ public:
     // more than it and never `keep` (the lane's newest superseded tap, §9.3). Returns false when
     // there is no Host tier or no slabs could be freed. The snapshot is pinned until the copy
     // completes.
+    // Under QSA the image's QSA region takes the shared indexer planes of `qsa_lane`, the
+    // capturing lane, whose next call would otherwise repool them before the copy lands.
     bool start_snapshot_host_write(runtime::prefix_cache::SnapshotRef snapshot,
                                    runtime::prefix_cache::SnapshotRef keep, cudaStream_t producer,
-                                   cudaStream_t transfer);
+                                   cudaStream_t transfer, std::uint32_t qsa_lane = 0);
     // Copies every Device-only node of `nodes` to a Host slab in one batch, evicting anything but
     // `keep` (the lane's newest superseded tap, §9.3) and no retained snapshot with a GDSF
     // priority above `claim` (the lane's snapshots, PrefixCacheIndex::retained_priority). Nodes
     // are pinned until the copy completes. Stops early when the Host tier cannot free a slab.
+    // Under the streamed tier this is a no-op: the lane's blocks get their host copy at the
+    // lane release's stream image handoff instead, and the prefix's halves already live in
+    // the writers' stream images. `nodes` runs in block order from the root, and node i's
+    // block index is i.
     void start_block_host_writes(std::span<const runtime::prefix_cache::NodeRef> nodes,
                                  runtime::prefix_cache::SnapshotRef keep, double claim,
                                  cudaStream_t producer, cudaStream_t transfer);
+
+    // ---- Streamed-tier per-sequence images --------------------------------------------
+    // At a lane release, compacts the lane's own blocks [first_block,
+    // first_block + own_nodes.size()) into a new per-sequence stream image and registers it
+    // with the index (first-writer-wins: an already-bound run keeps the earlier writer's
+    // image). The lane's pinned stream host pages stay authoritative for the next sequence;
+    // the compact copy is the derived, evictable host copy. The copies read those pages and
+    // the backend's Device pages, so `producer` is held until they land. Runs that are
+    // already bound are skipped, and the handoff stops at the first run the Host budget
+    // cannot hold.
+    void handoff_stream_image(std::span<const runtime::prefix_cache::NodeRef> own_nodes,
+                              std::uint32_t first_block, cudaStream_t producer,
+                              cudaStream_t transfer, std::uint32_t lane);
+    // The pinned buffer of a live stream image (valid while the index holds it).
+    [[nodiscard]] std::byte* stream_image_data(std::uint32_t image) const noexcept;
     // Publishes every completed Host write. Non-blocking.
     void poll();
 
@@ -182,7 +218,26 @@ public:
     void open_restore(cudaStream_t producer);
     void restore_block(runtime::prefix_cache::NodeRef node, HybridBlockPages destination);
     void restore_tail(runtime::prefix_cache::SnapshotRef snapshot, HybridBlockPages destination);
-    void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::int32_t device_slot);
+    // Streamed-tier block restore (resolve-on-load): the block's text half stays in its
+    // writer's stream image (the lane's stream pool reads it there), so no host copy moves;
+    // the backend half, when its Device copy is absent, restores to a Device page filled
+    // from the image. `destination` carries that backend page only (the MTP pool reads it
+    // densely); without a backend pool it is empty. A destination is expected exactly when
+    // the node's Device copy is absent.
+    void restore_block_stream(runtime::prefix_cache::NodeRef node, std::uint32_t block_index,
+                              std::uint32_t lane, HybridBlockPages destination);
+    // Streamed-tier tail restore: the tail's text half is copied host-to-host from its slab
+    // record into destination lane `lane`'s pinned stream host page (the tail's own page),
+    // and no Device fill is opened on it. `destination` carries only the backend page,
+    // which the MTP pool reads densely and so restores to a Device page as usual; without
+    // a backend pool it is empty. A destination is expected exactly when the tail's Device
+    // copy is absent.
+    void restore_tail_stream(runtime::prefix_cache::SnapshotRef snapshot, std::uint32_t lane,
+                             HybridBlockPages destination);
+    // Under QSA the image's QSA region lands in the shared indexer planes of `qsa_lane`, the
+    // destination lane the resumed sequence will run on.
+    void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::int32_t device_slot,
+                       std::uint32_t qsa_lane = 0);
     // Enqueues the batch in the order a forward pass reads it: a prelude (the snapshot tail, every
     // backend page, and the image's continuation hidden and DFlash state), then each model layer's
     // KV planes or recurrent state, recording an event after the prelude and after every layer.
@@ -232,16 +287,31 @@ public:
                                            std::string_view fingerprint,
                                            const StartupObserver& observer);
 
+    // One pinned buffer of a per-sequence stream image; the slot id is the index's image id.
+    struct StreamImageSlot {
+        explicit StreamImageSlot(std::uint64_t bytes) : pages(static_cast<std::size_t>(bytes)) {
+            this->bytes = bytes;
+            pages.pin();
+        }
+        HostPages pages;
+        std::uint64_t bytes = 0;
+    };
+
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
+    std::optional<std::uint32_t> allocate_stream_image(std::uint64_t bytes) noexcept override;
+    void release_stream_image(std::uint32_t image) noexcept override;
 
 private:
     struct PendingWrite {
         std::vector<runtime::prefix_cache::NodeRef> nodes;
         std::optional<runtime::prefix_cache::SnapshotRef> snapshot;
         cudaEvent_t done = nullptr;
+        // True when the nodes are open host fills to complete on landing; a stream image
+        // handoff pins its run for the copies without opening any fill.
+        bool fill = true;
     };
 
     // Copies between pages and Host slab records. A record's group is the pinned chunk holding
@@ -270,9 +340,16 @@ private:
         std::uint64_t ticket = 0;
         std::vector<runtime::prefix_cache::NodeRef> nodes;
         std::optional<runtime::prefix_cache::SnapshotRef> tail;
-        // The snapshot whose Host image lands in `image_slot`.
+        // The snapshot whose Host image lands in `image_slot`; under QSA its QSA region lands in
+        // the planes of `image_lane`.
         std::optional<runtime::prefix_cache::SnapshotRef> image;
         std::int32_t image_slot = -1;
+        std::uint32_t image_lane = 0;
+        // Streamed tier (kNoStreamLane for the ordinary batch): the destination lane whose
+        // pinned stream host pages receive the tail's text half (the blocks' text halves
+        // stay in their writers' stream images); the tail half as (block index, source slab).
+        std::uint32_t stream_lane = kNoStreamLane;
+        std::optional<std::pair<std::uint32_t, std::uint32_t>> stream_tail;
         PageCopies copies;
         PageCopies tail_copies;
         cudaEvent_t prelude = nullptr;
@@ -285,6 +362,10 @@ private:
     };
 
     [[nodiscard]] std::uint32_t allocate_block_id(HybridBlockPages pages);
+    // Allocates a block id whose slot stays empty: under the streamed tier the id names the
+    // caller's placeholder pool page for index bookkeeping without the cache taking a
+    // reference on it.
+    [[nodiscard]] std::uint32_t reserve_block_id();
     void free_block_id(std::uint32_t id) noexcept;
     void retain(const HybridBlockPages& pages, std::uint32_t text_columns,
                 std::uint32_t backend_columns);
@@ -292,8 +373,21 @@ private:
     void adopt_destination(const HybridBlockPages& pages, std::uint32_t columns);
     [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
     void add_copies(PageCopies& copies, const HybridBlockPages& pages, std::uint32_t slab_id);
+    // One backend page to be filled from a stream image's block record (a record is
+    // byte-identical to a slab block record): the image's block `block_index`, one record
+    // per `slab_bytes`, all within the image's one pinned buffer (its group).
+    void add_backend_copy(PageCopies& copies, const HybridBlockPages& pages,
+                          std::uint32_t image, std::uint32_t block_index);
     void enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const;
     void enqueue_from_host(const PageCopies& copies, cudaStream_t stream) const;
+    // One layer's page of a block record between a slab and a lane's pinned stream host pages:
+    // every (layer, plane) is one contiguous run, the host tensor's page stride and the
+    // record's plane layout agreeing by construction.
+    void copy_stream_block_layer(std::byte* record, std::uint32_t block, std::uint32_t lane,
+                                 std::uint32_t layer, bool to_lane_host, cudaStream_t stream) const;
+    // All layers of one block record, in layer order.
+    void copy_stream_block(std::byte* record, std::uint32_t block, std::uint32_t lane,
+                           bool to_lane_host, cudaStream_t stream) const;
     [[nodiscard]] cudaEvent_t take_event();
     void order_after(cudaStream_t producer, cudaStream_t consumer);
     void publish_write(PendingWrite& write);
@@ -308,6 +402,10 @@ private:
     LogicalKVPageStore* backend_pages_         = nullptr;
     StateImageStore* states_                   = nullptr;
     qwen3_5::StateImageDevicePool* state_pool_ = nullptr;
+    // --kv-resident: the Program's streamed-KV state; non-null when the block records are
+    // the per-layer streamed shape (host_layout_.stream) and the pool pages are
+    // bookkeeping placeholders.
+    const qwen3_5::QsaStreamState* stream_ = nullptr;
     HybridHostLayout host_layout_;
     // The Host slab pool is pinned in chunks of whole slabs: one very large pinned allocation
     // can fail or stall on Windows (WDDM) where several smaller ones succeed. A slab never
@@ -315,6 +413,10 @@ private:
     // run never spans two chunks (two records of different chunks would otherwise form a run).
     std::vector<std::unique_ptr<HostPages>> host_chunks_;
     std::uint32_t slabs_per_chunk_ = 0;
+    // Pinned buffers of the per-sequence stream images: one slot per index stream image (the
+    // slot id is the index's image id); freed slots are reused.
+    std::vector<std::unique_ptr<StreamImageSlot>> stream_images_;
+    std::vector<std::uint32_t> free_stream_images_;
     cudaStream_t restore_stream_   = nullptr;
     std::vector<std::optional<HybridBlockPages>> blocks_;
     std::vector<std::uint32_t> free_blocks_;

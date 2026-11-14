@@ -50,6 +50,11 @@ const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept 
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 
+const std::string& SequencePlan::stream_warning() const noexcept {
+    static const std::string empty;
+    return impl_ != nullptr ? impl_->stream_warning : empty;
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 

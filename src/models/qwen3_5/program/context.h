@@ -48,6 +48,8 @@ struct ExecutionCore {
     NativeExpertRuntime* experts = nullptr;
     // Null without LoRA adapters or control vectors.
     const SteeringView* steering = nullptr;
+    // --qwen38-27b-qsa: the full-attention layers' indexer state; null without the flag.
+    qwen3_5::QsaIndexerState* qsa_indexer = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,
@@ -85,6 +87,9 @@ struct PrefillContext {
     // state_destination_slot at every chunk, because a checkpoint may fork the destination slot
     // between chunks of one step and decode rounds rewrite the shared frame controls.
     std::int32_t dflash_kv_table_row = 0;
+    // The sequence's lane: the QSA sparse branch's per-lane indexer state, KV row and
+    // stream pool (0 otherwise).
+    std::uint32_t lane = 0;
     // Takes the per-model-layer events of a Host restore still landing, which the chunk's first
     // pass over the layer stack waits on; empty once taken or landed. The events are a view into
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
@@ -117,6 +122,14 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // --qwen38-27b-qsa: the sequence's row-bound execution view for the sparse branch's
+    // explicit KV append and attention; empty without the flag.
+    qwen3_5::PagedKVCacheView qsa_kv;
+    // --qwen38-27b-qsa: one row-bound execution view per batch row, in row order; empty
+    // without the flag.
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    // --qwen38-27b-qsa: the lane of each batch row, in row order; empty without the flag.
+    std::span<const std::uint32_t> sequence_lanes;
 };
 
 struct MtpBatchContext {
@@ -127,6 +140,14 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // --qwen38-27b-qsa: the one sequence's row-bound execution view, for the sparse
+    // branch's explicit KV append and attention during target verification.
+    qwen3_5::PagedKVCacheView qsa_kv;
+    // --qwen38-27b-qsa: one row-bound execution view per batch row, in row order; empty
+    // without the flag.
+    std::vector<qwen3_5::PagedKVCacheView> qsa_kv_views;
+    // --qwen38-27b-qsa: the lane of each batch row, in row order; empty without the flag.
+    std::span<const std::uint32_t> sequence_lanes;
     // --gumbel-sampling: each row's proposals are draws under frame.draft_sampling at the keys of
     // the verification columns they fill; otherwise every proposal is the drafter's argmax.
     bool sampled_drafts = false;
@@ -190,7 +211,8 @@ struct TargetVerifyFrameView {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling,
                          const ops::SamplingConfig* draft_sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                         std::uint32_t lane);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);

@@ -1,7 +1,8 @@
 #include "options.h"
-#include "product/kv_resident_options.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
+#include "product/kv_resident_options.h"
+#include "product/qsa_top_blocks_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -329,6 +330,12 @@ std::string usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
+           "  --qwen38-27b-qsa              Qwen3.8-27B: run the QSA sparse attention branch\n"
+           "                                of every full-attention layer; needs the\n"
+           "                                artifact's block indexer, one device and no\n"
+           "                                tensor parallelism; works with the model's own\n"
+           "                                MTP drafts\n" +
+           std::string(product::kQsaTopBlocksHelp) +
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
@@ -475,6 +482,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 ninfer::product::parse_tensor_parallel_partials(value(arg));
         } else if (product::switch_option(arg, "invariant-attention",
                                           [&](bool on) { options.invariant_attention = on; })) {
+        } else if (product::switch_option(arg, "qwen38-27b-qsa",
+                                          [&](bool on) { options.qwen38_27b_qsa = on; })) {
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -509,6 +518,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                                                      [&] { return value(arg); })) {
         } else if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
                                                      [&] { return value(arg); })) {
+        } else if (product::parse_qsa_top_blocks_option(arg, options.qsa_top_blocks,
+                                                            [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

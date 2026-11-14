@@ -14,8 +14,9 @@ of the grouped activation. Its values, like every source's, are in the grouped o
 that re-quantises ``ssm_out`` writes grouped columns and no gather.
 
 The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
-them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
-rounded to BF16: the one place a stored value changes.
+them as BF16 words, or as stored blocks -- Q8_0 in Underdog-Saluki and similar releases, Q4_K in
+Unsloth's UD-Q4_K_XL -- whose dequantized values are rounded to BF16: the one place a stored value
+changes.
 
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
@@ -24,6 +25,8 @@ needs only the base checkpoint's config and tokenizer files.
 
 from __future__ import annotations
 
+import os
+import re
 from typing import Callable
 
 import numpy as np
@@ -33,6 +36,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
+from . import qsa_gguf
 from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
@@ -62,8 +66,9 @@ from .ternary import (
 )
 
 MTP_BLOCK = LAYERS
-# The storage the GDN controls may have (gdn_control_source).
-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+# The storage the GDN controls may have (gdn_control_source): BF16 words, or any stored
+# block type (Q8_0 in Underdog-Saluki-style exports, Q4_K in Unsloth's UD-Q4_K_XL).
+GDN_CONTROL_TYPES = ("BF16", "blocks")
 # The storage the output head may have: stored blocks, or BF16 words (bf16_source).
 HEAD_TYPES = ("blocks", "BF16")
 
@@ -105,9 +110,12 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
     }
 
 
-def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
+def expected_tensors(
+    mtp: bool, qsa: bool = False
+) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
     """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
-    ggml type names it may have."""
+    ggml type names it may have. ``qsa`` adds the 16 x 5 F32 indexer tensors of the QSA-27B
+    adaptation (see ``qsa_gguf.py``)."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
@@ -140,6 +148,8 @@ def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[
             p + "nextn.hnorm.weight": ((HIDDEN,), "F32"),
             p + "nextn.shared_head_norm.weight": ((HIDDEN,), "F32"),
         }
+    if qsa:
+        out |= qsa_gguf.expected_tensors()
     return out
 
 
@@ -147,24 +157,34 @@ def has_mtp(gguf: GGUFFile) -> bool:
     return f"blk.{MTP_BLOCK}.nextn.eh_proj.weight" in gguf.tensors
 
 
-def validate(gguf: GGUFFile) -> None:
-    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types."""
+def validate(gguf: GGUFFile, qsa: bool = False) -> None:
+    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types.
+
+    ``qsa`` additionally requires the QSA-27B indexer metadata and its 80 F32 tensors;
+    leaving it False keeps the stock recipe's behaviour byte for byte.
+    """
 
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
             raise ValueError(
                 f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}"
             )
+    if qsa:
+        qsa_gguf.check_header(gguf)
     mtp = has_mtp(gguf)
     blocks = gguf.kv.get("qwen35.block_count")
     if blocks != LAYERS + (1 if mtp else 0):
         raise ValueError(f"{gguf.path}: {blocks} blocks, expected {LAYERS} (+1 for MTP)")
-    expected = expected_tensors(mtp)
+    expected = expected_tensors(mtp, qsa=qsa)
     if set(gguf.tensors) != set(expected):
         missing = sorted(set(expected) - set(gguf.tensors))[:5]
         extra = sorted(set(gguf.tensors) - set(expected))[:5]
+        hint = (
+            "" if qsa else
+            " (a QSA-27B GGUF needs the qwen3_8_27b_qsa_gguf recipe)"
+        )
         raise ValueError(
-            f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra})"
+            f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra}){hint}"
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
@@ -364,11 +384,117 @@ def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
     return block_source(gguf, "output.weight", shape, rows()), True
 
 
+GDN_CONTROLS_FP8_ENV = "NINFER_GDN_CONTROLS_FP8"
+# Default graft source = the committed compact asset of native BF16 GDN controls; the env
+# override may point at this asset file OR at a full FP8 HF directory (compat).
+_GDN_ASSET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "assets", "gdn_controls_fp8_bf16.safetensors")
+_GDN_CONTROL_KEY = re.compile(r"^blk\.(\d+)\.ssm_(alpha|beta)\.weight$")
+_native_controls_state: list = [None, False]   # [provider | None, probed?]
+_native_sanity_done: list = [False]
+
+
+class _NativeGdnControls:
+    """BF16 GDN controls in grouped head order, VERBATIM (the converter must NOT re-untile),
+    read from a compact asset safetensors (default) or a full FP8 HF release directory.
+    Keys are the official HF names, shared by both sources."""
+
+    def __init__(self, source: str) -> None:
+        import json
+
+        from safetensors import safe_open
+
+        self._safe_open = safe_open
+        self._cache: dict = {}
+        if os.path.isfile(source):                       # asset file
+            self.asset = True
+            self._handle = safe_open(source, framework="pt")
+            self._keys = set(self._handle.keys())
+        else:                                            # FP8 HF directory (compat)
+            self.asset = False
+            self.root = source
+            index = os.path.join(source, "model.safetensors.index.json")
+            if not os.path.exists(index):
+                raise ValueError(
+                    f"{GDN_CONTROLS_FP8_ENV}: {source} is neither an asset file nor an HF release directory")
+            self.wm = json.load(open(index, encoding="utf-8"))["weight_map"]
+
+    def get(self, layer: int, role: str):
+        key = f"model.language_model.layers.{layer}.linear_attn.in_proj_{role}.weight"
+        if key not in (self._keys if self.asset else self.wm):
+            return None
+        cached = self._cache.get((layer, role))
+        if cached is not None:
+            return cached
+        if self.asset:
+            tensor = self._handle.get_tensor(key)
+        else:
+            with self._safe_open(os.path.join(self.root, self.wm[key]), framework="pt") as handle:
+                tensor = handle.get_tensor(key)
+        tensor = tensor.detach().to("cpu").to(torch.bfloat16)
+        if tuple(tensor.shape) != (GDN_VALUE_HEADS, HIDDEN):
+            raise ValueError(
+                f"{key}: native GDN control is {tuple(tensor.shape)}, expected "
+                f"({GDN_VALUE_HEADS}, {HIDDEN})")
+        self._cache[(layer, role)] = tensor
+        return tensor
+
+
+def _native_gdn_controls():
+    if not _native_controls_state[1]:
+        raw = os.environ.get(GDN_CONTROLS_FP8_ENV)
+        if raw is not None and raw.strip().lower() in ("off", "none", "0"):
+            source = None                                  # explicit disable -> original path
+        else:
+            source = raw or (_GDN_ASSET_PATH if os.path.exists(_GDN_ASSET_PATH) else None)
+        _native_controls_state[0] = _NativeGdnControls(source) if source else None
+        _native_controls_state[1] = True
+    return _native_controls_state[0]
+
+
+def _bf16_words_to_f32(words):
+    return (words.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def _native_matches_release(native, gguf_grouped):
+    """Each native (grouped) row must best-match the same gguf grouped row."""
+    n = native.to(torch.float32).numpy()
+    if gguf_grouped.dtype == np.uint16:
+        g = _bf16_words_to_f32(np.asarray(gguf_grouped))
+    else:
+        g = np.asarray(gguf_grouped).astype(np.float32)
+    n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-12)
+    g = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-12)
+    sim = n @ g.T
+    return float((sim.argmax(axis=1) == np.arange(sim.shape[0])).mean()) >= 0.95
+
+
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, Q8_0 values rounded to BF16."""
+    as stored, encoded values (Q8_0, Q4_K, ...) rounded to BF16."""
 
-    if gguf.info(tensor).type_id == GGML_Q8_0:
+    # Route-B graft: when a native FP8 HF release is configured, copy its BF16 controls straight
+    # into the grouped a_projection/b_projection. They are already grouped (the published GGUF
+    # stores them tiled, which this converter untiles); re-untile would double-permute the heads.
+    provider = _native_gdn_controls()
+    matched = _GDN_CONTROL_KEY.match(tensor)
+    if provider is not None and matched:
+        native = provider.get(int(matched.group(1)), "a" if matched.group(2) == "alpha" else "b")
+        if native is not None:
+            if not _native_sanity_done[0]:
+                gguf_grouped = (
+                    untile(gguf.read_bf16_words(tensor), 1)
+                    if gguf.info(tensor).type_id == TYPE_BF16
+                    else untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1))
+                if not _native_matches_release(native, gguf_grouped):
+                    raise ValueError(
+                        f"{GDN_CONTROLS_FP8_ENV}: the native FP8 GDN controls do not match the "
+                        f"release's grouped order at {tensor}; the configured source is not the "
+                        "same model as this GGUF (or is in an unexpected head order).")
+                _native_sanity_done[0] = True
+            return array_source(native.contiguous(), f"{tensor}[native-BF16-grouped]")
+
+    if gguf.info(tensor).type_id != TYPE_BF16:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
         return array_source(
             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
@@ -698,7 +824,90 @@ def qwen3_8_27b_gguf(model, recipe, sources):
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
 
 
-RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
+def qwen3_8_27b_qsa_gguf(model, recipe, sources):
+    """A Qwen3.8-27B-QSA GGUF: the dense 27B block recipe plus its 80 F32 indexer tensors.
+
+    The text tower, MTP block, vision and DFlash2 companions are imported exactly as
+    ``qwen3_8_27b_gguf`` does.  On top of that, each of the 16 full-attention layers
+    gains ``attention/indexer/{query,key,query_norm,key_norm,key_pre_norm}``.
+    """
+
+    config = model.config
+    if (
+        "num_experts" in config
+        or config["hidden_size"] != HIDDEN
+        or config["num_hidden_layers"] != LAYERS
+    ):
+        raise ValueError("the QSA GGUF block recipe requires the Qwen3.8-27B Dense geometry")
+    gguf = sources["gguf"]
+    if not isinstance(gguf, GGUFFile):
+        raise ValueError("--source gguf must name the model's .gguf file")
+    validate(gguf, qsa=True)
+    mtp = "mtp" in model.components
+    if mtp and not has_mtp(gguf):
+        raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
+
+    # Recipe.assign resolves selectors against model.parameters, so register the
+    # indexer logical parameters (and their config) before assigning anything.
+    qsa_gguf.register_parameters(model)
+    model.config.update(qsa_gguf.artifact_config())
+    # The Recipe snapshotted its selections at construction, before these parameters
+    # existed; register each so its assign below can override the placeholder.
+    for layer in qsa_gguf.qsa_layers():
+        for role in qsa_gguf.ROLES:
+            recipe.add_parameter(qsa_gguf.parameter_name(layer, role))
+
+    _companions(model, recipe, sources)
+    encoded, direct = text_sources(gguf, mtp=mtp)
+    formats = {}
+    for name, source in encoded.items():
+        format = source.read_encoded(0, 1).format
+        formats[name] = format
+        recipe.assign(
+            name, format=format, method=import_encoded, source=source, activation_policy="AllowA8"
+        )
+    for name, source in direct.items():
+        recipe.assign(
+            name,
+            format=model.parameters[name].direct_format,
+            method=cast_direct,
+            source=source,
+        )
+    prefixes = [f"text/layers/{layer}/" for layer in range(LAYERS)]
+    if mtp:
+        prefixes.append("mtp/layers/0/")
+    for p in prefixes:
+        if p.startswith("text/") and not full_attention(int(p.split("/")[2])):
+            n = p + "gdn/"
+            qkv = [n + "query", n + "key", n + "value"]
+            recipe.group(qkv + [n + "z"] if formats[n + "z"] == formats[n + "query"] else qkv)
+            recipe.separate([n + "a_projection", n + "b_projection"])
+        else:
+            a = p + "attention/"
+            _group_same_format(
+                recipe, [a + "query", a + "key", a + "gate", a + "value"], formats
+            )
+        _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
+
+    # The indexer parameters are direct BF16; the fork stores them as F32 with the
+    # zero-centred norms folded as 1 + w (qsa_gguf.sources undoes the fold).
+    for name, source in qsa_gguf.sources(gguf).items():
+        recipe.assign(
+            name,
+            format=model.parameters[name].direct_format,
+            method=cast_direct,
+            source=source,
+        )
+        formats[name] = model.parameters[name].direct_format
+    for layer in qsa_gguf.qsa_layers():
+        p = f"text/layers/{layer}/attention/indexer/"
+        _group_same_format(recipe, [p + "query", p + "key"], formats)
+
+
+RECIPES = {
+    "qwen3_8_27b_gguf": qwen3_8_27b_gguf,
+    "qwen3_8_27b_qsa_gguf": qwen3_8_27b_qsa_gguf,
+}
 
 __all__ = [
     "EXPECTED_HEADER",

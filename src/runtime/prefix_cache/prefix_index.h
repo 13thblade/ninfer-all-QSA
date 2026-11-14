@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ninfer::runtime::prefix_cache {
@@ -86,6 +87,11 @@ struct PrefixIndexConfig {
     std::uint32_t device_snapshot_slots = 0;
     std::uint64_t block_bytes           = 0; // one block bundle (all enabled pools)
     std::uint64_t image_bytes           = 0; // one state image
+    // Streamed tier: the bytes the per-sequence stream images (each session's own blocks,
+    // compacted at yield) may hold. While the block write-through still runs the budget is
+    // shared with the slab pool; the block halves live in the images only once that write
+    // through goes.
+    std::uint64_t stream_image_budget_bytes = 0;
     // Whether the host tier backs KV block bundles and snapshot tails. Without it the host tier
     // holds state images only: tails and blocks are unbacked and their loss removes dependants.
     bool host_blocks = true;
@@ -105,6 +111,15 @@ public:
 
     // The snapshot keeps its host image but loses its device image copy.
     virtual void drop_snapshot_device_image(SnapshotRef /*snapshot*/) noexcept {}
+
+    // Streamed tier: the index registered a new per-sequence stream image; the backend
+    // allocates its pinned buffer of `bytes` and returns its own slot id, or nullopt when it
+    // cannot. The slot id is the index's image id.
+    virtual std::optional<std::uint32_t> allocate_stream_image(std::uint64_t /*bytes*/) noexcept {
+        return std::nullopt;
+    }
+    // The index evicted or orphaned a stream image and dropped every reference to it.
+    virtual void release_stream_image(std::uint32_t /*image*/) noexcept {}
 };
 
 struct MatchCandidate {
@@ -149,6 +164,9 @@ struct NodeView {
     CopyState device                   = CopyState::Absent;
     std::uint32_t host_slab            = kNoId;
     CopyState host                     = CopyState::Absent;
+    // Streamed tier: the per-sequence stream image holding this block's host copy; kNoId for
+    // a dense-tier node.
+    std::uint32_t host_image           = kNoId;
     std::uint32_t pins                 = 0;
     std::uint32_t live_snapshots_below = 0;
 };
@@ -188,6 +206,28 @@ struct RestoredBlock {
     std::uint32_t slab = kNoId;
 };
 
+// One saved block of a per-sequence stream image (version 6 persistence): the block's identity
+// without its parent (the run's parent chain is given by the caller in order).
+struct SavedStreamBlock {
+    std::uint64_t lookup_hash = 0;
+    std::span<const TokenId> tokens;
+    std::uint64_t extra = 0;
+};
+
+// The rebuilt run of one saved per-sequence stream image: the index's image id and the nodes
+// the image now binds, in path order.
+struct RestoredStreamImage {
+    std::uint32_t image = kNoId;
+    std::vector<NodeRef> nodes;
+};
+
+// One persistable per-sequence stream image (version 6 save): the image id and its kept blocks,
+// in path order (a prefix of the image's run).
+struct PersistableImage {
+    std::uint32_t image = kNoId;
+    std::vector<NodeRef> run;
+};
+
 struct PrefixIndexStats {
     std::uint32_t nodes                   = 0;
     std::uint32_t snapshots               = 0;
@@ -202,6 +242,10 @@ struct PrefixIndexStats {
     std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
     std::uint64_t device_slot_evictions   = 0;
     std::uint64_t snapshot_hits           = 0;
+    // Streamed tier: live per-sequence stream images and the bytes they hold.
+    std::uint32_t stream_images           = 0;
+    std::uint64_t stream_image_bytes      = 0;
+    std::uint64_t stream_image_evictions  = 0;
     double gdsf_inflation                 = 0.0;
 };
 
@@ -308,6 +352,26 @@ public:
     // Returns the device id to the backend.
     void abort_tail_device_fill(SnapshotRef snapshot);
 
+    // ---- streamed-tier per-sequence images ----------------------------------------------------
+    // Registers a new per-sequence stream image: the contiguous run `nodes` (node i holds block
+    // first_block + i, is pinned, and is the parent of node i + 1) becomes the image's content,
+    // the caller's compacted copy of the writing lane's own blocks. The budget is held by
+    // evicting the oldest unpinned images first. Returns the backend slot of the new image;
+    // nullopt when every node is already bound (the earlier writer's image keeps the copy,
+    // first-writer-wins) or when the budget cannot be satisfied.
+    [[nodiscard]] std::optional<std::uint32_t>
+    register_stream_image(std::span<const NodeRef> nodes, std::uint32_t first_block,
+                          std::uint32_t block_count, std::uint64_t bytes);
+    // Pins a stream image directly (a resume lane holds its prefix images until its release):
+    // it is no longer evictable, and the pin refreshes its recency.
+    void pin_stream_image(std::uint32_t image);
+    void unpin_stream_image(std::uint32_t image);
+    // A handoff that registered its image but could not fill it gives it back: the binding is
+    // cleared and the buffer returned. The caller unpins the run's nodes first.
+    void abort_stream_image(std::uint32_t image);
+    // The block range an image's pinned buffer covers: [first_block, first_block + block_count).
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> stream_image_range(std::uint32_t image);
+
     // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
     // ------------------------------------------------------- Returns a device snapshot slot for a
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
@@ -339,11 +403,13 @@ public:
                                                  std::uint32_t hits = 0);
 
     // ---- persistence ---------------------------------------------------------------------------
-    // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
-    // throughout, and exactly those paths, parents before children. Other Host content is dead
-    // (no snapshot can resume through it) or unreachable after a restart.
-    void collect_persistable(std::vector<NodeRef>& nodes,
-                             std::vector<SnapshotRef>& snapshots) const;
+    // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is backed
+    // throughout (a host slab, or the writer's per-sequence stream image under the streamed
+    // tier), and exactly those paths, parents before children; into `images`, when given, the
+    // stream images' kept runs. Other Host content is dead (no snapshot can resume through it)
+    // or unreachable after a restart.
+    void collect_persistable(std::vector<NodeRef>& nodes, std::vector<SnapshotRef>& snapshots,
+                             std::vector<PersistableImage>* images = nullptr) const;
     [[nodiscard]] BlockIdentity block_identity(NodeRef node) const;
     // Rebuild a saved Host tier into a fresh index, parents before children and anchors before
     // their snapshots, in the selection plan_host_restore made. Nothing is evicted to make room;
@@ -352,6 +418,14 @@ public:
                                                                   std::uint64_t lookup_hash,
                                                                   std::span<const TokenId> tokens,
                                                                   std::uint64_t extra);
+    // Rebuilds one saved per-sequence stream image into a fresh index (version 6 load): the
+    // run's blocks (the first's parent `parent`, path order) are created without a host slab and
+    // bound to a new pinned image of `bytes`. The caller's plan_host_restore_v6 already fits the
+    // bytes in the stream image budget, so nothing is evicted here; absence means the budget or
+    // the backend could not hold the image.
+    [[nodiscard]] std::optional<RestoredStreamImage>
+    restore_stream_image(NodeRef parent, std::span<const SavedStreamBlock> blocks,
+                         std::uint32_t first_block, std::uint64_t bytes);
     [[nodiscard]] std::optional<SnapshotRef>
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
                           SnapshotKind kind, std::uint32_t hits, bool branch_point,
@@ -383,6 +457,9 @@ private:
         CopyState device         = CopyState::Absent;
         std::uint32_t host_slab  = kNoId;
         CopyState host           = CopyState::Absent;
+        // Streamed tier: the per-sequence stream image holding this block's host copy (the
+        // writer's compact image); kNoId for a dense-tier node.
+        std::uint32_t host_image = kNoId;
         std::uint32_t pins       = 0;
         std::uint32_t live_below = 0;
         // Retained (not superseded) snapshots anchored at or below this node.
@@ -427,6 +504,26 @@ private:
         // snapshots whose nearest one this is.
         std::uint32_t ancestor = kNoId;
         std::vector<std::uint32_t> dependents;
+    };
+
+    // A per-sequence stream image (streamed tier): one pinned buffer of block_count compact
+    // block records covering blocks [first_block, first_block + block_count); the bound nodes
+    // are the run it covers. The buffer slot is the backend's (the id is the backend's).
+    struct StreamImage {
+        std::uint32_t generation  = 0;
+        bool occupied             = false;
+        std::uint64_t bytes       = 0;
+        std::uint32_t first_block = 0;
+        std::uint32_t block_count = 0;
+        // Aggregated pins: every bound node's pins plus the direct image pins; nonzero while
+        // anything holds it, and it is not evictable.
+        std::uint32_t pins = 0;
+        // Bound node indices, in path order.
+        std::vector<std::uint32_t> bound;
+        // Recency list links, newest at the head.
+        std::uint32_t prev   = kNoId;
+        std::uint32_t next   = kNoId;
+        bool in_list         = false;
     };
 
     enum class SlotState : std::uint8_t { Free, Staging, Owned };
@@ -505,6 +602,18 @@ private:
     void drop_node_device_copy(std::uint32_t node);
     void drop_node_host_copy(std::uint32_t node);
     void adjust_live(std::uint32_t anchor, int delta);
+    // Node pins and their bound image's aggregated pins move together, so every pin change
+    // goes through here.
+    void bump_node_pins(std::uint32_t node, int delta);
+    void stream_image_link(std::uint32_t image, bool newest);
+    void stream_image_unlink(std::uint32_t image);
+    // Clears every bound node's binding; a node that loses its last copy is unpinned and goes
+    // with its subtree (§9.4).
+    void unbind_stream_image(std::uint32_t image);
+    // Frees an image: unlinks it, invalidates the entry, returns the buffer to the backend.
+    void drop_stream_image(std::uint32_t image);
+    void evict_stream_image(std::uint32_t image);
+    [[nodiscard]] StreamImage& require_stream_image(std::uint32_t image);
     // Every Device residency and slot-state change goes through these so the gauges stats()
     // reports stay O(1): the Engine publishes statistics after every decode round.
     void set_device(Node& node, CopyState state) noexcept;
@@ -541,6 +650,13 @@ private:
     std::vector<SlotState> slot_state_;
     std::vector<std::uint32_t> slot_owner_;
 
+    // Streamed-tier per-sequence images, indexed by their backend slot; the recency list runs
+    // newest (head) to oldest (tail), and unpinned images evict from the tail.
+    std::vector<StreamImage> stream_images_;
+    std::uint64_t stream_image_bytes_used_ = 0;
+    std::uint32_t stream_image_head_       = kNoId;
+    std::uint32_t stream_image_tail_       = kNoId;
+
     std::uint32_t node_count_      = 0;
     std::uint32_t snapshot_count_  = 0;
     std::uint32_t device_resident_ = 0;
@@ -571,6 +687,9 @@ struct HostRestorePlan {
     std::vector<bool> snapshots;
     // Host slabs the chosen entries take.
     std::uint64_t slabs = 0;
+    // Stream image bytes the chosen image-backed blocks take (version 6; zero for a file with no
+    // images).
+    std::uint64_t image_bytes = 0;
 };
 
 // Chooses what an empty Host tier of `host_slabs` restores from a saved one: everything when it
@@ -584,5 +703,20 @@ struct HostRestorePlan {
                                                 std::span<const SavedSnapshotShape> snapshots,
                                                 std::uint64_t host_slabs,
                                                 const PrefixIndexConfig& config);
+
+// Chooses what an empty Host tier restores from a version 6 file: slab-backed blocks take host
+// slabs, image-backed blocks take `image_block_bytes` of the stream image budget, and snapshots
+// take their image slabs and one more with a tail. Everything is taken when both budgets hold
+// it. Otherwise snapshots are taken greedily by the GDSF density of §9.3 (as in plan_host_restore,
+// which a file without images degenerates to) against both budgets; a snapshot that does not fit
+// one is passed over for later ones that may. `block_image` names each block's backing (1: a
+// per-sequence stream image, 0: a host slab).
+[[nodiscard]] HostRestorePlan plan_host_restore_v6(std::span<const std::int32_t> block_parents,
+                                                   std::span<const std::uint8_t> block_image,
+                                                   std::span<const SavedSnapshotShape> snapshots,
+                                                   std::uint64_t host_slabs,
+                                                   std::uint64_t stream_image_budget_bytes,
+                                                   std::uint64_t image_block_bytes,
+                                                   const PrefixIndexConfig& config);
 
 } // namespace ninfer::runtime::prefix_cache

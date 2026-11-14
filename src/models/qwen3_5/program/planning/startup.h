@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -58,6 +59,26 @@ struct SteeringRankLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
+    // --qwen38-27b-qsa: one FP32 plane per (lane, full-attention layer) on rank 0, in
+    // lane-major order, holding the pooled block keys, the incomplete block's tail, and
+    // a scratch tail for speculative verification. Empty without the flag.
+    std::vector<TensorLayout> qsa_indexer;
+    // One I32 [3, 3] plane per (lane, layer): interleaved M-RoPE axis positions of the
+    // incomplete block's three tail slots, needed when a completed block starts inside
+    // the previous call's tail.
+    std::vector<TensorLayout> qsa_tail_axes;
+    // --kv-resident under QSA: one device region per (lane, layer) holding the
+    // four-token-page KV pool (all K/V and scale planes concatenated), plus the
+    // (lane, layer)'s KvStreamMap words and a shared identity block table for the
+    // pinned host copy. Empty when streaming is off.
+    std::vector<TensorLayout> qsa_stream_pool;
+    std::vector<TensorLayout> qsa_stream_map;
+    std::optional<TensorLayout> qsa_stream_identity;
+    // The verification's indexer projections (BF16 [640, lanes * layers * record_width],
+    // (lane, layer) blocks in layer-major order) and its first position (I32 [lanes]),
+    // both at stable addresses for captured decode graphs.
+    std::optional<TensorLayout> qsa_index_records;
+    std::optional<TensorLayout> qsa_first_position;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.
     std::optional<GdnReplayRecordLayout> replay_records;
     std::vector<GdnReplayRecordLayout> extra_replay_records;
@@ -124,6 +145,16 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
     bool invariant_attention                = false;
+    // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
+    // (ops::qsa_indexer, ops::sparse_softmax_attention) instead of dense attention.
+    bool qsa                               = false;
+    // --kv-resident: positions of each QSA full-attention layer's KV kept on the
+    // device; a longer context streams the rest from pinned host memory. Zero
+    // keeps every layer fully resident. This is the resolved value: an unset
+    // EngineOptions flag follows the upstream preset (qwen4_exp_core.cpp: device
+    // experts -> all resident, host/disk experts -> kDefaultKvResidentPositions).
+    // Only meaningful with `qsa`.
+    std::uint32_t kv_resident_positions     = 0;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -170,6 +201,22 @@ struct SequencePlanImpl {
     bool fast_prefill_kernel                = false;
     // --invariant-attention: the text cache's calls take fixed key segments.
     bool invariant_attention                = false;
+    // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
+    // instead of dense attention; its rank-0 pooled-key and tail state below.
+    bool qsa                               = false;
+    std::uint32_t kv_resident_positions     = 0;
+    // Derived stream geometry: device pool slots (4 tokens each), the widest
+    // call that may resolve from the pool, total 4-token blocks and 64-token
+    // pages of the host copy. All zero when streaming is off.
+    std::uint32_t stream_slots              = 0;
+    std::uint32_t stream_width              = 0;
+    std::uint32_t stream_blocks             = 0;
+    std::uint32_t stream_pages              = 0;
+    std::uint32_t stream_heads              = 0;
+    // A QSA history window wider than the artifact's whose stream pool no longer fits the
+    // context, so streaming is off and every full-attention layer stays resident. Planning has
+    // no observer, so the engine publishes this. Empty otherwise.
+    std::string stream_warning;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;

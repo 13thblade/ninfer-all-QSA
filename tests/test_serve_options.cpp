@@ -259,6 +259,38 @@ int main() {
         catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid --kv-resident");
     }
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).qsa_top_blocks &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "1"})
+                                   .qsa_top_blocks == 1U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "512"})
+                                   .qsa_top_blocks == 512U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "5003"})
+                                   .qsa_top_blocks == 5003U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "8192"})
+                                   .qsa_top_blocks == 8192U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", "65536"})
+                                   .qsa_top_blocks == 65536U &&
+                           parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
+                                 "--qsa-top-blocks", "4096", "--kv-resident", "16384"})
+                                   .qsa_top_blocks == 4096U,
+                       "server did not preserve --qsa-top-blocks");
+    for (const auto* value : {"65537", "262144", "8192x", ""}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--qsa-top-blocks", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --qsa-top-blocks");
+    }
+    {
+        // QSA keeps the hybrid prefix cache: the checkpoint catalog has no candidate that could
+        // rebuild a sparse session, so naming both is an error rather than a silent fallback.
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
+                         "--use-original-prefix-caching"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected,
+                          "server combined --qwen38-27b-qsa with --use-original-prefix-caching");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})

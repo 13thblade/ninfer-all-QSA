@@ -1,20 +1,23 @@
 // qsa_indexer_append/select against an FP64 oracle of Qwen3.8-Flash-Next's block indexer: a
 // sequence long enough for the selection to bind (650 blocks), fed as a prefill chunk that starts
 // mid-block, decode steps across block boundaries and a verify-width chunk; the pooled keys
-// pointwise and every selection as a set, up to near-ties of the 512th score. The decode steps
-// replay one captured CUDA graph, the position advancing only in the device word the ops read.
+// pointwise and every selection as a set, up to near-ties of the top-th score, at the artifact's
+// budget and at raised ones. The decode steps replay one captured CUDA graph, the position
+// advancing only in the device word the ops read.
 #include "core/arena.h"
 #include "core/device_launch.h"
 #include "ninfer/ops/qsa_indexer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -22,7 +25,8 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kDim = 128, kHeads = 4, kProjection = 640, kTop = 512;
+constexpr int kDim = 128, kHeads = 4, kProjection = 640;
+constexpr int kDefaultTop = ops::kQsaTopBlocksDefault;
 constexpr float kEps = 1e-6f;
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
@@ -34,16 +38,23 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
 // YaRN over a native window (factor above one), as Hugging Face's `yarn` rope type gives it with
 // beta_fast 32 and beta_slow 1; factor one leaves the rotation unscaled.
 struct Yarn {
-    double factor = 1.0;
-    double native = 0.0;
+    double factor                = 1.0;
+    double native                = 0.0;
+    double interpolation_factor  = 1.0;
+    std::uint32_t interpolation_threshold = 0;
     [[nodiscard]] ops::RopeYarn op() const {
-        return {static_cast<float>(factor), static_cast<std::uint32_t>(native)};
+        return {static_cast<float>(factor), static_cast<std::uint32_t>(native),
+                static_cast<float>(interpolation_factor), interpolation_threshold};
     }
+    [[nodiscard]] bool active() const { return factor > 1.0 || interpolation_factor > 1.0; }
 };
 
-// Pair i's frequency of 64 rotated dims at theta 1e7, rounded to FP32 as the contract states.
+// Pair i's frequency. The unscaled route uses the Op's exp form; the active YaRN
+// route uses yarn_schedule's pow form. Both match the engine's two branches.
 float pair_frequency(int i, const Yarn& yarn) {
-    if (!(yarn.factor > 1.0)) return static_cast<float>(std::exp(-(2.0 * i / 64.0) * std::log(1e7)));
+    if (!yarn.active()) return static_cast<float>(std::exp(-(2.0 * i / 64.0) * std::log(1e7)));
+    const double base = std::pow(1e7, -2.0 * i / 64.0);
+    if (!(yarn.factor > 1.0)) return static_cast<float>(base);
     constexpr double kPi = 3.14159265358979323846;
     const auto correction = [&](double rotations) {
         return 64.0 * std::log(yarn.native / (rotations * 2.0 * kPi)) / (2.0 * std::log(1e7));
@@ -52,19 +63,28 @@ float pair_frequency(int i, const Yarn& yarn) {
     double hi       = std::min(std::ceil(correction(1.0)), 63.0);
     if (hi == lo) hi += 0.001;
     const double ramp = std::clamp((i - lo) / (hi - lo), 0.0, 1.0);
-    return static_cast<float>(std::pow(1e7, -2.0 * i / 64.0) * ((1.0 - ramp) + ramp / yarn.factor));
+    return static_cast<float>(base * ((1.0 - ramp) + ramp / yarn.factor));
 }
 
-std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w, int position,
-                              const Yarn& yarn) {
+// Zero-centred RMSNorm then rotate-half. Pair i takes axis i % 3 of pos3 (the
+// engine's interleaved MRoPE), with the same per-axis linear interpolation as
+// rope.cuh's YaRN kernel. Three equal axes are exactly the scalar rotation.
+std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w,
+                              const std::array<int, 3>& pos3, const Yarn& yarn) {
     double sum = 0;
     for (double v : x) sum += v * v;
     const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
     for (int d = 0; d < kDim; ++d) x[d] = x[d] * scale * (1.0 + w[d]);
     const double attention = yarn.factor > 1.0 ? 0.1 * std::log(yarn.factor) + 1.0 : 1.0;
+    const float threshold  = static_cast<float>(yarn.interpolation_threshold);
+    const float inv_scale  = static_cast<float>(1.0 / yarn.interpolation_factor);
     for (int i = 0; i < 32; ++i) {
         const float frequency = pair_frequency(i, yarn);
-        const float angle     = static_cast<float>(position) * frequency;
+        float scaled = static_cast<float>(pos3[i % 3]);
+        if (yarn.interpolation_factor > 1.0 && scaled > threshold) {
+            scaled = threshold + (scaled - threshold) * inv_scale;
+        }
+        const float angle = scaled * frequency;
         const double c = std::cos(double(angle)) * attention, s = std::sin(double(angle)) * attention;
         const double x1 = x[i], x2 = x[i + 32];
         x[i]      = x1 * c - x2 * s;
@@ -73,38 +93,74 @@ std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w
     return x;
 }
 
+std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w, int position,
+                              const Yarn& yarn) {
+    return norm_rope(std::move(x), w, std::array<int, 3>{position, position, position}, yarn);
+}
+
+// axis-major 3-axis positions of a token sequence; `distinct` gives an
+// image/video-like t/h/w spread, otherwise three equal (text) axes.
+std::vector<std::array<int, 3>> make_axes(int length, bool distinct) {
+    std::vector<std::array<int, 3>> out(static_cast<std::size_t>(length));
+    for (int p = 0; p < length; ++p) {
+        out[static_cast<std::size_t>(p)] =
+            distinct ? std::array<int, 3>{p, p / 7 + 1, p / 11 + 2}
+                     : std::array<int, 3>{p, p, p};
+    }
+    return out;
+}
+
 struct Sequence {
     int length;
     std::vector<float> projection; // [length][640]
     std::vector<float> query_norm, key_norm;
+    // QSA-27B's index_k_pre_norm: applied to each raw key before the 4-token mean. Empty selects
+    // Flash-Next's path, which pools the raw projection keys.
+    std::vector<float> key_pre_norm;
 };
 
-std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& yarn) {
+std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& yarn,
+                                  const std::vector<std::array<int, 3>>* axes = nullptr) {
     std::vector<double> mean(kDim, 0.0);
     for (int i = 0; i < 4; ++i) {
+        std::vector<double> key(kDim);
         for (int d = 0; d < kDim; ++d) {
-            mean[d] += seq.projection[static_cast<std::size_t>(block * 4 + i) * kProjection + kHeads * kDim + d];
+            key[d] = seq.projection[static_cast<std::size_t>(block * 4 + i) * kProjection + kHeads * kDim + d];
         }
+        if (!seq.key_pre_norm.empty()) {
+            double sum = 0;
+            for (double v : key) sum += v * v;
+            const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
+            for (int d = 0; d < kDim; ++d) key[d] = key[d] * scale * (1.0 + seq.key_pre_norm[d]);
+        }
+        for (int d = 0; d < kDim; ++d) mean[d] += key[d];
     }
     for (double& v : mean) v /= 4.0;
-    return norm_rope(mean, seq.key_norm, block * 4, yarn);
+    const int first = block * 4;
+    const auto pos3 = axes != nullptr ? (*axes)[static_cast<std::size_t>(first)]
+                                      : std::array<int, 3>{first, first, first};
+    return norm_rope(mean, seq.key_norm, pos3, yarn);
 }
 
 int check_selection(const std::string& label, const Sequence& seq, const std::vector<std::vector<double>>& pooled,
-                    int position, const int* got, int got_count, const Yarn& yarn, int column = -1) {
+                    int position, const int* got, int got_count, const Yarn& yarn, int column = -1,
+                    const std::vector<std::array<int, 3>>* axes = nullptr,
+                    int top = kDefaultTop) {
     const int blocks = std::min((position + 1) / 4, static_cast<int>(pooled.size()));
     std::vector<int> expected;
     std::vector<double> score(blocks);
-    if (blocks <= kTop) {
+    if (blocks <= top) {
         expected.resize(blocks);
         std::iota(expected.begin(), expected.end(), 0);
     } else {
         std::vector<std::vector<double>> q(kHeads);
+        const auto qpos3 = axes != nullptr ? (*axes)[static_cast<std::size_t>(position)]
+                                           : std::array<int, 3>{position, position, position};
         for (int h = 0; h < kHeads; ++h) {
             std::vector<double> raw(kDim);
             for (int d = 0; d < kDim; ++d) raw[d] = seq.projection[
                 static_cast<std::size_t>(column < 0 ? position : column) * kProjection + h * kDim + d];
-            q[h] = norm_rope(raw, seq.query_norm, position, yarn);
+            q[h] = norm_rope(raw, seq.query_norm, qpos3, yarn);
         }
         for (int b = 0; b < blocks; ++b) {
             double s = 0;
@@ -118,7 +174,7 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
         std::vector<int> order(blocks);
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[a] > score[b]; });
-        expected.assign(order.begin(), order.begin() + kTop);
+        expected.assign(order.begin(), order.begin() + top);
         std::sort(expected.begin(), expected.end());
     }
     if (got_count != static_cast<int>(expected.size())) {
@@ -133,14 +189,15 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
         return 1;
     }
     if (actual == expected) return 0;
-    // Only blocks tied with the 512th score within 1e-5 relative may differ.
+    // Only blocks tied with the top-th score within 1e-5 relative may differ.
     std::vector<double> sorted(score);
     std::sort(sorted.begin(), sorted.end(), std::greater<>());
-    const double edge = sorted[kTop - 1];
+    const double edge = sorted[top - 1];
     std::set<int> a(actual.begin(), actual.end()), e(expected.begin(), expected.end());
     for (int b = 0; b < blocks; ++b) {
         if (a.count(b) != e.count(b) && std::abs(score[b] - edge) > 1e-5 * std::abs(edge)) {
-            std::cerr << label << ": block " << b << " (score " << score[b] << ", 512th " << edge
+            std::cerr << label << ": block " << b << " (score " << score[b] << ", " << top
+                      << "-th " << edge
                       << ") selected=" << a.count(b) << " expected=" << e.count(b) << '\n';
             return 1;
         }
@@ -148,35 +205,50 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
     return 0;
 }
 
-int run(std::uint32_t seed, const Yarn& yarn = {}) {
-    Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim)};
+int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
+        const std::vector<std::array<int, 3>>* axes = nullptr, int top = kDefaultTop) {
+    Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim),
+                 pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
     fill_uniform(seq.projection, seed, -2.0f, 2.0f);
     fill_uniform(seq.query_norm, seed + 1, -0.5f, 0.5f);
     fill_uniform(seq.key_norm, seed + 2, -0.5f, 0.5f);
     round_to_bf16(seq.projection);
     round_to_bf16(seq.query_norm);
     round_to_bf16(seq.key_norm);
+    // Only a non-empty key_pre_norm selects the QSA-27B path; the Flash-Next runs must leave it
+    // empty so the oracle pools the raw keys, as the op does when the weight is null.
+    if (pre_norm) {
+        fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
+        round_to_bf16(seq.key_pre_norm);
+    }
     std::vector<std::vector<double>> pooled(seq.length / 4);
-    for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn);
+    for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn, axes);
 
     const int capacity = 700;
     GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
-        d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
-        d_selected(kProjection * 2 + static_cast<std::size_t>(kTop) * 64 * 4), d_counts(64 * 4);
+        d_kpn(kDim * 2), d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
+        d_selected(kProjection * 2 + static_cast<std::size_t>(top) * 64 * 4), d_counts(64 * 4),
+        d_rope(static_cast<std::size_t>(3) * seq.length * 4), d_tail_axes(9 * 4);
     const auto bits = encode_bf16(seq.projection);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
-    const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm);
-    d_qn.copy_from_host(qn.data(), d_qn.bytes());
-    d_kn.copy_from_host(kn.data(), d_kn.bytes());
+    const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm),
+               kpn = encode_bf16(seq.key_pre_norm);
+    d_qn.copy_from_host(qn.data(), qn.size() * sizeof(std::uint16_t));
+    d_kn.copy_from_host(kn.data(), kn.size() * sizeof(std::uint16_t));
+    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), kpn.size() * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemset(d_pooled.data(), 0, d_pooled.bytes()));
     CUDA_CHECK(cudaMemset(d_tail.data(), 0, d_tail.bytes()));
-    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim});
+    // tail_axes is persistent across calls: append writes it, the next append
+    // reads it when a completed block starts inside the incomplete tail.
+    CUDA_CHECK(cudaMemset(d_tail_axes.data(), 0, d_tail_axes.bytes()));
+    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
+        t_kpn(d_kpn.data(), DType::BF16, {kDim});
     Tensor t_pooled(d_pooled.data(), DType::FP32, {kDim, capacity});
     Tensor t_tail(d_tail.data(), DType::FP32, {kDim, 3});
     GuardedDeviceBuffer d_first(4);
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    const ops::QsaIndexerWeights weights{&t_qn, &t_kn};
-    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity));
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity, top));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     cudaGraphExec_t decode = nullptr;
@@ -195,14 +267,32 @@ int run(std::uint32_t seed, const Yarn& yarn = {}) {
             column = static_cast<std::uint16_t*>(d_selected.data());
         }
         CUDA_CHECK(cudaMemcpyAsync(d_first.data(), &begin, 4, cudaMemcpyHostToDevice, stream));
+        Tensor t_rope(d_rope.data(), DType::I32, {count, 3});
+        Tensor t_tail_axes(d_tail_axes.data(), DType::I32, {3, 3});
+        ops::QsaIndexerPositions positions{};
+        if (axes != nullptr) {
+            std::vector<int> host(static_cast<std::size_t>(3) * count);
+            for (int axis = 0; axis < 3; ++axis) {
+                for (int t = 0; t < count; ++t) {
+                    host[static_cast<std::size_t>(axis) * count + t] =
+                        (*axes)[static_cast<std::size_t>(begin + t)][axis];
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_rope.data(), host.data(), host.size() * sizeof(int),
+                                       cudaMemcpyHostToDevice, stream));
+            positions.rope_positions = &t_rope;
+            positions.tail_axes      = &t_tail_axes;
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         Tensor t_projection(column, DType::BF16, {kProjection, count});
-        Tensor t_selected(static_cast<std::byte*>(d_selected.data()) + (count == 1 ? kProjection * 2 : 0), DType::I32, {kTop, count});
+        Tensor t_selected(static_cast<std::byte*>(d_selected.data()) + (count == 1 ? kProjection * 2 : 0), DType::I32, {top, count});
         Tensor t_counts(d_counts.data(), DType::I32, {count});
         const auto step = [&] {
-            ops::qsa_indexer_append(t_projection, t_first, weights, kEps, yarn.op(), t_pooled, t_tail, stream);
+            ops::qsa_indexer_append(t_projection, t_first, weights, kEps, yarn.op(), t_pooled,
+                                    t_tail, stream, positions);
             if (count <= 64) {
-                ops::qsa_indexer_select(t_projection, t_first, weights, kEps, yarn.op(), t_pooled, workspace, t_selected, t_counts, stream);
+                ops::qsa_indexer_select(t_projection, t_first, weights, kEps, yarn.op(), t_pooled,
+                                        workspace, t_selected, t_counts, stream, positions, top);
             }
         };
         if (count == 1) {
@@ -221,11 +311,12 @@ int run(std::uint32_t seed, const Yarn& yarn = {}) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (count <= 64) {
             const std::byte* selected_base = static_cast<const std::byte*>(t_selected.data);
-            const auto selected = from_device<int>(selected_base, static_cast<std::size_t>(kTop) * count);
+            const auto selected = from_device<int>(selected_base, static_cast<std::size_t>(top) * count);
             const auto counts   = from_device<int>(d_counts.data(), count);
             for (int t = 0; t < count; ++t) {
                 failures += check_selection("qsa select p=" + std::to_string(begin + t), seq, pooled, begin + t,
-                                            selected.data() + static_cast<std::size_t>(t) * kTop, counts[t], yarn);
+                                            selected.data() + static_cast<std::size_t>(t) * top, counts[t],
+                                            yarn, -1, axes, top);
             }
         }
         begin += count;
@@ -236,15 +327,18 @@ int run(std::uint32_t seed, const Yarn& yarn = {}) {
     const auto got = from_device<float>(d_pooled.data(), static_cast<std::size_t>(complete) * kDim);
     std::vector<double> expected;
     for (int b = 0; b < complete; ++b) expected.insert(expected.end(), pooled[b].begin(), pooled[b].end());
-    failures += verify_pointwise(yarn.factor > 1.0 ? "qsa pooled keys yarn" : "qsa pooled keys",
+    failures += verify_pointwise(std::string("qsa pooled keys") + (pre_norm ? " pre-norm" : "") +
+                                     (yarn.factor > 1.0 ? " yarn" : ""),
                                  std::vector<double>(got.begin(), got.end()), expected, {2e-5, 2e-5});
-    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_pooled, &d_tail, &d_selected, &d_counts, &d_first}) {
+    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_kpn, &d_pooled, &d_tail, &d_selected,
+                         &d_counts, &d_first, &d_rope, &d_tail_axes}) {
         failures += buffer->verify_guards("qsa_indexer");
     }
     return failures;
 }
 
-int selection_case(int tokens, int capacity, int first, bool ties = false, const Yarn& yarn = {}) {
+int selection_case(int tokens, int capacity, int first, bool ties = false, const Yarn& yarn = {},
+                   int top = kDefaultTop) {
     Sequence seq{tokens, std::vector<float>(std::size_t(tokens) * kProjection),
                  std::vector<float>(kDim), std::vector<float>(kDim)};
     fill_uniform(seq.projection, 9100 + tokens, -2.0f, 2.0f);
@@ -260,7 +354,7 @@ int selection_case(int tokens, int capacity, int first, bool ties = false, const
         std::copy_n(keys.data() + std::size_t(b) * kDim, kDim, pooled[b].begin());
     }
     GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2),
-        d_pooled(keys.size() * 4), d_first(4), d_selected(std::size_t(tokens) * kTop * 4),
+        d_pooled(keys.size() * 4), d_first(4), d_selected(std::size_t(tokens) * top * 4),
         d_counts(tokens * 4);
     const auto bits = encode_bf16(seq.projection), norms = encode_bf16(seq.query_norm);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
@@ -270,17 +364,17 @@ int selection_case(int tokens, int capacity, int first, bool ties = false, const
     Tensor norm(d_qn.data(), DType::BF16, {kDim});
     Tensor positions(d_first.data(), DType::I32, {1});
     Tensor pool(d_pooled.data(), DType::FP32, {kDim, capacity});
-    Tensor selected(d_selected.data(), DType::I32, {kTop, tokens});
+    Tensor selected(d_selected.data(), DType::I32, {top, tokens});
     Tensor counts(d_counts.data(), DType::I32, {tokens});
     const ops::QsaIndexerWeights weights{&norm, nullptr};
-    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(tokens, capacity));
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(tokens, capacity, top));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     int failures = 0;
     {
         const auto step = [&] {
             ops::qsa_indexer_select(projection, positions, weights, kEps, yarn.op(), pool, workspace,
-                                   selected, counts, stream);
+                                   selected, counts, stream, top);
         };
         cudaGraphExec_t graph = nullptr;
         for (int replay = 0; replay < 2; ++replay) {
@@ -298,40 +392,42 @@ int selection_case(int tokens, int capacity, int first, bool ties = false, const
                 CUDA_CHECK(cudaGraphLaunch(graph, stream));
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            const auto got = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+            const auto got = from_device<int>(d_selected.data(), std::size_t(tokens) * top);
             const auto sizes = from_device<int>(d_counts.data(), tokens);
             for (int t = 0; t < tokens; ++t) {
                 failures += check_selection("qsa T=" + std::to_string(tokens) +
                     " p=" + std::to_string(position + t) + (yarn.factor > 1.0 ? " yarn" : ""),
-                    seq, pooled, position + t, got.data() + std::size_t(t) * kTop, sizes[t], yarn, t);
+                    seq, pooled, position + t, got.data() + std::size_t(t) * top, sizes[t], yarn, t,
+                    nullptr, top);
                 if (ties) {
                     for (int i = 0; i < sizes[t]; ++i) {
-                        if (got[std::size_t(t) * kTop + i] != i) { ++failures; break; }
+                        if (got[std::size_t(t) * top + i] != i) { ++failures; break; }
                     }
                 }
             }
             if (replay == 1) {
                 CUDA_CHECK(cudaGraphLaunch(graph, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                const auto same = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+                const auto same = from_device<int>(d_selected.data(), std::size_t(tokens) * top);
                 const auto same_sizes = from_device<int>(d_counts.data(), tokens);
                 if (same_sizes != sizes) { ++failures; }
                 for (int t = 0; t < tokens; ++t) {
-                    if (sizes[t] >= 0 && sizes[t] <= kTop &&
-                        !std::equal(got.begin() + std::size_t(t) * kTop,
-                                    got.begin() + std::size_t(t) * kTop + sizes[t],
-                                    same.begin() + std::size_t(t) * kTop)) { ++failures; }
+                    if (sizes[t] >= 0 && sizes[t] <= top &&
+                        !std::equal(got.begin() + std::size_t(t) * top,
+                                    got.begin() + std::size_t(t) * top + sizes[t],
+                                    same.begin() + std::size_t(t) * top)) { ++failures; }
                 }
                 // Changed device position after capture must change causal visibility and RoPE.
                 const int next = position + 2;
                 d_first.copy_from_host(&next, 4);
                 CUDA_CHECK(cudaGraphLaunch(graph, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                const auto repeated = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+                const auto repeated = from_device<int>(d_selected.data(), std::size_t(tokens) * top);
                 const auto repeated_sizes = from_device<int>(d_counts.data(), tokens);
                 for (int t = 0; t < tokens; ++t) {
                     failures += check_selection("qsa changed-position graph", seq, pooled, next + t,
-                        repeated.data() + std::size_t(t) * kTop, repeated_sizes[t], yarn, t);
+                        repeated.data() + std::size_t(t) * top, repeated_sizes[t], yarn, t,
+                        nullptr, top);
                 }
             }
         }
@@ -344,6 +440,222 @@ int selection_case(int tokens, int capacity, int first, bool ties = false, const
     return failures;
 }
 
+// Three equal M-RoPE axes must be bit-for-bit identical to the original scalar
+// path, for pooled keys, tail, selected blocks and counts. This is the
+// self-contained YaRN compatibility check (no external multimodal reference).
+int equal_axes_equivalence(const Yarn& yarn, bool pre_norm) {
+    constexpr int kTokens   = 64;
+    constexpr int kCapacity = 700;
+    constexpr int kFirst    = 2048; // block-aligned, so tail_axes is never read
+    constexpr int top       = kDefaultTop;
+    Sequence seq{kTokens, std::vector<float>(static_cast<std::size_t>(kTokens) * kProjection),
+                 std::vector<float>(kDim), std::vector<float>(kDim),
+                 pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
+    fill_uniform(seq.projection, 9700, -2.0f, 2.0f);
+    fill_uniform(seq.query_norm, 9701, -0.5f, 0.5f);
+    fill_uniform(seq.key_norm, 9702, -0.5f, 0.5f);
+    round_to_bf16(seq.projection);
+    round_to_bf16(seq.query_norm);
+    round_to_bf16(seq.key_norm);
+    if (pre_norm) {
+        fill_uniform(seq.key_pre_norm, 9703, -0.5f, 0.5f);
+        round_to_bf16(seq.key_pre_norm);
+    }
+    const std::size_t pooled_bytes = static_cast<std::size_t>(kCapacity) * kDim * 4;
+    const std::size_t tail_bytes   = 3 * kDim * 4;
+    const std::size_t sel_bytes    = static_cast<std::size_t>(top) * kTokens * 4;
+    GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
+        d_kpn(kDim * 2), d_first(4), d_rope(3 * kTokens * 4), d_tail_axes(9 * 4),
+        a_pooled(pooled_bytes), a_tail(tail_bytes), a_sel(sel_bytes), a_cnt(kTokens * 4),
+        b_pooled(pooled_bytes), b_tail(tail_bytes), b_sel(sel_bytes), b_cnt(kTokens * 4);
+    const auto bits = encode_bf16(seq.projection), qn = encode_bf16(seq.query_norm),
+               kn = encode_bf16(seq.key_norm), kpn = encode_bf16(seq.key_pre_norm);
+    d_projection.copy_from_host(bits.data(), d_projection.bytes());
+    d_qn.copy_from_host(qn.data(), d_qn.bytes());
+    d_kn.copy_from_host(kn.data(), d_kn.bytes());
+    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), d_kpn.bytes());
+    std::vector<int> host(static_cast<std::size_t>(3) * kTokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int t = 0; t < kTokens; ++t) {
+            host[static_cast<std::size_t>(axis) * kTokens + t] = kFirst + t;
+        }
+    }
+    d_rope.copy_from_host(host.data(), host.size() * sizeof(int));
+    d_first.copy_from_host(&kFirst, 4);
+    for (auto* b : {&a_pooled, &b_pooled}) CUDA_CHECK(cudaMemset(b->data(), 0, b->bytes()));
+    for (auto* b : {&a_tail, &b_tail, &d_tail_axes}) CUDA_CHECK(cudaMemset(b->data(), 0, b->bytes()));
+
+    Tensor t_proj(d_projection.data(), DType::BF16, {kProjection, kTokens});
+    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
+        t_kpn(d_kpn.data(), DType::BF16, {kDim});
+    Tensor t_first(d_first.data(), DType::I32, {1});
+    Tensor t_rope(d_rope.data(), DType::I32, {kTokens, 3});
+    Tensor t_tail_axes(d_tail_axes.data(), DType::I32, {3, 3});
+    Tensor a_pool(a_pooled.data(), DType::FP32, {kDim, kCapacity}),
+        b_pool(b_pooled.data(), DType::FP32, {kDim, kCapacity});
+    Tensor a_t(a_tail.data(), DType::FP32, {kDim, 3}), b_t(b_tail.data(), DType::FP32, {kDim, 3});
+    Tensor a_s(a_sel.data(), DType::I32, {top, kTokens}), b_s(b_sel.data(), DType::I32, {top, kTokens});
+    Tensor a_c(a_cnt.data(), DType::I32, {kTokens}), b_c(b_cnt.data(), DType::I32, {kTokens});
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
+    const ops::QsaIndexerPositions positions{&t_rope, &t_tail_axes, nullptr};
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(kTokens, kCapacity));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), a_pool, a_t, stream);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), a_pool, workspace, a_s, a_c, stream);
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), b_pool, b_t, stream, positions);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), b_pool, workspace, b_s, b_c,
+                            stream, positions);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int failures = 0;
+    const auto pa = from_device<float>(a_pooled.data(), kCapacity * kDim);
+    const auto pb = from_device<float>(b_pooled.data(), kCapacity * kDim);
+    const auto ta = from_device<float>(a_tail.data(), 3 * kDim);
+    const auto tb = from_device<float>(b_tail.data(), 3 * kDim);
+    const auto sa = from_device<int>(a_sel.data(), static_cast<std::size_t>(top) * kTokens);
+    const auto sb = from_device<int>(b_sel.data(), static_cast<std::size_t>(top) * kTokens);
+    const auto ca = from_device<int>(a_cnt.data(), kTokens);
+    const auto cb = from_device<int>(b_cnt.data(), kTokens);
+    for (const auto& [label, equal] : {std::pair<const char*, bool>{"pooled", pa == pb},
+                                       {"tail", ta == tb}, {"selected", sa == sb},
+                                       {"counts", ca == cb}}) {
+        if (!equal) {
+            std::cerr << "equal-axes equivalence: " << label << " differs from the scalar path\n";
+            ++failures;
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (auto* b : {&d_projection, &d_qn, &d_kn, &d_kpn, &d_first, &d_rope, &d_tail_axes,
+                    &a_pooled, &a_tail, &a_sel, &a_cnt, &b_pooled, &b_tail, &b_sel, &b_cnt}) {
+        failures += b->verify_guards("equal axes");
+    }
+    return failures;
+}
+
+// The engine's multimodal prefill feeds the indexer a NON-CONTIGUOUS slice `rope.slice(0, col, W)`
+// of a longer axis-major [full, 3] plane, so the three axes stay spaced by `full` (not W). A
+// materialized contiguous [W, 3] copy of the same part spaces the axes by W. Both hold the same
+// per-token 3-axis positions, and the slice must be read at axis*full + t to give results
+// bit-identical to the copy. The case pins the zero-copy stride read against a materialized copy
+// over the pool/query/score/select routes with distinct M-RoPE axes, YaRN/interpolation and the
+// QSA-27B pre-norm key.
+int sliced_matches_materialized(std::uint32_t seed, const std::vector<std::array<int, 3>>* axes,
+                                int part_tokens, const Yarn& yarn, bool pre_norm) {
+    const int col     = 128;
+    const int full    = part_tokens + 256;                 // plane longer than the part: the slice is non-contiguous
+    const int base    = col;                               // first_position of the part
+    const int capacity = full / 4 + 64;                    // pooled blocks beyond top, so selection scores
+    const int top      = 4;
+    Sequence seq{full, std::vector<float>(static_cast<std::size_t>(full) * kProjection),
+                 std::vector<float>(kDim), std::vector<float>(kDim),
+                 pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
+    fill_uniform(seq.projection, seed, -2.0f, 2.0f);
+    fill_uniform(seq.query_norm, seed + 1, -0.5f, 0.5f);
+    fill_uniform(seq.key_norm, seed + 2, -0.5f, 0.5f);
+    round_to_bf16(seq.projection);
+    round_to_bf16(seq.query_norm);
+    round_to_bf16(seq.key_norm);
+    if (pre_norm) {
+        fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
+        round_to_bf16(seq.key_pre_norm);
+    }
+    // full[axis * full + p] = axes[p][axis]; the part's materialized copy mat[axis * W + t] =
+    // axes[col + t][axis] carries the same per-token positions the slice addresses at col + t.
+    std::vector<int> full_host(static_cast<std::size_t>(3) * full);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int p = 0; p < full; ++p) {
+            full_host[static_cast<std::size_t>(axis) * full + p] =
+                (*axes)[static_cast<std::size_t>(p)][axis];
+        }
+    }
+    std::vector<int> mat_host(static_cast<std::size_t>(3) * part_tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int t = 0; t < part_tokens; ++t) {
+            mat_host[static_cast<std::size_t>(axis) * part_tokens + t] =
+                (*axes)[static_cast<std::size_t>(col + t)][axis];
+        }
+    }
+    GuardedDeviceBuffer d_projection(static_cast<std::size_t>(full) * kProjection * 2),
+        d_qn(kDim * 2), d_kn(kDim * 2), d_kpn(kDim * 2), d_first(4),
+        d_full_rope(static_cast<std::size_t>(3) * full * 4),
+        d_mat_rope(static_cast<std::size_t>(3) * part_tokens * 4),
+        a_pooled(static_cast<std::size_t>(capacity) * kDim * 4), b_pooled(a_pooled.bytes()),
+        a_tail(3 * kDim * 4), b_tail(a_tail.bytes()), a_sel(static_cast<std::size_t>(top) * part_tokens * 4),
+        b_sel(a_sel.bytes()), a_cnt(part_tokens * 4), b_cnt(a_cnt.bytes()),
+        a_tail_axes(9 * 4), b_tail_axes(9 * 4);
+    const auto bits = encode_bf16(seq.projection), qn = encode_bf16(seq.query_norm),
+               kn = encode_bf16(seq.key_norm), kpn = encode_bf16(seq.key_pre_norm);
+    d_projection.copy_from_host(bits.data(), d_projection.bytes());
+    d_qn.copy_from_host(qn.data(), qn.size() * sizeof(std::uint16_t));
+    d_kn.copy_from_host(kn.data(), kn.size() * sizeof(std::uint16_t));
+    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), kpn.size() * sizeof(std::uint16_t));
+    d_full_rope.copy_from_host(full_host.data(), full_host.size() * sizeof(int));
+    d_mat_rope.copy_from_host(mat_host.data(), mat_host.size() * sizeof(int));
+    d_first.copy_from_host(&base, 4);
+    for (auto* b : {&a_pooled, &b_pooled, &a_tail, &b_tail, &a_tail_axes, &b_tail_axes}) {
+        CUDA_CHECK(cudaMemset(b->data(), 0, b->bytes()));
+    }
+    // The part's projection columns begin at element col * kProjection of the sequence projection.
+    auto* const part_column = static_cast<std::uint16_t*>(d_projection.data()) +
+                              static_cast<std::size_t>(col) * kProjection;
+    Tensor t_proj(part_column, DType::BF16, {kProjection, part_tokens});
+    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
+        t_kpn(d_kpn.data(), DType::BF16, {kDim});
+    Tensor t_first(d_first.data(), DType::I32, {1});
+    Tensor t_full_rope(d_full_rope.data(), DType::I32, {full, 3});
+    Tensor t_rope_sliced = t_full_rope.slice(0, col, part_tokens); // non-contiguous: axis stride full
+    Tensor t_mat_rope(d_mat_rope.data(), DType::I32, {part_tokens, 3}); // contiguous: axis stride W
+    Tensor t_tail_axes_a(a_tail_axes.data(), DType::I32, {3, 3}),
+        t_tail_axes_b(b_tail_axes.data(), DType::I32, {3, 3});
+    Tensor a_pool(a_pooled.data(), DType::FP32, {kDim, capacity}),
+        b_pool(b_pooled.data(), DType::FP32, {kDim, capacity});
+    Tensor a_t(a_tail.data(), DType::FP32, {kDim, 3}), b_t(b_tail.data(), DType::FP32, {kDim, 3});
+    Tensor a_s(a_sel.data(), DType::I32, {top, part_tokens}),
+        b_s(b_sel.data(), DType::I32, {top, part_tokens});
+    Tensor a_c(a_cnt.data(), DType::I32, {part_tokens}), b_c(b_cnt.data(), DType::I32, {part_tokens});
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
+    // The reference (materialized) uses an axis stride equal to the part width; the sliced uses the
+    // plane's full stride, so the kernels must resolve the same positions for the same tokens.
+    const ops::QsaIndexerPositions pos_mat{&t_mat_rope, &t_tail_axes_a, nullptr};
+    const ops::QsaIndexerPositions pos_sli{&t_rope_sliced, &t_tail_axes_b, nullptr};
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(part_tokens, capacity, top));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), a_pool, a_t, stream, pos_mat);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), a_pool, workspace, a_s, a_c,
+                            stream, pos_mat, top);
+    ops::qsa_indexer_append(t_proj, t_first, weights, kEps, yarn.op(), b_pool, b_t, stream, pos_sli);
+    ops::qsa_indexer_select(t_proj, t_first, weights, kEps, yarn.op(), b_pool, workspace, b_s, b_c,
+                            stream, pos_sli, top);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int failures = 0;
+    const auto pa = from_device<float>(a_pooled.data(), static_cast<std::size_t>(capacity) * kDim);
+    const auto pb = from_device<float>(b_pooled.data(), static_cast<std::size_t>(capacity) * kDim);
+    const auto ta = from_device<float>(a_tail.data(), 3 * kDim);
+    const auto tb = from_device<float>(b_tail.data(), 3 * kDim);
+    const auto sa = from_device<int>(a_sel.data(), static_cast<std::size_t>(top) * part_tokens);
+    const auto sb = from_device<int>(b_sel.data(), static_cast<std::size_t>(top) * part_tokens);
+    const auto ca = from_device<int>(a_cnt.data(), part_tokens);
+    const auto cb = from_device<int>(b_cnt.data(), part_tokens);
+    for (const auto& [label, equal] : {std::pair<const char*, bool>{"pooled", pa == pb},
+                                       {"tail", ta == tb}, {"selected", sa == sb},
+                                       {"counts", ca == cb}}) {
+        if (!equal) {
+            std::cerr << "sliced non-contiguous read differs from the materialized copy: " << label
+                      << " (tokens=" << part_tokens << (pre_norm ? " pre-norm" : "")
+                      << (yarn.active() ? " yarn" : "") << ")\n";
+            ++failures;
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (auto* b : {&d_projection, &d_qn, &d_kn, &d_kpn, &d_first, &d_full_rope, &d_mat_rope,
+                    &a_pooled, &b_pooled, &a_tail, &b_tail, &a_sel, &b_sel, &a_cnt, &b_cnt,
+                    &a_tail_axes, &b_tail_axes}) {
+        failures += b->verify_guards("sliced");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -352,6 +664,7 @@ int main() {
         return 77;
     }
     int failures = run(8100u);
+    failures += run(8300u, {}, true);
     // Scalar below 64 tokens (80 on an A100), narrow and wide SIMT tiles or the A100's tensor tile
     // above, by the device's SM count: each card meets the routes it selects.
     for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 63, 64, 79, 80, 127, 128, 129, 512}) {
@@ -367,14 +680,51 @@ int main() {
     failures += selection_case(129, 32768, 130970);
     failures += selection_case(512, 32768, 0);
     failures += selection_case(512, 32768, 1800);
+    // Raised budgets: the same selections at 128, 256, 1024 and the compile-time cap, the
+    // all-select shortcut when the context fits the budget (no scoring), and the tiled scoring
+    // route with a budget below the context.
+    failures += selection_case(5, 700, 2050, false, Yarn{}, 128);
+    failures += selection_case(64, 700, 2050, false, Yarn{}, 256);
+    failures += selection_case(128, 700, 2400, false, Yarn{}, 1024);
+    failures += selection_case(128, 8192, 32700, false, Yarn{}, ops::kQsaTopBlocksMax);
+    failures += run(8150u, {}, false, nullptr, 128);
+    failures += run(8160u, {}, false, nullptr, 1024);
     // YaRN at the factor of Flash-Next's 589,824-token window: the whole prefill / decode / verify
     // flow, the scalar and tiled scoring routes, and queries near that window's end.
     const Yarn yarn{2.25, 262144.0};
     failures += run(8200u, yarn);
+    failures += run(8400u, yarn, true);
     failures += selection_case(5, 700, 2050, false, yarn);
     failures += selection_case(129, 32768, 130970, false, yarn);
     failures += selection_case(5, 147500, 589000, false, yarn);
     failures += selection_case(128, 147500, 589000, false, yarn);
+    // Interleaved 3-axis M-RoPE. Three equal axes must be bit-for-bit identical to the
+    // scalar path, with and without YaRN / interpolation / pre-norm. Distinct t/h/w axes
+    // are checked against the 3D FP64 oracle, including YaRN x 3D, interpolation x 3D,
+    // cross-call tail_axes and CUDA Graph replay (inside run()).
+    const auto equal_axes = make_axes(2600, false);
+    const auto mrope_axes = make_axes(2600, true);
+    for (const auto& cfg : {Yarn{}, Yarn{2.25, 262144.0}, Yarn{4.0, 262144.0},
+                            Yarn{2.25, 262144.0, 3.0, 2050}}) {
+        failures += equal_axes_equivalence(cfg, false);
+        failures += equal_axes_equivalence(cfg, true);
+    }
+    failures += run(8500u, {}, false, &equal_axes);
+    failures += run(8600u, {}, true, &mrope_axes);
+    failures += run(8700u, Yarn{2.25, 262144.0}, false, &mrope_axes);
+    failures += run(8800u, Yarn{4.0, 262144.0}, true, &mrope_axes);
+    failures += run(8900u, Yarn{2.25, 262144.0, 3.0, 2050}, false, &mrope_axes);
+    // The engine's multimodal prefill feeds the indexer a NON-CONTIGUOUS slice of the full
+    // [T,3] axis-major plane (axis stride T, not the part width). Slicing such a plane and
+    // comparing the stride-aware read against a materialized contiguous copy of the same part
+    // proves the zero-copy read equals direction 1's copy — the non-contiguous slice the engine's
+    // multimodal prefill hands the indexer. YaRN and pre-norm variants exercise the
+    // pool/query/score/select routes' interpolation branch.
+    failures += sliced_matches_materialized(9000u, &mrope_axes, 700,   Yarn{},                    false);
+    failures += sliced_matches_materialized(9010u, &mrope_axes, 64,    Yarn{},                    false);
+    failures += sliced_matches_materialized(9020u, &mrope_axes, 129,   Yarn{2.25, 262144.0},      true);
+    failures += sliced_matches_materialized(9030u, &mrope_axes, 512,   Yarn{2.25, 262144.0, 3.0, 2050}, false);
+    failures += sliced_matches_materialized(9040u, &mrope_axes, 512,   Yarn{4.0, 262144.0},       true);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " qsa_indexer\n";
     return failures == 0 ? 0 : 1;
 }

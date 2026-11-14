@@ -4,6 +4,8 @@
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
+#include "ninfer/ops/qsa_budget.h"
+
 #include <spdlog/logger.h>
 
 #include <algorithm>
@@ -588,6 +590,45 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           ? std::string()
                           : " | expert cache " +
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
+    }
+
+    if (engine.qwen38_27b_qsa) {
+        // The artifact's own budget no longer decides the window once the flag is set, so name the
+        // source: a reader of the log must be able to tell 2,048 from an override (plan §6.5).
+        const std::uint32_t native_tokens = static_cast<std::uint32_t>(ninfer::ops::kQsaBlockTokens) *
+                                            static_cast<std::uint32_t>(ninfer::ops::kQsaTopBlocksDefault);
+        if (engine.qsa_top_blocks == 0) {
+            logger_->info("qsa | history window {} blocks, {} tokens | the artifact's own",
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)),
+                          product::format_pretty_count(native_tokens));
+        } else {
+            logger_->info("qsa | history window {} blocks, {} tokens | overrides the artifact's {}",
+                          product::format_pretty_count(engine.qsa_top_blocks),
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(engine.qsa_top_blocks) *
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaBlockTokens)),
+                          product::format_pretty_count(
+                              static_cast<std::uint64_t>(ninfer::ops::kQsaTopBlocksDefault)));
+        }
+        if (engine.max_concurrency > 1) {
+            // The sparse branch scores, appends and reads each part through its own lane's
+            // indexer state and stream pool. A captured graph bakes those per-lane pointers
+            // and the row-bound KV views in, so a multi-lane replay would touch lanes it does
+            // not own; QSA runs without CUDA graphs above one concurrency.
+            logger_->info("qsa | CUDA graphs off | concurrency {} needs per-lane replay",
+                          engine.max_concurrency);
+        }
+    }
+
+    if (memory.kv_stream_host_pinned_bytes != 0) {
+        // --kv-resident under QSA: the staging layer and the MTP pool both address the full
+        // history (a wide prefill stages it, a verification reads it densely), so neither can
+        // shrink below the logical page count. The pinned copy is RAM, not VRAM.
+        logger_->info("kv stream | device staging {} | MTP pool {} | pinned host KV {} (RAM)",
+                      product::format_pretty_bytes(memory.kv_stream_staging_bytes),
+                      product::format_pretty_bytes(memory.kv_mtp_payload_bytes),
+                      product::format_pretty_bytes(memory.kv_stream_host_pinned_bytes));
     }
 
     if (cache.enabled) {

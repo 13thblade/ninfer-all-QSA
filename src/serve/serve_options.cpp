@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
 #include "product/option_layers.h"
+#include "product/qsa_top_blocks_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -258,6 +259,12 @@ std::string serve_usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
+           "  --qwen38-27b-qsa              Qwen3.8-27B: run the QSA sparse attention branch\n"
+           "                                of every full-attention layer; needs the\n"
+           "                                artifact's block indexer, one device and no\n"
+           "                                tensor parallelism; works with the model's own\n"
+           "                                MTP drafts\n" +
+           std::string(product::kQsaTopBlocksHelp) +
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
@@ -1216,6 +1223,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                                               [&] { return require_value(arg.c_str()); })) {
             continue;
         }
+        if (product::parse_qsa_top_blocks_option(arg, options.qsa_top_blocks,
+                                                 [&] { return require_value(arg.c_str()); })) {
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1243,6 +1254,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (product::switch_option(arg, "invariant-attention", [&](bool on) { options.invariant_attention = on; })) {
+            continue;
+        }
+        if (product::switch_option(arg, "qwen38-27b-qsa",
+                                   [&](bool on) { options.qwen38_27b_qsa = on; })) {
             continue;
         }
         if (arg == "--kv-dtype") {
@@ -1754,6 +1769,15 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         hybrid_cache_selected || (!original_cache_selected && catalog_option == nullptr)
             ? ContextCacheMode::Hybrid
             : ContextCacheMode::Legacy;
+    // QSA runs on the hybrid prefix cache only: a QSA session's KV lives in the streamed store and
+    // its prefix entries carry the sparse indexer's state, which the checkpoint catalog has no
+    // candidate to rebuild. Refuse the combination rather than cache nothing and answer slowly.
+    if (options.qwen38_27b_qsa && original_cache_selected) {
+        throw product::OptionConflict(
+            {"qwen38-27b-qsa", "use-original-prefix-caching"},
+            "--qwen38-27b-qsa runs the hybrid prefix cache and cannot be combined with "
+            "--use-original-prefix-caching");
+    }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
         // it sizes the KV pool to free VRAM unless a capacity is given.

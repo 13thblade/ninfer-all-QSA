@@ -317,6 +317,56 @@ int main() {
         failures += check(rejected, "a Host budget below one snapshot was accepted");
     }
 
+    // The QSA sparse branch under the hybrid prefix cache: --kv-resident's pinned host KV does
+    // not change the hybrid budget. The slab pool keeps its default, no Legacy Host pools coexist
+    // with it, and every lane keeps one private continuation.
+    {
+        EngineOptions options;
+        options.max_concurrency           = 2;
+        options.qwen38_27b_qsa            = true;
+        options.kv_resident_positions     = 8192;
+        options.context_cache.mode        = ninfer::ContextCacheMode::Hybrid;
+        const EngineOptions normalized    = normalize_engine_options(options);
+        const ninfer::ContextCacheOptions& out = normalized.context_cache;
+        failures +=
+            check(out.host_cache_budget_bytes == ninfer::kDefaultHybridHostCacheBytes &&
+                      out.host_kv_capacity_bytes == 0 && out.host_state_slots == 0 &&
+                      out.max_private_continuations == 2U && out.max_shared_prefixes == 0U &&
+                      out.device_state_slots == 4U,
+                  "QSA + hybrid + --kv-resident did not keep the hybrid budget and lane capacities");
+    }
+
+    // QSA under the Legacy cache keeps exactly one conversation: the lane's indexer planes (and,
+    // under --kv-resident, its pinned host KV) live in per-Program state the Legacy StateImage
+    // does not carry, so the catalog is clamped to one Device slot, one private continuation,
+    // no shared prefixes and no anchors, whatever the concurrency is.
+    {
+        EngineOptions options;
+        options.max_concurrency         = 4;
+        options.qwen38_27b_qsa          = true;
+        options.kv_resident_positions   = 8192;
+        const ninfer::ContextCacheOptions out = normalize_engine_options(options).context_cache;
+        failures +=
+            check(out.device_state_slots == 1U && out.max_private_continuations == 1U &&
+                      out.max_shared_prefixes == 0U &&
+                      out.max_long_anchors_per_continuation == 0U &&
+                      out.host_kv_capacity_bytes == 0 && out.host_state_slots == 0,
+                  "QSA + legacy did not clamp the catalog to a single conversation");
+    }
+
+    // The same branch cannot spill to the Legacy Host tier: the indexer planes stay in Device
+    // scratch, so any Host budget is refused.
+    {
+        EngineOptions options;
+        options.qwen38_27b_qsa                    = true;
+        options.context_cache.host_cache_budget_bytes = 1ULL << 20;
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "QSA + legacy accepted a Host cache budget");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -2,8 +2,9 @@
 // include/ninfer/ops/kv_stream.h). One CTA of 1,024 threads resolves a call: it looks up every
 // block the queries read, claims the missing ones, picks their slots with a clock sweep and
 // re-points the table; a second launch of a fixed grid copies the claimed and rewritten blocks
-// from the host copy into their slots. Both read the call's position from a device word and the
-// number of copies from the map, so a captured graph replays them at any position.
+// from the host copy (or the named prefix source for blocks the host copy does not hold) into
+// their slots. Both read the call's position from a device word and the number of copies from
+// the map, so a captured graph replays them at any position.
 #include "ninfer/ops/kv_stream.h"
 
 #include "core/device_launch.h"
@@ -22,7 +23,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr int kResolveThreads = 1024;
-constexpr int kTopBlocks      = 512;
 constexpr int kHostPage       = kPagedKVPageSize;
 constexpr int kBlocksPerPage  = kHostPage / kKvStreamPageTokens; // 16
 // Blocks one call writes: positions first .. first + 15 span at most five blocks.
@@ -83,7 +83,8 @@ __device__ __forceinline__ unsigned long long* counters(const KvStreamMap& m) {
 
 __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(KvStreamMap m, const int* __restrict__ first_word,
-                   const int* __restrict__ selected, const int* __restrict__ counts, int tokens) {
+                   const int* __restrict__ selected, const int* __restrict__ counts, int tokens,
+                   int selected_stride) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut;
     __shared__ int warp_sums[32];
     __shared__ int read_written[kWrittenBlocks];
@@ -108,7 +109,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         const int p      = first + q;
         const int count  = counts[q];
         const bool tail  = (p + 1) % kKvStreamPageTokens != 0;
-        const int* list  = selected + static_cast<long long>(q) * kTopBlocks;
+        const int* list  = selected + static_cast<long long>(q) * selected_stride;
         const int blocks = count + (tail ? 1 : 0);
         for (int i = threadIdx.x; i < blocks; i += kResolveThreads) {
             const int b = i < count ? list[i] : p / kKvStreamPageTokens;
@@ -219,8 +220,11 @@ __global__ void __launch_bounds__(kResolveThreads)
 }
 
 // Copy k of the last resolve: block b's rows of every head and plane, from its host page into
-// its slot, in 8-byte words.
-__global__ void __launch_bounds__(kCopyThreads) copy_kernel(KvStreamMap m, Planes planes) {
+// its slot, in 8-byte words. A block the host copy does not hold (the lane's prefix, streamed
+// tier) sources its 64-position block record from the prefix table instead: one segment
+// lookup per copy, each plane at its offset within the record.
+__global__ void __launch_bounds__(kCopyThreads) copy_kernel(KvStreamMap m, Planes planes,
+                                                           KvStreamPrefixSource prefix) {
     const int copies = m.control[2];
     int per_block    = 0;
     for (int a = 0; a < planes.count; ++a) per_block += planes.plane[a].words * planes.heads;
@@ -229,6 +233,15 @@ __global__ void __launch_bounds__(kCopyThreads) copy_kernel(KvStreamMap m, Plane
         const long long slot = m.copy_slot[k];
         const long long page = b / kBlocksPerPage;
         const int within     = static_cast<int>(b % kBlocksPerPage) * kKvStreamPageTokens;
+        const KvStreamPrefixSegment* prefix_segment = nullptr;
+        for (int s = 0; s < prefix.segment_count; ++s) {
+            const KvStreamPrefixSegment& segment = prefix.segments[s];
+            if (page >= segment.first_block &&
+                page < static_cast<long long>(segment.first_block + segment.count)) {
+                prefix_segment = &segment;
+                break;
+            }
+        }
         for (int i = threadIdx.x; i < per_block; i += blockDim.x) {
             int rest = i, a = 0;
             while (rest >= planes.plane[a].words * planes.heads) {
@@ -238,12 +251,24 @@ __global__ void __launch_bounds__(kCopyThreads) copy_kernel(KvStreamMap m, Plane
             const Plane& plane = planes.plane[a];
             const int head     = rest / plane.words;
             const int word     = rest % plane.words;
-            const long long source =
-                ((page * planes.heads + head) * kHostPage + within) * plane.row_bytes;
+            const unsigned char* host_base;
+            long long source;
+            if (prefix_segment != nullptr) {
+                // The record's plane page is the host page's layout at its within-record offset.
+                host_base = reinterpret_cast<const unsigned char*>(prefix_segment->base) +
+                            (page - prefix_segment->first_block) * prefix.record_stride +
+                            prefix.plane_offset[a];
+                source = (head * kHostPage + within) * static_cast<long long>(plane.row_bytes);
+            } else {
+                host_base = plane.host;
+                source =
+                    ((page * planes.heads + head) * kHostPage + within) *
+                    static_cast<long long>(plane.row_bytes);
+            }
             const long long target =
                 ((slot * planes.heads + head) * kKvStreamPageTokens) * plane.row_bytes;
             reinterpret_cast<uint2*>(plane.pool + target)[word] =
-                reinterpret_cast<const uint2*>(plane.host + source)[word];
+                reinterpret_cast<const uint2*>(host_base + source)[word];
         }
     }
 }
@@ -360,14 +385,24 @@ void kv_stream_reset(const KvStreamMap& map, cudaStream_t stream) {
 
 void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const Tensor& selected, const Tensor& counts, const PagedKVLayerView& host,
-                       const PagedKVLayerView& pool, cudaStream_t stream) {
+                       const PagedKVLayerView& pool, const KvStreamPrefixSource& prefix,
+                       cudaStream_t stream) {
     require(map.table != nullptr, "an empty map");
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
-                selected.ne[0] == kTopBlocks && selected.ne[1] > 0,
-            "selected must be contiguous I32 [512, tokens]");
+                selected.ne[0] >= 1 && selected.ne[0] <= kQsaTopBlocksMax && selected.ne[1] > 0,
+            "selected must be contiguous I32 [top_blocks, tokens]");
     const std::int32_t tokens = selected.ne[1];
+    const std::int32_t stride = selected.ne[0];
     require(tokens <= kKvStreamMaxTokens, "a resolved call has at most 16 queries");
-    require(map.slots >= kv_stream_minimum_slots(tokens),
+    // A verify's columns sit at consecutive positions and can pick disjoint indexer selections,
+    // so the pool must hold the disjoint worst case. kv_stream_minimum_slots(width, query_blocks)
+    // gives that count; the engine's automatic floor (startup.cpp) now sizes the pool to it, and
+    // direct callers/tests use the same bound. This per-call check only enforces the lighter
+    // overlapping bound (one query's selection plus the blocks the call writes) as a cheap sanity
+    // floor; the real overflow guard is resolve_kernel's control[3] below (step 4).
+    const std::int32_t written_blocks =
+        (tokens + kKvStreamPageTokens - 1) / kKvStreamPageTokens;
+    require(map.slots >= stride + written_blocks,
             "the pool cannot hold the blocks of one call");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,
@@ -377,9 +412,9 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const Planes planes = planes_of(map, host, pool);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         map, static_cast<const int*>(first_position.data), static_cast<const int*>(selected.data),
-        static_cast<const int*>(counts.data), tokens);
+        static_cast<const int*>(counts.data), tokens, stride);
     CUDA_CHECK(cudaGetLastError());
-    copy_kernel<<<kCopyBlocks, kCopyThreads, 0, stream>>>(map, planes);
+    copy_kernel<<<kCopyBlocks, kCopyThreads, 0, stream>>>(map, planes, prefix);
     CUDA_CHECK(cudaGetLastError());
 }
 

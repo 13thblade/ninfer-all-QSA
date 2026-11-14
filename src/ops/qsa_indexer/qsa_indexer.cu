@@ -2,8 +2,10 @@
 // include/ninfer/ops/qsa_indexer.h). Pooling runs one CTA per completed block. Selection scores the
 // blocks into workspace, a few tokens with one CTA per token and 64 blocks, prompts in tiles of
 // tokens x blocks (grids sized by the capacity, so a graph replays them at any position), then one
-// CTA per query runs a four-pass radix select of the 512th key and two ordered passes that keep
-// ties at the lower block index and write the blocks in increasing order.
+// CTA per query runs a four-pass radix select of the top_blocks-th key and two ordered passes that
+// keep ties at the lower block index and write the blocks in increasing order. `top_blocks` is a
+// kernel argument (defaulting to the artifact's 512): the geometry and grids do not depend on it,
+// so a captured graph replays a raised budget as it stands.
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/rope.h"
 
@@ -20,8 +22,10 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {
@@ -29,8 +33,7 @@ namespace {
 constexpr int kHeadDim     = 128;
 constexpr int kHeads       = 4;
 constexpr int kRotaryPairs = 32;
-constexpr int kBlock       = 4;
-constexpr int kTopBlocks   = 512;
+constexpr int kBlock       = kQsaBlockTokens;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
 constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
@@ -55,16 +58,52 @@ __device__ __forceinline__ float rope_frequency(int pair) {
 // YaRN's rotation: each pair's inverse frequency and the attention factor on cos and sin. A kernel
 // parameter, so a captured graph keeps it. The kernels take it as a template choice: their unscaled
 // instantiation is the original code, so it rounds as before.
+// `active` is yarn.active() (a YaRN factor OR linear position interpolation).
+// The engine's dense YaRN route runs for either, so the indexer must too; the
+// frequency table and the attention factor come from the same yarn_schedule()
+// the dense route uses. Interpolation matches rope.cuh's rope_yarn_kernel and
+// is applied per axis, before the angle. With no interpolation the threshold is
+// FLT_MAX and the scale 1, so the YaRN path rounds exactly as before.
 struct QsaRope {
     float inverse_frequency[kRotaryPairs];
     float attention_factor;
-    int scaled;
+    float interpolation_threshold;
+    float interpolation_scale;
+    int active;
+    // Interleaved M-RoPE axis of each rotated pair. The engine's native route is
+    // pair % 3 (RopeConfig::pair_axes for sections [11,11,10]); a caller may
+    // override it. With three equal axis positions this is exactly the scalar
+    // rotation, whatever the mapping.
+    int axes[kRotaryPairs];
 };
+
+// Three equal axes are the scalar path; an image/video token supplies distinct
+// t/h/w axes from an axis-major [tokens, 3] plane.
+__device__ __forceinline__ void scalar_positions(int position, int* out) {
+    out[0] = out[1] = out[2] = position;
+}
+
+__device__ __forceinline__ void call_positions(const int* __restrict__ rope_positions,
+                                                std::int32_t axis_stride, int t,
+                                                int position, int* out) {
+    if (rope_positions == nullptr) {
+        scalar_positions(position, out);
+    } else {
+        for (int axis = 0; axis < 3; ++axis) {
+            out[axis] = rope_positions[static_cast<std::int64_t>(axis) * axis_stride + t];
+        }
+    }
+}
 
 // cos and sin of pair `pair` at `position` under YaRN.
 __device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int position,
                                             float* sine, float* cosine) {
-    sincosf(static_cast<float>(position) * rope.inverse_frequency[pair], sine, cosine);
+    float scaled = static_cast<float>(position);
+    if (scaled > rope.interpolation_threshold) {
+        scaled = rope.interpolation_threshold +
+                 (scaled - rope.interpolation_threshold) * rope.interpolation_scale;
+    }
+    sincosf(scaled * rope.inverse_frequency[pair], sine, cosine);
     *sine *= rope.attention_factor;
     *cosine *= rope.attention_factor;
 }
@@ -72,8 +111,9 @@ __device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int p
 // Zero-centred RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
 // rotate-half rotation of its first 64 dims at `position`. `values` is the group's shared row.
 template <bool Yarn>
-__device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps, int position,
-                              int lane128, float* reduce, const QsaRope& rope) {
+__device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps,
+                              const int* position3, int lane128, float* reduce,
+                              const QsaRope& rope) {
     const float x = values[lane128];
     float square  = x * x;
 #pragma unroll
@@ -89,6 +129,7 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     values[lane128] = normed;
     __syncthreads();
     if (lane128 < kRotaryPairs) {
+        const int position = position3[rope.axes[lane128]];
         float sine, cosine;
         if constexpr (Yarn) {
             yarn_sincos(rope, lane128, position, &sine, &cosine);
@@ -103,50 +144,121 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     __syncthreads();
 }
 
+// Zero-centred RMSNorm of one raw indexer key, a 128-vector held one value per thread, before the
+// 4-token mean. `key_pre_norm` supplies the stored 1 + w weight of the QSA-27B adaptation; the
+// reduction is the same four-warp sum `norm_rope_row` uses.
+template <bool PreNorm>
+__device__ __forceinline__ float pre_norm_key(float value, int d,
+                                              const __nv_bfloat16* __restrict__ key_pre_norm,
+                                              float eps, float* reduce) {
+    if constexpr (!PreNorm) {
+        return value;
+    } else {
+        float square = value * value;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            square += __shfl_xor_sync(0xffffffffu, square, offset);
+        }
+        const int warp = d >> 5;
+        if ((d & 31) == 0) reduce[warp] = square;
+        __syncwarp();
+        __syncthreads();
+        const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
+        const float normed =
+            value * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(key_pre_norm[d]));
+        __syncthreads();
+        return normed;
+    }
+}
+
 // One 128-thread CTA per block completing in the call: mean of its four raw keys (from the tail
 // or the projection), norm, rope at the block's first position. The grid covers every block a call
-// of `tokens` can complete; a CTA past the call's completed blocks has nothing to do.
-template <bool Yarn>
+// of `tokens` can complete; a CTA past the call's completed blocks has nothing to do. With
+// `PreNorm` every projection key is first normalized by `key_pre_norm`; the tail already holds
+// keys normalized by the call that wrote it.
+template <bool Yarn, bool PreNorm>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                    int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
+                    int tokens, const __nv_bfloat16* __restrict__ key_norm,
+                    const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
                     const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
-                    const QsaRope rope) {
+                    const int* __restrict__ rope_positions, int* __restrict__ tail_axes,
+                    std::int32_t pos_tokens, std::int32_t axis_stride, const QsaRope rope) {
     __shared__ float row[kHeadDim];
     __shared__ float reduce[4];
     const int first_position = *first;
     const int block          = first_position / kBlock + static_cast<int>(blockIdx.x);
     if (block >= (first_position + tokens) / kBlock || block >= capacity) { return; }
+    // A completed block is rotated at its FIRST token's 3-axis position. That
+    // token can belong to this call's projection or to the previous call's
+    // incomplete-block tail, whose axis positions tail_axes carries over.
+    const int block_first = block * kBlock;
+    int block_pos3[3];
+    if (rope_positions != nullptr && block_first >= first_position &&
+        block_first - first_position < pos_tokens) {
+        for (int axis = 0; axis < 3; ++axis) {
+            block_pos3[axis] = rope_positions[static_cast<std::int64_t>(axis) * axis_stride +
+                                              (block_first - first_position)];
+        }
+    } else if (tail_axes != nullptr && block_first < first_position) {
+        for (int axis = 0; axis < 3; ++axis) {
+            block_pos3[axis] = tail_axes[static_cast<std::int64_t>(axis) * (kBlock - 1) +
+                                         (block_first % kBlock)];
+        }
+    } else {
+        scalar_positions(block_first, block_pos3);
+    }
     const int d     = threadIdx.x;
     float sum       = 0.0f;
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) {
         const int position = block * kBlock + i;
-        sum += position < first_position
-                   ? tail[(position % kBlock) * kHeadDim + d]
-                   : __bfloat162float(projection[static_cast<std::int64_t>(position - first_position) *
-                                                     kProjection +
-                                                 kHeads * kHeadDim + d]);
+        if (position < first_position) {
+            sum += tail[(position % kBlock) * kHeadDim + d];
+        } else {
+            float value = __bfloat162float(
+                projection[static_cast<std::int64_t>(position - first_position) * kProjection +
+                           kHeads * kHeadDim + d]);
+            sum += pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+        }
     }
     row[d] = sum * 0.25f;
     __syncthreads();
-    norm_rope_row<Yarn>(row, key_norm, eps, block * kBlock, d, reduce, rope);
+    norm_rope_row<Yarn>(row, key_norm, eps, block_pos3, d, reduce, rope);
     pooled[static_cast<std::int64_t>(block) * kHeadDim + d] = row[d];
 }
 
 // The raw keys of the incomplete block after the call, at slot position mod 4. Positions of that
-// block before the call are already in place.
+// block before the call are already in place. With `PreNorm` each key is normalized by
+// `key_pre_norm` before it enters the tail, matching the pooled path.
+template <bool PreNorm>
 __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
                                 const int* __restrict__ first, int tokens,
-                                float* __restrict__ tail) {
+                                const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
+                                float* __restrict__ tail,
+                                const int* __restrict__ rope_positions,
+                                int* __restrict__ tail_axes, std::int32_t axis_stride) {
+    __shared__ float reduce[4];
     const int first_position = *first;
     const int last      = first_position + tokens - 1;
     const int start     = (last + 1) / kBlock * kBlock; // first position of the incomplete block
     const int d         = threadIdx.x;
     for (int position = max(start, first_position); position <= last; ++position) {
-        tail[(position % kBlock) * kHeadDim + d] = __bfloat162float(
+        float value = __bfloat162float(
             projection[static_cast<std::int64_t>(position - first_position) * kProjection +
                        kHeads * kHeadDim + d]);
+        value = pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+        tail[(position % kBlock) * kHeadDim + d] = value;
+        // Keep the tail slots' 3-axis positions for the next call's pooling of
+        // a block that starts inside this incomplete block.
+        if (tail_axes != nullptr && d == 0) {
+            int pos3[3];
+            call_positions(rope_positions, axis_stride, position - first_position, position, pos3);
+            for (int axis = 0; axis < 3; ++axis) {
+                tail_axes[static_cast<std::int64_t>(axis) * (kBlock - 1) +
+                          (position % kBlock)] = pos3[axis];
+            }
+        }
     }
 }
 
@@ -162,15 +274,18 @@ template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
                      const __nv_bfloat16* query_norm, float eps, float* queries,
-                     const QsaRope rope) {
+                     const int* __restrict__ rope_positions, std::int32_t axis_stride,
+                     const QsaRope rope, int top_blocks) {
     __shared__ float row[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
     const int t = blockIdx.x, position = *first + t;
-    if ((position + 1) / kBlock <= kTopBlocks) { return; }
+    if ((position + 1) / kBlock <= top_blocks) { return; }
     row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
     __syncthreads();
-    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head], rope);
+    int pos3[3];
+    call_positions(rope_positions, axis_stride, t, position, pos3);
+    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, pos3, lane, reduce[head], rope);
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
 
@@ -188,7 +303,7 @@ template <int Tok>
 __global__ void __launch_bounds__(kTileThreads, 2)
     qsa_tile_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                           const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                          int tokens, int capacity) {
+                          int tokens, int capacity, int top_blocks) {
     constexpr int kTokensPerThread = Tok / 16;
     constexpr int kRows            = Tok * kHeads;
     constexpr int kParts           = kStageDims / 4;          // float4 loads per row and stage
@@ -205,7 +320,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     const int t0 = blockIdx.x * Tok, b0 = blockIdx.y * kTileBlocks;
     const int start  = *first;
     const int blocks = min((start + min(t0 + Tok, tokens)) / kBlock, capacity);
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const int part = tid % kParts, line = tid / kParts;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const float4* query_src[kQueryLoads];
@@ -214,7 +329,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     for (int l = 0; l < kQueryLoads; ++l) {
         const int row   = line + kLines * l;
         const int token = t0 + row / kHeads;
-        query_ok[l]     = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_ok[l]     = token < tokens && (start + token + 1) / kBlock > top_blocks;
         query_src[l]    = reinterpret_cast<const float4*>(
                            queries + (static_cast<std::int64_t>(t0) * kHeads + row) * kHeadDim) +
                        part;
@@ -311,7 +426,7 @@ __global__ void __launch_bounds__(kTileThreads, 2)
     for (int k = 0; k < kTokensPerThread; ++k) {
         const int t       = t0 + ty + 16 * k;
         const int visible = min((start + t + 1) / kBlock, capacity);
-        if (t < tokens && visible > kTopBlocks) {
+        if (t < tokens && visible > top_blocks) {
             unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -342,9 +457,10 @@ __global__ void __launch_bounds__(kTileThreads, 2)
 __global__ void __launch_bounds__(kTileThreads, 1)
     qsa_tensor_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                             const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                            int tokens, int capacity) {
+                            int tokens, int capacity, int top_blocks) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 800
-    (void)queries, (void)first, (void)pooled, (void)keys_workspace, (void)tokens, (void)capacity;
+    (void)queries, (void)first, (void)pooled, (void)keys_workspace, (void)tokens, (void)capacity,
+        (void)top_blocks;
     __trap();
 #else
     namespace wmma = nvcuda::wmma;
@@ -355,13 +471,13 @@ __global__ void __launch_bounds__(kTileThreads, 1)
     const int t0 = blockIdx.x * kTensorTokens, b0 = blockIdx.y * kTensorBlocks;
     const int start  = *first;
     const int blocks = min((start + min(t0 + kTensorTokens, tokens)) / kBlock, capacity);
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const float* query_base[2];
     bool query_ok[2];
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         const int token  = t0 + 16 * wm + g + 8 * half;
-        query_ok[half]   = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_ok[half]   = token < tokens && (start + token + 1) / kBlock > top_blocks;
         query_base[half] = queries + static_cast<std::int64_t>(token) * kHeads * kHeadDim + 2 * c;
     }
     const float* key_base[kTiles];
@@ -448,7 +564,7 @@ __global__ void __launch_bounds__(kTileThreads, 1)
     for (int half = 0; half < 2; ++half) {
         const int t       = t0 + 16 * wm + g + 8 * half;
         const int visible = min((start + t + 1) / kBlock, capacity);
-        if (t < tokens && visible > kTopBlocks) {
+        if (t < tokens && visible > top_blocks) {
             unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 #pragma unroll
             for (int n = 0; n < kTiles; ++n) {
@@ -471,20 +587,23 @@ __global__ void __launch_bounds__(kTileThreads, 1)
 }
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
-// order), as orderable keys. A query that sees at most 512 blocks needs none.
+// order), as orderable keys. A query that sees at most `top_blocks` blocks needs none.
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                      const __nv_bfloat16* __restrict__ query_norm, float eps,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                     int capacity, const QsaRope rope) {
+                     int capacity, const int* __restrict__ rope_positions,
+                     std::int32_t axis_stride, const QsaRope rope, int top_blocks) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int t        = blockIdx.y;
     const int position = *first + t;
     const int blocks   = min((position + 1) / kBlock, capacity);
+    int pos3[3];
+    call_positions(rope_positions, axis_stride, t, position, pos3);
     const int b0       = blockIdx.x * kScoreBlocks;
-    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    if (blocks <= top_blocks || b0 >= blocks) { return; }
     const int tid = threadIdx.x;
 
     // Normalised, rotated query heads: four 128-thread groups.
@@ -507,11 +626,12 @@ __global__ void __launch_bounds__(kThreads)
         row[lane] = normed;
         __syncthreads();
         if (lane < kRotaryPairs) {
+            const int rotated_position = pos3[rope.axes[lane]];
             float sine, cosine;
             if constexpr (Yarn) {
-                yarn_sincos(rope, lane, position, &sine, &cosine);
+                yarn_sincos(rope, lane, rotated_position, &sine, &cosine);
             } else {
-                const float angle = static_cast<float>(position) * rope_frequency(lane);
+                const float angle = static_cast<float>(rotated_position) * rope_frequency(lane);
                 sincosf(angle, &sine, &cosine);
             }
             const float x1 = row[lane], x2 = row[lane + kRotaryPairs];
@@ -546,7 +666,8 @@ __global__ void __launch_bounds__(kThreads)
 
 __global__ void __launch_bounds__(kThreads)
     qsa_select_kernel(const int* __restrict__ first, const unsigned* __restrict__ keys_workspace,
-                      int capacity, int* __restrict__ selected, int* __restrict__ counts) {
+                      int capacity, int* __restrict__ selected, int* __restrict__ counts,
+                      int top_blocks) {
     using Scan = cub::BlockScan<int, kThreads>;
     __shared__ typename Scan::TempStorage scan_storage;
     __shared__ int histogram[256];
@@ -557,19 +678,19 @@ __global__ void __launch_bounds__(kThreads)
     const int t        = blockIdx.x;
     const int position = *first + t;
     const int blocks   = min((position + 1) / kBlock, capacity);
-    int* out           = selected + static_cast<std::int64_t>(t) * kTopBlocks;
+    int* out           = selected + static_cast<std::int64_t>(t) * top_blocks;
     const int tid      = threadIdx.x;
-    if (blocks <= kTopBlocks) {
+    if (blocks <= top_blocks) {
         for (int b = tid; b < blocks; b += kThreads) out[b] = b;
         if (tid == 0) counts[t] = blocks;
         return;
     }
     const unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 
-    // Radix select of the kTopBlocks-th largest key, eight bits at a time from the top.
+    // Radix select of the top_blocks-th largest key, eight bits at a time from the top.
     if (tid == 0) {
         prefix_shared    = 0;
-        remaining_shared = kTopBlocks;
+        remaining_shared = top_blocks;
     }
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int i = tid; i < 256; i += kThreads) histogram[i] = 0;
@@ -624,6 +745,11 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa_indexer: ") + message); }
 }
 
+void require_top_blocks(std::int32_t top_blocks) {
+    require(top_blocks >= 1 && top_blocks <= kQsaTopBlocksMax,
+            "top_blocks must be within 1..kQsaTopBlocksMax");
+}
+
 void require_projection(const Tensor& projection) {
     require(projection.dtype == DType::BF16 && projection.is_contiguous() &&
                 projection.data != nullptr && projection.ne[0] == kProjection &&
@@ -648,6 +774,48 @@ void require_pooled(const Tensor& pooled) {
     require(pooled.dtype == DType::FP32 && pooled.is_contiguous() && pooled.data != nullptr &&
                 pooled.ne[0] == kHeadDim && pooled.ne[1] > 0 && pooled.ne[2] == 1,
             "pooled must be contiguous FP32 [128, capacity]");
+}
+
+// Unpack the optional 3-axis inputs. A null rope_positions keeps the scalar path:
+// call_positions() then fills all three axes with the cache position.
+struct IndexerPositionArgs {
+    const int* rope = nullptr;
+    int* tail_axes         = nullptr;
+    std::int32_t pos_tokens = 0;
+    // Element stride between the three axes of `rope`. A contiguous [tokens, 3] plane spaces the
+    // axes by `pos_tokens`; a per-part slice of a longer [T, 3] plane keeps spacing them by T. The
+    // kernels read axis*axis_stride + t, so a slice feeds them zero-copy instead of failing a
+    // contiguity assertion.
+    std::int32_t axis_stride = 0;
+};
+
+IndexerPositionArgs require_positions(const QsaIndexerPositions& positions,
+                                      std::int32_t tokens) {
+    IndexerPositionArgs out{};
+    if (positions.rope_positions != nullptr) {
+        const Tensor& p = *positions.rope_positions;
+        // Accept a per-part slice of a longer axis-major [T, 3] plane, not only a contiguous
+        // [tokens, 3]. The slice keeps a one-element token stride (so element (t, axis) stays at
+        // rope[axis*axis_stride + t]) but spaces the axes by the full T, which `is_contiguous`
+        // rejects; require that shape and carry the axis stride to the kernels instead.
+        require(p.dtype == DType::I32 && p.data != nullptr &&
+                    p.ne[0] == tokens && p.ne[1] == 3 && p.ne[2] == 1 && p.ne[3] == 1 &&
+                    p.nb[0] == static_cast<std::int64_t>(sizeof(std::int32_t)) &&
+                    p.nb[1] % p.nb[0] == 0 &&
+                    p.nb[1] >= static_cast<std::int64_t>(tokens) * p.nb[0],
+                "rope_positions must be I32 [tokens, 3] with a one-element token stride and a whole-element axis stride");
+        out.rope        = static_cast<const int*>(p.data);
+        out.pos_tokens  = tokens;
+        out.axis_stride = static_cast<std::int32_t>(p.nb[1] / p.nb[0]);
+    }
+    if (positions.tail_axes != nullptr) {
+        const Tensor& t = *positions.tail_axes;
+        require(t.dtype == DType::I32 && t.is_contiguous() && t.data != nullptr &&
+                    t.ne[0] == kBlock - 1 && t.ne[1] == 3 && t.ne[2] == 1 && t.ne[3] == 1,
+                "tail_axes must be contiguous I32 [3, 3]");
+        out.tail_axes = static_cast<int*>(t.data);
+    }
+    return out;
 }
 
 // Scoring routes. The per-token scalar kernel prepares its query in every CTA and reads the keys
@@ -682,15 +850,30 @@ ScoreRoute score_route(std::int32_t tokens, std::int32_t capacity) {
                                                               : ScoreRoute::Narrow;
 }
 
-QsaRope make_rope(const RopeYarn& yarn) {
-    require(!(yarn.interpolation_factor > 1.0F), "linear position interpolation is not supported");
+// The optional pair_axes and the YaRN interpolation path are this port's
+// interleaved 3-axis M-RoPE extension; the body below is shared with upstream.
+QsaRope make_rope(const RopeYarn& yarn, const std::uint8_t* pair_axes) {
     QsaRope rope{};
-    if (yarn.factor > 1.0F) {
+    rope.attention_factor        = 1.0F;
+    rope.interpolation_threshold = std::numeric_limits<float>::max();
+    rope.interpolation_scale     = 1.0F;
+    for (int i = 0; i < kRotaryPairs; ++i) {
+        rope.axes[i] = pair_axes != nullptr ? static_cast<int>(pair_axes[i]) : i % 3;
+        require(rope.axes[i] >= 0 && rope.axes[i] < 3, "M-RoPE pair axis must be 0..2");
+    }
+    // YaRN (a factor extension) AND linear position interpolation both activate
+    // the engine's dense YaRN kernel, so the indexer must follow the same route
+    // with the same frequency table, attention factor and per-axis interpolation.
+    if (yarn.active()) {
         const RopeYarnFrequencies f =
-            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn);
+            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn, true);
         for (int i = 0; i < kRotaryPairs; ++i) rope.inverse_frequency[i] = f.inverse_frequency[i];
         rope.attention_factor = f.attention_factor;
-        rope.scaled           = 1;
+        rope.active           = 1;
+        if (yarn.interpolation_factor > 1.0F) {
+            rope.interpolation_threshold = static_cast<float>(yarn.interpolation_threshold);
+            rope.interpolation_scale     = 1.0F / yarn.interpolation_factor;
+        }
     }
     return rope;
 }
@@ -699,36 +882,64 @@ QsaRope make_rope(const RopeYarn& yarn) {
 
 void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
-                        Tensor& pooled, Tensor& tail, cudaStream_t stream) {
+                        Tensor& pooled, Tensor& tail, cudaStream_t stream,
+                        const QsaIndexerPositions& positions) {
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.key_norm, "key_norm must be BF16 [128]");
+    if (weights.key_pre_norm != nullptr) {
+        require_norm(weights.key_pre_norm, "key_pre_norm must be BF16 [128]");
+    }
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
                 tail.ne[0] == kHeadDim && tail.ne[1] == kBlock - 1,
             "tail must be contiguous FP32 [128, 3]");
-    const QsaRope rope        = make_rope(yarn);
+    const QsaRope rope        = make_rope(yarn, positions.pair_axes);
     const std::int32_t tokens = projection.ne[1];
+    const auto pos            = require_positions(positions, tokens);
+    const auto* key_pre_norm =
+        weights.key_pre_norm != nullptr
+            ? static_cast<const __nv_bfloat16*>(weights.key_pre_norm->data)
+            : nullptr;
     // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
-    auto* const pool_kernel = rope.scaled ? qsa_pool_kernel<true> : qsa_pool_kernel<false>;
-    pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
-        static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
-        rope);
-    CUDA_CHECK(cudaGetLastError());
-    qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
-                                                first, tokens, static_cast<float*>(tail.data));
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch_pool = [&](auto yarn_tag, auto pre_norm_tag) {
+        constexpr bool kYarn    = decltype(yarn_tag)::value;
+        constexpr bool kPreNorm = decltype(pre_norm_tag)::value;
+        qsa_pool_kernel<kYarn, kPreNorm><<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
+            static_cast<const __nv_bfloat16*>(weights.key_norm->data), key_pre_norm, eps,
+            static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
+            pos.rope, pos.tail_axes, pos.pos_tokens, pos.axis_stride, rope);
+        CUDA_CHECK(cudaGetLastError());
+        qsa_tail_kernel<kPreNorm><<<1, kHeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projection.data), first, tokens, key_pre_norm, eps,
+            static_cast<float*>(tail.data), pos.rope, pos.tail_axes, pos.axis_stride);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (rope.active) {
+        if (key_pre_norm != nullptr) {
+            launch_pool(std::true_type{}, std::true_type{});
+        } else {
+            launch_pool(std::true_type{}, std::false_type{});
+        }
+    } else {
+        if (key_pre_norm != nullptr) {
+            launch_pool(std::false_type{}, std::true_type{});
+        } else {
+            launch_pool(std::false_type{}, std::false_type{});
+        }
+    }
 }
 
-std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t capacity) {
+std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t capacity,
+                                               std::int32_t top_blocks) {
     require(tokens > 0 && capacity > 0, "tokens and capacity must be positive");
+    require_top_blocks(top_blocks);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {capacity, tokens});
     // The prepared queries of a tiled route, on any device (kTensorMinTokens > kTileMinTokens).
-    if (tokens >= kTileMinTokens && capacity > kTopBlocks) {
+    if (tokens >= kTileMinTokens && capacity > top_blocks) {
         (void)layout.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
     }
     return layout.peak_bytes(1);
@@ -737,17 +948,20 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
                         const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
-                        Tensor& counts, cudaStream_t stream) {
+                        Tensor& counts, cudaStream_t stream,
+                        const QsaIndexerPositions& positions, std::int32_t top_blocks) {
+    require_top_blocks(top_blocks);
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.query_norm, "query_norm must be BF16 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
-    const QsaRope rope = make_rope(yarn);
+    const QsaRope rope = make_rope(yarn, positions.pair_axes);
     const std::int32_t tokens = projection.ne[1];
+    const auto pos            = require_positions(positions, tokens);
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
-                selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
-            "selected must be contiguous I32 [512, tokens]");
+                selected.ne[0] == top_blocks && selected.ne[1] == tokens,
+            "selected must be contiguous I32 [top_blocks, tokens]");
     require(counts.dtype == DType::I32 && counts.is_contiguous() && counts.data != nullptr &&
                 counts.ne[0] == tokens,
             "counts must be contiguous I32 [tokens]");
@@ -756,26 +970,26 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     require(capacity <= 65535 * kTileBlocks, "pooled capacity must be at most 4,194,240 blocks");
     auto scope                  = workspace.scope();
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
-    if (capacity > kTopBlocks) {
+    if (capacity > top_blocks) {
         const ScoreRoute route = score_route(tokens, capacity);
         if (route == ScoreRoute::Scalar) {
             const dim3 grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
                             static_cast<unsigned>(tokens));
             auto* const score_kernel =
-                rope.scaled ? qsa_score_kernel<true> : qsa_score_kernel<false>;
+                rope.active ? qsa_score_kernel<true> : qsa_score_kernel<false>;
             score_kernel<<<grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
-                rope);
+                pos.rope, pos.axis_stride, rope, top_blocks);
         } else {
             Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
             auto* const query_kernel =
-                rope.scaled ? qsa_query_kernel<true> : qsa_query_kernel<false>;
+                rope.active ? qsa_query_kernel<true> : qsa_query_kernel<false>;
             query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-                static_cast<float*>(queries.data), rope);
+                static_cast<float*>(queries.data), pos.rope, pos.axis_stride, rope, top_blocks);
             CUDA_CHECK(cudaGetLastError());
             const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;
             const int tile_blocks = route == ScoreRoute::Tensor ? kTensorBlocks : kTileBlocks;
@@ -788,14 +1002,31 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
             score_kernel<<<grid, kTileThreads, 0, stream>>>(
                 static_cast<const float*>(queries.data), first,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), tokens,
-                capacity);
+                capacity, top_blocks);
         }
         CUDA_CHECK(cudaGetLastError());
     }
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
         first, static_cast<const unsigned*>(keys.data), capacity, static_cast<int*>(selected.data),
-        static_cast<int*>(counts.data));
+        static_cast<int*>(counts.data), top_blocks);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// The original scalar-position symbols, kept so an existing caller needs no
+// recompile: three equal axes are exactly the rotation this wrapper selects.
+void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        Tensor& pooled, Tensor& tail, cudaStream_t stream) {
+    qsa_indexer_append(projection, first_position, weights, eps, yarn, pooled, tail, stream,
+                       QsaIndexerPositions{});
+}
+
+void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
+                        Tensor& counts, cudaStream_t stream, std::int32_t top_blocks) {
+    qsa_indexer_select(projection, first_position, weights, eps, yarn, pooled, workspace, selected,
+                       counts, stream, QsaIndexerPositions{}, top_blocks);
 }
 
 } // namespace ninfer::ops

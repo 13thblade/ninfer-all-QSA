@@ -981,6 +981,8 @@ public:
     // columns they fill.
     const bool gumbel_sampling;
     const std::size_t kv_payload_bytes;
+    // The MTP draft layer's device KV pool alone (part of kv_payload_bytes); zero without MTP.
+    const std::size_t mtp_kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
     // launch of every executable), for comparison with graph_allowance_bytes; empty when no free
@@ -1050,6 +1052,45 @@ public:
     std::optional<dspine::Drafter> dspine_drafter;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
+    // --qwen38-27b-qsa: each lane's indexer pooled keys and tail, rank 0, one set per
+    // concurrent sequence.
+    std::optional<qwen3_5::QsaIndexerState> qsa_indexer_state;
+    // --kv-resident: the pinned host KV copies (owned here, one per lane and layer) and the
+    // per-(lane, layer) pool / residency map views. Empty when streaming is off. Per-sequence
+    // host attribution of a released lane's own blocks lives in the prefix index's per-
+    // sequence stream images (the yield handoff), not in these lane buffers: the buffers
+    // stay per lane and the next sequence on a lane reuses them from position zero.
+    std::optional<qwen3_5::QsaStreamState> qsa_stream_state;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> qsa_stream_host;
+    // --kv-resident: the (lane, layer) stream pool overflow words staged by each decode round.
+    std::optional<PinnedHostBuffer> qsa_stream_overflow_host;
+    // --qwen38-27b-qsa (Legacy cache): the continuation that last wrote each lane's QSA
+    // planes (the indexer state and, under --kv-resident, that lane's pinned KV copy). The
+    // Legacy StateImage carries no QSA region, so a catalogued continuation can resume its
+    // prefix only on the lane that still holds its planes: the engine admits to the lowest
+    // free lane, and a prefill starting at position zero repools the assigned lane from
+    // block zero. `kNoQsaLaneOwner`, which no live slot carries, means none. Under the
+    // hybrid cache the image carries the QSA region and a restore lands it in the
+    // destination lane, so no gate applies there (the tracking stays current anyway).
+    static constexpr std::uint32_t kNoQsaLaneOwner = 0xFFFFFFFFU;
+    std::array<std::uint32_t, kMaximumConcurrency> qsa_lane_owner{};
+    std::array<std::uint64_t, kMaximumConcurrency> qsa_lane_generation{};
+    [[nodiscard]] bool owns_qsa_lane(std::uint32_t lane, std::uint32_t continuation_index,
+                                     std::uint64_t generation) const noexcept {
+        return lane < max_concurrency && qsa_lane_owner[lane] == continuation_index &&
+               qsa_lane_generation[lane] == generation;
+    }
+    [[nodiscard]] bool qsa_cache_carries_indexer_state() const noexcept {
+        return context_cache.enabled && context_cache.mode == ContextCacheMode::Hybrid;
+    }
+    // The lowest lane with no active continuation: the one admission would take next.
+    // `kNoQsaLaneOwner` when every lane is taken.
+    [[nodiscard]] std::uint32_t lowest_free_lane() const noexcept {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (active_continuations[lane] >= continuation_capacity) { return lane; }
+        }
+        return kNoQsaLaneOwner;
+    }
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     // Each lane's MTP proposal sampler; unbound without MTP or --gumbel-sampling.
@@ -1966,6 +2007,11 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+    // --kv-resident: enqueues an async copy of every (lane, layer) stream pool overflow word
+    // after a decode round's forward pass; the round's device sync covers the copy, and
+    // check_qsa_stream_overflow then refuses a round that reported an overflow.
+    void queue_qsa_stream_overflow_fetch();
+    void check_qsa_stream_overflow();
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

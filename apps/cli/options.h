@@ -46,6 +46,10 @@ struct Options {
     ninfer::TensorParallelPartials tensor_parallel_prompt_partials =
         ninfer::TensorParallelPartials::Fp32;
     bool invariant_attention                 = false;
+    // Qwen3.8-27B: run the QSA sparse attention branch of every full-attention layer.
+    bool qwen38_27b_qsa                      = false;
+    // Qwen3.8-27B with --qwen38-27b-qsa: --qsa-top-blocks, the history a QSA query sees.
+    std::uint32_t qsa_top_blocks         = 0;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;

@@ -2,6 +2,7 @@
 
 #include "artifact/schema.h"
 #include "models/qwen3_5/draft_config.h"
+#include "ninfer/ops/qsa_budget.h"
 
 #include <algorithm>
 #include <cmath>
@@ -109,7 +110,8 @@ TextConfig text(const Json& value, bool mtp) {
         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
+         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
+         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
@@ -156,6 +158,36 @@ TextConfig text(const Json& value, bool mtp) {
         }
         (void)gdn.conv_channels();
         out.gdn = gdn;
+    }
+    // QSA-27B carries a learned block indexer on its full-attention layers. Stock
+    // artifacts have none of these fields and keep dense full attention. The geometry is
+    // the one ninfer::ops::qsa_indexer implements: 4-token blocks and four 128-dim heads.
+    // The budget is the artifact's own selection width, which the range the ops compile in
+    // bounds; --qsa-top-blocks may widen the selection at run time without touching it.
+    static constexpr const char* qsa_fields[] = {
+        "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"};
+    bool has_qsa = false;
+    for (const char* key : qsa_fields) { has_qsa = has_qsa || value.contains(key); }
+    if (has_qsa) {
+        for (const char* key : qsa_fields) {
+            if (!value.contains(key)) {
+                throw ArtifactError(std::string("text config: QSA requires ") + key);
+            }
+        }
+        QsaConfig qsa{dimension(value, "indexer_n_heads"), dimension(value, "indexer_head_dim"),
+                      dimension(value, "indexer_compress_ratio"), dimension(value, "indexer_budget")};
+        if (qsa.indexer_n_heads != 4 || qsa.indexer_head_dim != 128 ||
+            qsa.indexer_compress_ratio != static_cast<std::uint32_t>(ops::kQsaBlockTokens) ||
+            qsa.indexer_budget == 0 || qsa.indexer_budget % qsa.indexer_compress_ratio != 0 ||
+            qsa.block_budget() > static_cast<std::uint32_t>(ops::kQsaTopBlocksMax)) {
+            throw ArtifactError(
+                "QSA indexer geometry must be 4 heads x 128 with 4-token blocks and a budget "
+                "of at most 2048 blocks");
+        }
+        if (out.full_attention_layers == 0) {
+            throw ArtifactError("QSA indexer needs full-attention layers");
+        }
+        out.qsa = qsa;
     }
     if (out.architecture == Architecture::Qwen3_5Moe) {
         if (value.contains("intermediate_size")) {

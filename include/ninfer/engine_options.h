@@ -523,6 +523,23 @@ struct EngineOptions {
     // bytes whether it is decoded alone, verified in a draft window or batched with others. The
     // other kernels (projections, experts, Gated DeltaNet) keep their own schedules.
     bool invariant_attention = false;
+    // Qwen3.8-27B-QSA artifacts only: route the text's full-attention layers through the
+    // artifact's learned block indexer (ops::qsa_indexer, ops::sparse_softmax_attention)
+    // instead of the model's native dense attention. Unset keeps the native dense path for
+    // every model. Refused for an artifact without the indexer, for several devices, tensor
+    // parallelism, more than one concurrent request, and for a speculative backend other
+    // than the artifact's own MTP head. The context cache retains one conversation, the one
+    // whose prefix the indexer planes still hold, so a turn that extends its own history
+    // prefills only the new tokens; the Hybrid prefix cache is refused under the flag. MTP
+    // verification replays the indexer tail on commit.
+    bool qwen38_27b_qsa              = false;
+    // Qwen3.8-27B-QSA with qwen38_27b_qsa: how many history blocks (four tokens each) each
+    // query may look back over, 1 to 65536. Zero keeps the artifact's own budget, 512 blocks
+    // (2048 tokens), which every artifact trained with. Raising it only widens the indexer's
+    // selection and the blocks the sparse attention reads; the artifact, the scoring formula
+    // and the indexer's training are untouched. A --kv-resident stream pool must then hold
+    // that many more blocks, so a wider window can leave a context too large to stream.
+    std::uint32_t qsa_top_blocks = 0;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split
@@ -533,11 +550,13 @@ struct EngineOptions {
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
     NgramTableOptions ngram_table;
-    // Qwen3.8-Flash-Next only: positions of each sparse-attention layer's KV a sequence keeps in
-    // device memory. A longer context streams those layers: their KV lives in pinned host memory
-    // and the device keeps the blocks the indexer selected most recently, which leaves the rest
-    // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
-    // disk experts, every position with device experts; 0 keeps every position.
+    // Qwen3.8-Flash-Next, and Qwen3.8-27B under --qwen38-27b-qsa: positions of each
+    // sparse-attention layer's KV a sequence keeps in device memory. A longer context
+    // streams those layers: their KV lives in pinned host memory and the device keeps
+    // the blocks the indexer selected most recently. Unset follows the upstream
+    // preset (qwen4_exp_core.cpp): device experts keep every position resident,
+    // host/disk experts use kDefaultKvResidentPositions. Explicit 0 / "all" keeps
+    // everything resident; under QSA the widest verification must be <= 15 drafts.
     std::optional<std::uint32_t> kv_resident_positions;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
