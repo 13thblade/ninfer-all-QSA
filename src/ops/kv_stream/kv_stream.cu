@@ -261,36 +261,42 @@ __global__ void __launch_bounds__(kResolveThreads)
 
     // 4. One slot per missing block: a clock sweep from the hand, a window of at most one slot
     //    per thread (a pool smaller than the CTA must not show a slot to two threads). A slot this
-    //    sweep already handed out (stamped with this epoch) is never taken twice. The pool may
-    //    reclaim a slot a draft column reads but never one column 0 reads or one the call wrote:
-    //    the list is already ordered that way, so the first `s_primary` placements are exactly the
-    //    blocks the fallback keeps.
+    //    sweep already handed out (stamped with this epoch) is never taken twice. Two passes: the
+    //    first takes only slots nothing reads this round, so a pool that has filled with older
+    //    blocks still serves a verification whose own union fits; the second may reclaim a draft
+    //    column's slot, which costs that column its KV and is reported as a recoverable overflow.
+    //    Column 0's blocks and the blocks the call wrote are in the first `s_primary` entries of
+    //    the copy list and are never reclaimed.
     const int target = need < n ? need : n;
     const int window = n < kResolveThreads ? n : kResolveThreads;
     const bool sweeps = static_cast<int>(threadIdx.x) < window;
     int hand = m.control[1], got = 0;
-    for (int scanned = 0; got < target && scanned < 3 * n; scanned += window) {
-        const int j      = static_cast<int>((static_cast<long long>(hand) + threadIdx.x) % n);
-        const bool mine  = sweeps && m.slot_stamp[j] == epoch;
-        const bool taken = sweeps && !mine &&
-                           (m.slot_block[j] < 0 || m.slot_ref[j] < kRefPrimary);
-        int total        = 0;
-        const int rank   = block_scan(taken ? 1 : 0, warp_sums, total);
-        const int want   = target - got;
-        if (threadIdx.x == 0) s_cut = window;
-        __syncthreads();
-        // The hand stops just past the last slot taken.
-        if (taken && rank == want - 1) s_cut = threadIdx.x + 1;
-        __syncthreads();
-        const int cut = s_cut;
-        if (taken && rank < want) {
-            m.copy_slot[got + rank] = j;
-            m.slot_stamp[j]         = epoch; // a sweep that wraps around must not take it twice
-            if (m.slot_ref[j] == kRefDraft) { atomicAdd(&s_evicted_draft, 1); }
+    for (int pass = 0; pass < 2 && got < target; ++pass) {
+        const bool reclaim_drafts = pass == 1;
+        for (int scanned = 0; got < target && scanned < 3 * n; scanned += window) {
+            const int j     = static_cast<int>((static_cast<long long>(hand) + threadIdx.x) % n);
+            const bool mine = sweeps && m.slot_stamp[j] == epoch;
+            const bool idle = m.slot_block[j] < 0 || m.slot_ref[j] == kRefNone;
+            const bool taken = sweeps && !mine &&
+                               (idle || (reclaim_drafts && m.slot_ref[j] == kRefDraft));
+            int total        = 0;
+            const int rank   = block_scan(taken ? 1 : 0, warp_sums, total);
+            const int want   = target - got;
+            if (threadIdx.x == 0) s_cut = window;
+            __syncthreads();
+            // The hand stops just past the last slot taken.
+            if (taken && rank == want - 1) s_cut = threadIdx.x + 1;
+            __syncthreads();
+            const int cut = s_cut;
+            if (taken && rank < want) {
+                m.copy_slot[got + rank] = j;
+                m.slot_stamp[j]         = epoch; // a sweep that wraps around must not take it twice
+                if (m.slot_ref[j] == kRefDraft) { atomicAdd(&s_evicted_draft, 1); }
+            }
+            got += total < want ? total : want;
+            hand = static_cast<int>((static_cast<long long>(hand) + cut) % n);
+            __syncthreads();
         }
-        got += total < want ? total : want;
-        hand = static_cast<int>((static_cast<long long>(hand) + cut) % n);
-        __syncthreads();
     }
 
     const int placed = got < need ? got : need;
