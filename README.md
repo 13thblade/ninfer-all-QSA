@@ -1,4 +1,4 @@
-# Ninfer for Qwen3.8-27B-QSA
+# Ninfer for Qwen3.8-27B-QSA (English below)
 
 # 中文
 
@@ -19,15 +19,15 @@
 | `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
 
-`--kv-resident` 的自动下限是「column 0 + 一列草稿余量」= 2 ×`--qsa-top-blocks` 个块（默认 1024 块 = 4096 token）。连续草稿的块选区高度重合，大多数验证轮这个池就够；并集超出时流式 resolve 保住 column 0 的选区与本次写入的块、丢弃草稿列的块，并在 device 侧 acceptance 之前撤回该轮全部草稿，由 acceptance kernel 按「只采信 column 0」给出一致的 token 与记账；连 column 0 都放不下则拒绝该轮并提示调大 `--kv-resident`。prefill 不使用这个池：它的列都是已提交的 prompt token，一律读 staging 层走 dense 注意力，池只服务 decode 与 verify——没有草稿列可丢的调用遇到溢出会直接拒绝，而不是悄悄少读 KV。显式给更大的 `--kv-resident` 仍生效；当此下限 ×4 token 不小于上下文时流式关闭、整段历史全驻留。典型用法：
+`--kv-resident` 取非`0`/`all`时的自动下限是 2 ×`--qsa-top-blocks` 个块。开启MTP时，连续草稿的块选区高度重合，因此绝大部分情况下不必为每个草稿都预留一份注意力窗口；当注意力窗口并集偶发超出resident时，流式 resolve 保住 column 0 的选区与本次写入的块、丢弃草稿列的块，等价于当前verify轮次接受度为0。显式给更大的 `--kv-resident` 仍生效；当取值不小于上下文时流式关闭、整段历史全驻留。典型用法：
 
 ```bash
 # 启用QSA + 2048 token 注意力窗口 + KV 全驻留
 ninfer-serve model.ninfer --qwen38-27b-qsa
 
-# 2 倍注意力窗口（4,096 token），开启 MTP + ngram 草稿，并把 KV 的 65,600 个位置留在显存、其余流式传输
+# 2 倍注意力窗口（4,096 token），开启 MTP + ngram 草稿，并把 KV 的 16,384 个位置留在显存、其余流式传输
 ninfer-serve model.ninfer --max-context 262144 \
-  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 65600 \
+  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 15
 ```
 
@@ -87,15 +87,15 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
 
-The `--kv-resident` pool's automatic floor is column 0 plus one column of draft headroom: 2 x `--qsa-top-blocks` blocks of four tokens each (1024 blocks, 4096 tokens, at the default 512). Consecutive drafts re-read most of column 0's blocks, so this floor covers most verification rounds; when a round's union outgrows it, the streamed resolve keeps column 0's selection and the blocks the call wrote, drops the draft columns' blocks, and withholds every draft on the device before acceptance, so the acceptance kernel itself commits column 0's token with consistent bookkeeping. A round whose column 0 shortlist cannot be kept complete is refused with a hint to raise `--kv-resident`. Prefills never use the pool: their columns are committed prompt tokens, so they read the staged layer with dense attention and the pool serves decode and verification only; a call with no draft columns refuses an overflowing pool instead of silently reading less KV. An explicit larger `--kv-resident` still takes effect; when the floor times four tokens is not below the context, streaming is disabled and the whole history stays resident. Typical use:
+When `--kv-resident` is a number other than `0`/`all`, the pool's automatic floor is 2 x `--qsa-top-blocks` blocks. With MTP on, consecutive drafts' block selections overlap heavily, so there is mostly no need to reserve one attention window per draft; when the union of the windows occasionally outgrows the resident pool, the streamed resolve keeps column 0's selection and the blocks the call wrote and drops the draft columns' blocks, equivalent to accepting nothing from that verification round. An explicit larger `--kv-resident` still takes effect; a value not below the context disables streaming and keeps the whole history resident. Typical use:
 
 ```bash
 # QSA on, a 2048-token attention window, every layer's KV resident
 ninfer-serve model.ninfer --qwen38-27b-qsa
 
-# twice the attention window (4,096 tokens), MTP and ngram drafting on, keeping 65,600 KV positions on the device and streaming the rest
+# twice the attention window (4,096 tokens), MTP and ngram drafting on, keeping 16,384 KV positions on the device and streaming the rest
 ninfer-serve model.ninfer --max-context 262144 \
-  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 65600 \
+  --qwen38-27b-qsa --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 15
 ```
 
