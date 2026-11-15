@@ -109,8 +109,9 @@ offered under the same Apache-2.0 license.
   (all with device experts, 32,768 with host or disk experts).
 - `src/ops/kv_stream/kv_stream.cu` and `include/ninfer/ops/kv_stream.h` move the
   authoritative KV to pinned host memory behind one shared staging layer and plan
-  the device pool at column 0 plus one column of draft headroom
-  (`planning/startup.cpp`). Consecutive drafts re-read most of column 0's blocks,
+  the device pool at two windows, column 0 plus one column of draft headroom
+  (`2 * --qsa-top-blocks` blocks, 4096 tokens at the default 512;
+  `planning/startup.cpp`). Consecutive drafts re-read most of column 0's blocks,
   so this floor covers most verification rounds; a round whose union outgrows it
   keeps column 0's blocks and the written pages in a compact copy list (at most
   one entry per slot, then the written pages), drops the draft columns' blocks,

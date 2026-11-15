@@ -1898,21 +1898,19 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // The pool serves decode and verification only: a prefill reads the staged layer, because
         // its columns are committed prompt tokens and cannot be narrowed. A verification's columns
         // overlap heavily -- consecutive drafts re-read most of column 0's blocks -- so the floor
-        // holds column 0 plus one column's worth of draft headroom instead of the full union. A
-        // round whose union grows past that degrades to column 0 alone in resolve_kernel, which
-        // keeps the pool small without ever letting a draft's blocks reach the attention. When this
-        // floor times four tokens is not below the context, streaming is off and every
-        // full-attention layer keeps its KV resident. An explicit --kv-resident above the floor is
-        // still honoured.
-        constexpr std::uint32_t kReserveColumns = 2;
+        // holds two windows, column 0 plus one draft column, rather than the full union:
+        // 2 * budget blocks (4096 tokens at the default 512). A round whose union grows past that
+        // degrades to column 0 alone in resolve_kernel, which keeps the pool small without ever
+        // letting a draft's blocks reach the attention. When this floor times four tokens is not
+        // below the context, streaming is off and every full-attention layer keeps its KV resident.
+        // An explicit --kv-resident above the floor is still honoured.
+        constexpr std::uint32_t kReserveWindows = 2;
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
-        const std::uint32_t floor_blocks = static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
-            static_cast<std::int32_t>(std::min(width, kReserveColumns)),
-            static_cast<std::int32_t>(budget) + 1));
+        const std::uint32_t floor_blocks = kReserveWindows * budget;
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
