@@ -495,9 +495,11 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
 
 int main() {
     // The one-column floor shared by startup planning and kv_stream_resolve: one query's
-    // selection plus the pages the call wrote, not the disjoint union of every column.
-    static_assert(ops::kv_stream_single_column_slots(2048, 4) == 2049);
-    static_assert(ops::kv_stream_single_column_slots(512, 16) == 516);
+    // selection plus the blocks the call writes (its own incomplete block is one of them), not
+    // the disjoint union of every column.
+    static_assert(ops::kv_stream_single_column_slots(2048, 4) == 2050);
+    static_assert(ops::kv_stream_single_column_slots(512, 16) == 517);
+    static_assert(ops::kv_stream_single_column_slots(512, 1) == ops::kv_stream_minimum_slots(1));
     static_assert(ops::kv_stream_single_column_slots(2048, 4) <
                   ops::kv_stream_minimum_slots(4, 2049));
     if (cuda_unavailable()) {

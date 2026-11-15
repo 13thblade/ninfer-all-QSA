@@ -75,11 +75,12 @@ kv_stream_minimum_slots(std::int32_t tokens,
 }
 
 // The slots a QSA verification needs when only column 0's shortlist is guaranteed: one query's
-// `stride` selected blocks plus the pages the call itself wrote. The planning floor and
+// `stride` selected blocks plus the blocks the call writes. The call's own incomplete block is
+// always one of those writes, so it is not counted twice. The planning floor and
 // kv_stream_resolve's per-call check share this function so they cannot drift apart.
 [[nodiscard]] constexpr std::int32_t
 kv_stream_single_column_slots(std::int32_t stride, std::int32_t tokens) noexcept {
-    return stride + (tokens + kKvStreamPageTokens - 1) / kKvStreamPageTokens;
+    return stride + (tokens + kKvStreamPageTokens - 2) / kKvStreamPageTokens + 1;
 }
 
 // Device bytes of one map, and the map laid out in `memory` (256-byte aligned, that many bytes).

@@ -27,6 +27,9 @@ constexpr int kHostPage       = kPagedKVPageSize;
 constexpr int kBlocksPerPage  = kHostPage / kKvStreamPageTokens; // 16
 // Blocks one call writes: positions first .. first + 15 span at most five blocks.
 constexpr int kWrittenBlocks = kKvStreamMaxTokens / kKvStreamPageTokens + 1;
+// A slot's reference inside the resolve that is running: column 0 or a block the call wrote
+// (the fallback keeps those), a draft column (droppable), or nothing.
+constexpr int kRefNone = 0, kRefDraft = 1, kRefPrimary = 2;
 constexpr int kCopyThreads   = 256;
 constexpr int kCopyBlocks    = 64;
 
@@ -89,6 +92,7 @@ __global__ void __launch_bounds__(kResolveThreads)
                    int selected_stride) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut, s_primary;
     __shared__ int s_listed, s_written; // compact copy-list indices, independent of s_misses
+    __shared__ int s_evicted_draft;     // draft slots this call reclaimed for a primary block
     __shared__ int warp_sums[32];
     __shared__ int read_written[kWrittenBlocks];
     __shared__ int refresh_block[kWrittenBlocks], refresh_slot[kWrittenBlocks];
@@ -107,6 +111,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         s_primary   = 0;
         s_listed    = 0;
         s_written   = 0;
+        s_evicted_draft = 0;
         // These words describe this resolve only. A round that overflowed degrades in place and
         // reads them back, so a previous round's value must not linger into the next one.
         m.control[3]  = 0;
@@ -116,6 +121,12 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.control[13] = 0; // of those, the blocks the pool could place
     }
     if (threadIdx.x < kWrittenBlocks) read_written[threadIdx.x] = 0;
+    __syncthreads();
+    // Reference bits describe this resolve only: column 0 and the blocks the call wrote are what
+    // the fallback keeps, a draft column's may be reclaimed. Clearing them here (instead of
+    // letting the clock decay a bit two passes later) keeps a stale bit from pinning a slot and
+    // makes "the pool may take this slot" answerable in one pass.
+    for (int i = threadIdx.x; i < m.slots; i += kResolveThreads) { m.slot_ref[i] = kRefNone; }
     __syncthreads();
 
     // 1. Every block a query reads: a resident one takes this call's stamp and its reference
@@ -140,8 +151,7 @@ __global__ void __launch_bounds__(kResolveThreads)
             ++lookups;
             const int slot = m.table[b];
             if (slot >= 0) {
-                m.slot_stamp[slot] = epoch;
-                m.slot_ref[slot]   = 1;
+                m.slot_ref[slot]   = kRefPrimary;
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
                 const int at = atomicAdd(&s_misses, 1);
                 if (at < m.slots) {
@@ -168,8 +178,9 @@ __global__ void __launch_bounds__(kResolveThreads)
             ++lookups;
             const int slot = m.table[b];
             if (slot >= 0) {
-                m.slot_stamp[slot] = epoch;
-                m.slot_ref[slot]   = 1;
+                // A draft column never downgrades a block column 0 already reads: the fallback
+                // may take a draft's slot, never a primary one.
+                if (m.slot_ref[slot] != kRefPrimary) { m.slot_ref[slot] = kRefDraft; }
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
                 const int at = atomicAdd(&s_misses, 1);
                 if (at < m.slots) {
@@ -192,8 +203,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         if (read_written[threadIdx.x] != 0) {
             atomicAdd(&s_lookups, 1);
             if (slot >= 0) {
-                m.slot_stamp[slot] = epoch;
-                m.slot_ref[slot]   = 1;
+                m.slot_ref[slot]   = kRefPrimary;
                 const int r        = atomicAdd(&s_refreshes, 1);
                 refresh_block[r]   = b;
                 refresh_slot[r]    = slot;
@@ -216,14 +226,40 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
     __syncthreads();
 
-    // 3. One slot per missing block: a clock sweep from the hand, a window of at most one slot
-    //    per thread (a pool smaller than the CTA must not show a slot to two threads). A slot this
-    //    call uses (stamped with this epoch) is never taken; a referenced one loses its bit as the
-    //    hand passes and is taken on the next pass.
+    // 3. Primary first: column 0's blocks and the blocks this call wrote move to the front of the
+    //    copy list, so the sweep below hands them slots before any draft column's block. The
+    //    block, its slot and its class move together — the copy kernel pairs them by index, and a
+    //    partial swap would point a block at another block's bytes. One thread does it: the kernel
+    //    is single-CTA and the list is bounded by the pool size.
     const int need = s_misses, n = m.slots;
-    // Only `n` slots exist. An overflowing union cannot be satisfied, so stop the sweep at
-    // the pool size instead of spinning through every scan for an unreachable `need`.
     const int listed = s_listed + s_written;
+    if (threadIdx.x == 0) {
+        int write = 0;
+        for (int k = 0; k < listed; ++k) {
+            if (m.copy_primary[k] == 0) { continue; }
+            if (write != k) {
+                const int block   = m.copy_block[write];
+                const int slot    = m.copy_slot[write];
+                const int primary = m.copy_primary[write];
+                m.copy_block[write]   = m.copy_block[k];
+                m.copy_slot[write]    = m.copy_slot[k];
+                m.copy_primary[write] = m.copy_primary[k];
+                m.copy_block[k]   = block;
+                m.copy_slot[k]    = slot;
+                m.copy_primary[k] = primary;
+            }
+            ++write;
+        }
+        s_primary = write;
+    }
+    __syncthreads();
+
+    // 4. One slot per missing block: a clock sweep from the hand, a window of at most one slot
+    //    per thread (a pool smaller than the CTA must not show a slot to two threads). A slot this
+    //    sweep already handed out (stamped with this epoch) is never taken twice. The pool may
+    //    reclaim a slot a draft column reads but never one column 0 reads or one the call wrote:
+    //    the list is already ordered that way, so the first `s_primary` placements are exactly the
+    //    blocks the fallback keeps.
     const int target = need < n ? need : n;
     const int window = n < kResolveThreads ? n : kResolveThreads;
     const bool sweeps = static_cast<int>(threadIdx.x) < window;
@@ -231,7 +267,8 @@ __global__ void __launch_bounds__(kResolveThreads)
     for (int scanned = 0; got < target && scanned < 3 * n; scanned += window) {
         const int j      = static_cast<int>((static_cast<long long>(hand) + threadIdx.x) % n);
         const bool mine  = sweeps && m.slot_stamp[j] == epoch;
-        const bool taken = sweeps && !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
+        const bool taken = sweeps && !mine &&
+                           (m.slot_block[j] < 0 || m.slot_ref[j] < kRefPrimary);
         int total        = 0;
         const int rank   = block_scan(taken ? 1 : 0, warp_sums, total);
         const int want   = target - got;
@@ -244,8 +281,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         if (taken && rank < want) {
             m.copy_slot[got + rank] = j;
             m.slot_stamp[j]         = epoch; // a sweep that wraps around must not take it twice
-        } else if (sweeps && static_cast<int>(threadIdx.x) < cut && !mine) {
-            m.slot_ref[j] = 0;
+            if (m.slot_ref[j] == kRefDraft) { atomicAdd(&s_evicted_draft, 1); }
         }
         got += total < want ? total : want;
         hand = static_cast<int>((static_cast<long long>(hand) + cut) % n);
@@ -253,28 +289,6 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
 
     const int placed = got < need ? got : need;
-    // 3b. Overflow: partition the listed copy blocks so column 0's blocks and the blocks this
-    // call wrote occupy the first `placed` entries. The one-column floor (startup.cpp) guarantees
-    // they fit; only draft columns' blocks are then dropped, leaving column 0's shortlist
-    // complete so the round can fall back to accepting column 0 alone. One thread does the stable
-    // partition: the kernel is single-CTA and the list is bounded by the pool size.
-    if (placed < need && threadIdx.x == 0) {
-        int write = 0;
-        for (int k = 0; k < listed; ++k) {
-            if (m.copy_primary[k] == 0) { continue; }
-            if (write != k) {
-                const int block   = m.copy_block[write];
-                const int primary = m.copy_primary[write];
-                m.copy_block[write]   = m.copy_block[k];
-                m.copy_primary[write] = m.copy_primary[k];
-                m.copy_block[k]   = block;
-                m.copy_primary[k] = primary;
-            }
-            ++write;
-        }
-        s_primary = write;
-    }
-    __syncthreads();
 
     // 4. Re-point the table; the rewritten blocks join the copies in their own slots.
     for (int k = threadIdx.x; k < listed; k += kResolveThreads) {
@@ -287,7 +301,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         const int old  = m.slot_block[slot];
         if (old >= 0) m.table[old] = -1;
         m.slot_block[slot] = b;
-        m.slot_ref[slot]   = 1;
+        m.slot_ref[slot]   = m.copy_primary[k] != 0 ? kRefPrimary : kRefDraft;
         m.table[b]         = slot;
     }
     if (placed < need) {
@@ -309,10 +323,12 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.control[0]     = epoch;
         m.control[1]     = hand;
         m.control[2]     = copies;
-        if (placed < need) {
+        if (placed < need || s_evicted_draft > 0) {
             // Code 2 means even the blocks the fallback must keep did not fit: column 0's
             // shortlist would be dirty, so no in-place degradation is safe and the caller
-            // refuses the round instead of returning a bad token.
+            // refuses the round instead of returning a bad token. Code 1 also covers a call that
+            // placed every missing block by reclaiming a draft column's slot: that column's KV is
+            // gone, so its drafts are withheld even though the pool looked roomy.
             const int code = s_primary <= placed ? 1 : 2;
             m.control[3]   = code;
             if (m.round_flags != nullptr) {
@@ -396,7 +412,7 @@ __global__ void reset_kernel(KvStreamMap m) {
     for (long long i = start; i < m.slots; i += stride) {
         m.slot_block[i] = -1;
         m.slot_stamp[i] = -1;
-        m.slot_ref[i]   = 0;
+        m.slot_ref[i]   = kRefNone;
     }
     if (start < kControlWords) m.control[start] = 0;
 }

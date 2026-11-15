@@ -1192,12 +1192,27 @@ void ProgramImpl::check_qsa_stream_overflow() {
         }
         if (!fold_qsa_stream_lane(lane_words, stream.layers, lane,
                                   qsa_stream_overflow_mask)) {
-            // Column 0 is dirty: no in-place degradation can return a correct token.
+            // Column 0 is dirty: no in-place degradation can return a correct token. Read back
+            // the offending layer's counters on the way out — the round is already synchronized,
+            // so this costs nothing on the success path and tells the operator how far the pool
+            // fell short instead of only its size.
+            std::int32_t counters[4] = {0, 0, 0, 0};
+            for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
+                if (lane_words[layer] != kQsaStreamOverflowUnsafe) { continue; }
+                const qwen3_5::QsaStreamLayerState& state =
+                    stream.layer_states[static_cast<std::size_t>(lane) * stream.layers + layer];
+                CUDA_CHECK(cudaMemcpy(counters, state.map.control + 10, sizeof(counters),
+                                      cudaMemcpyDeviceToHost));
+                break;
+            }
             throw std::logic_error(
                 "QSA streamed KV pool overflow: lane " + std::to_string(lane) +
                 " could not keep column 0's shortlist in its " +
-                std::to_string(stream.slots) +
-                "-slot pool; raise --kv-resident to widen the pool");
+                std::to_string(stream.slots) + "-slot pool (layer needed " +
+                std::to_string(counters[0]) + " blocks, placed " +
+                std::to_string(counters[1]) + ", must keep " + std::to_string(counters[2]) +
+                ", kept " + std::to_string(counters[3]) +
+                "); raise --kv-resident to widen the pool");
         }
     }
 }

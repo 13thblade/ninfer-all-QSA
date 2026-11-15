@@ -1895,25 +1895,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->steering_vectors    = inputs.steering_vectors;
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
-        // One verification column holds at most `budget` selected blocks, plus the pages the call
-        // writes. Reserving that bound keeps column 0's shortlist complete when the columns' union
-        // exceeds the pool: resolve_kernel drops the overflowing draft columns' blocks and the
-        // round falls back to column 0 alone, so a disjoint union needs no reservation. When this
-        // floor times four tokens is not below the context, streaming is off and every
-        // full-attention layer keeps its KV resident. An explicit --kv-resident above the floor is
-        // still honoured.
+        // A verification reads every column's blocks in one call, so the pool has to hold the
+        // union: at most `width` columns of `budget + 1` blocks (the selection plus the query's
+        // own incomplete block). The overflow fallback in resolve_kernel stays as a guard for a
+        // pool this floor did not size — the round degrades to column 0 alone — but a pool below
+        // the union also loses KV that the call still reads, and no host-side check can restore
+        // it. When this floor times four tokens is not below the context, streaming is off and
+        // every full-attention layer keeps its KV resident. An explicit --kv-resident above the
+        // floor is still honoured.
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
-        const std::uint32_t one_column = static_cast<std::uint32_t>(
-            ops::kv_stream_single_column_slots(static_cast<std::int32_t>(budget),
-                                               static_cast<std::int32_t>(width)));
+        const std::uint32_t union_blocks = static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
+            static_cast<std::int32_t>(width), static_cast<std::int32_t>(budget) + 1));
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
-            one_column);
+            union_blocks);
         const std::uint32_t pages = page_count(inputs.capacity);
         if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
             impl->stream_slots  = slots;
@@ -1925,12 +1925,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                             .text.attention->num_key_value_heads
                                       : 0;
         } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
-            // The one-column floor still exceeds the context: streaming is off and every
-            // full-attention layer keeps its KV resident.
+            // The union floor still exceeds the context: streaming is off and every full-attention
+            // layer keeps its KV resident.
             impl->stream_warning =
                 "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
-                " tokens: a streamed call needs " + std::to_string(one_column) +
-                " blocks for one verification column, so the " +
+                " tokens: a streamed call needs " + std::to_string(union_blocks) +
+                " blocks for the verification union, so the " +
                 std::to_string(inputs.capacity) +
                 "-token context no longer fits the --kv-resident pool and every full-attention "
                 "layer keeps its KV resident; a smaller --max-context or "
