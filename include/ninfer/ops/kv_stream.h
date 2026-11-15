@@ -118,18 +118,23 @@ struct KvStreamPrefixSource {
 // I32 [tokens] are the indexer's blocks, `first_position` a device I32 word; `host` the host copy
 // (identity layout), `pool` the device pool (its block_table the map's table). A block the host
 // copy does not hold (the lane's prefix, streamed tier) names its source in `prefix` instead.
+// `draft_columns` says whether columns 1.. are speculative drafts: only then may an overflow drop
+// them and empty their shortlists (control[3] 1, the round commits column 0 alone). A call whose
+// columns are all committed tokens -- a prefill, or a decode column -- passes false: every block
+// it reads is then treated as primary, and a pool too small for it reports control[3] 2 (refuse)
+// instead of returning hidden states computed from missing KV.
 // Capturable: every size it launches with is fixed; the selection width is read from `selected`.
 void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const Tensor& selected, const Tensor& counts, const PagedKVLayerView& host,
                        const PagedKVLayerView& pool, const KvStreamPrefixSource& prefix,
-                       cudaStream_t stream);
+                       bool draft_columns, cudaStream_t stream);
 // The dense-tier form: every block the host copy does not hold is impossible, so the prefix
 // source is empty.
 inline void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                               const Tensor& selected, const Tensor& counts,
                               const PagedKVLayerView& host, const PagedKVLayerView& pool,
-                              cudaStream_t stream) {
-    kv_stream_resolve(map, first_position, selected, counts, host, pool, {}, stream);
+                              bool draft_columns, cudaStream_t stream) {
+    kv_stream_resolve(map, first_position, selected, counts, host, pool, {}, draft_columns, stream);
 }
 
 // Evicts the resident blocks among [first_block, end_block).

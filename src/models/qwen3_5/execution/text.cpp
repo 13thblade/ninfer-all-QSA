@@ -1930,10 +1930,13 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         const ops::CausalAttentionExecutionEnvelope part_envelope =
             !active_segments_.empty() ? active_segments_[part_index].envelope
                                       : *active_causal_attention_envelope_;
+        // A prefill reads committed prompt columns, so it never shares the streamed pool: the
+        // pool's fallback withholds draft columns, which a prefill does not have. Reading the
+        // staged layer keeps every prefill column complete, and the pool then serves only decode
+        // and verification, where a column really is a draft.
         const bool dense_prefill =
             phase == Phase::Prefill && dense_prefill_opt &&
-            active_causal_attention_envelope_ != nullptr && call_positions.is_contiguous() &&
-            (qsa_stream == nullptr || W > static_cast<std::int32_t>(qsa_stream->width));
+            active_causal_attention_envelope_ != nullptr && call_positions.is_contiguous();
         if (!dense_prefill) {
             selected =
                 workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), W);
@@ -1946,7 +1949,7 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         bool wide_stream_call = false;
         std::int32_t first_host = 0;
         if (qsa_stream != nullptr) {
-            if (W <= static_cast<std::int32_t>(qsa_stream->width)) {
+            if (!dense_prefill && W <= static_cast<std::int32_t>(qsa_stream->width)) {
                 // Streamed tier: the lane's prefix blocks the host copy does not hold source
                 // from the writers' stream images (the per-lane pinned segment table the
                 // admission's stage built); the host path serves the lane's own blocks.
@@ -1967,16 +1970,18 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                     }
                 }
                 ops::kv_stream_resolve(stream_layer->map, first, selected, counts,
-                                       stream_layer->host, stream_layer->pool, prefix, stream);
+                                       stream_layer->host, stream_layer->pool, prefix, verifying,
+                                       stream);
                 read = stream_layer->pool;
                 // A narrow call appended tokens to the lane's host copy, so the shared
                 // staging bytes no longer cover this layer's frontier.
                 qsa_stream->staged_lane  = -1;
                 qsa_stream->staged_layer = -1;
             } else {
-                // A wide prefill chunk exceeds kv_stream_resolve's 16-column limit.
-                // Prefills are not captured graphs, so reading the first position
-                // back to the host is safe here.
+                // A prefill (or a chunk wider than the pool's per-call limit) reads the staged
+                // layer: its columns are committed tokens, so it cannot narrow them to column 0.
+                // Prefills are not captured graphs, so reading the first position back to the
+                // host is safe here.
                 wide_stream_call = true;
                 CUDA_CHECK(cudaMemcpyAsync(&first_host, first.data, sizeof(std::int32_t),
                                            cudaMemcpyDeviceToHost, stream));

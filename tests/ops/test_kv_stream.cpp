@@ -268,7 +268,7 @@ public:
         const Tensor selected(in_.selected.p, DType::I32, {top_, t});
         const Tensor counts(in_.counts.p, DType::I32, {t});
         ops::kv_stream_resolve(layer_.map, first, selected, counts, layer_.host_view,
-                               layer_.pool_view, stream);
+                               layer_.pool_view, false, stream);
         attend(t, layer_.pool_view, out_stream_.p, stream);
     }
 
@@ -284,13 +284,13 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    void resolve(int t, cudaStream_t stream) {
+    void resolve(int t, cudaStream_t stream, bool draft_columns = true) {
         append_kernels(t, layer_.host_view, stream);
         const Tensor first(in_.first.p, DType::I32, {1});
         const Tensor selected(in_.selected.p, DType::I32, {top_, t});
         const Tensor counts(in_.counts.p, DType::I32, {t});
         ops::kv_stream_resolve(layer_.map, first, selected, counts, layer_.host_view,
-                               layer_.pool_view, stream);
+                               layer_.pool_view, draft_columns, stream);
     }
 
     void attend(int t, const PagedKVLayerView& cache, void* out, cudaStream_t stream) {
@@ -472,6 +472,34 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     }
     check(dropped, "a draft column's block was dropped");
     failures += layer.check(label, stream);
+
+    // A call whose columns are all committed tokens must not degrade: emptying a column would
+    // make a real prompt position attend to a single block. It reports code 2 and leaves every
+    // shortlist intact, which is what a prefill relies on.
+    {
+        Layer committed(storage, 4096, slots);
+        DeviceBuffer committed_flags(sizeof(std::int32_t));
+        committed_flags.fill(0);
+        committed.map.round_flags = static_cast<std::int32_t*>(committed_flags.p);
+        committed.map.lane        = 0;
+        Sequence committed_sequence(committed, seed, 64, kTop);
+        for (int i = 0; i < 8; ++i) { committed_sequence.wide(64, stream); }
+        committed_sequence.append(kColumns, stream);
+        committed_sequence.set_selection(kColumns, selected,
+                                         std::vector<std::int32_t>(kColumns, kTop), stream);
+        committed_sequence.resolve(kColumns, stream, false);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto committed_control = from_device<std::int32_t>(committed.map.control, 16);
+        check(committed_control[10] > slots, "the committed union exceeds the pool");
+        check(committed_control[3] == 2, "a committed call refuses an overflowing pool");
+        const auto committed_counts = committed_sequence.counts(kColumns, stream);
+        bool kept = true;
+        for (int q = 0; q < kColumns; ++q) {
+            if (committed_counts[std::size_t(q)] != kTop) { kept = false; }
+        }
+        check(kept, "a committed call keeps every column's shortlist");
+        failures += committed.check(label + " committed", stream);
+    }
 
     // The next round clears its flags before submitting, then resolves without an overflow.
     round_flags.fill(0);

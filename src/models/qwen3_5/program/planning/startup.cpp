@@ -1895,25 +1895,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->steering_vectors    = inputs.steering_vectors;
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
-        // A verification reads every column's blocks in one call, so the pool has to hold the
-        // union: at most `width` columns of `budget + 1` blocks (the selection plus the query's
-        // own incomplete block). The overflow fallback in resolve_kernel stays as a guard for a
-        // pool this floor did not size — the round degrades to column 0 alone — but a pool below
-        // the union also loses KV that the call still reads, and no host-side check can restore
-        // it. When this floor times four tokens is not below the context, streaming is off and
-        // every full-attention layer keeps its KV resident. An explicit --kv-resident above the
-        // floor is still honoured.
+        // The pool serves decode and verification only: a prefill reads the staged layer, because
+        // its columns are committed prompt tokens and cannot be narrowed. A verification's columns
+        // overlap heavily -- consecutive drafts re-read most of column 0's blocks -- so the floor
+        // holds column 0 plus one column's worth of draft headroom instead of the full union. A
+        // round whose union grows past that degrades to column 0 alone in resolve_kernel, which
+        // keeps the pool small without ever letting a draft's blocks reach the attention. When this
+        // floor times four tokens is not below the context, streaming is off and every
+        // full-attention layer keeps its KV resident. An explicit --kv-resident above the floor is
+        // still honoured.
+        constexpr std::uint32_t kReserveColumns = 2;
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
-        const std::uint32_t union_blocks = static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
-            static_cast<std::int32_t>(width), static_cast<std::int32_t>(budget) + 1));
+        const std::uint32_t floor_blocks = static_cast<std::uint32_t>(ops::kv_stream_minimum_slots(
+            static_cast<std::int32_t>(std::min(width, kReserveColumns)),
+            static_cast<std::int32_t>(budget) + 1));
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
-            union_blocks);
+            floor_blocks);
         const std::uint32_t pages = page_count(inputs.capacity);
         if (static_cast<std::uint64_t>(slots) * ops::kKvStreamPageTokens < inputs.capacity) {
             impl->stream_slots  = slots;
@@ -1925,12 +1928,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                             .text.attention->num_key_value_heads
                                       : 0;
         } else if (budget > static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault)) {
-            // The union floor still exceeds the context: streaming is off and every full-attention
+            // The floor still exceeds the context: streaming is off and every full-attention
             // layer keeps its KV resident.
             impl->stream_warning =
                 "QSA history window of " + std::to_string(budget * ops::kQsaBlockTokens) +
-                " tokens: a streamed call needs " + std::to_string(union_blocks) +
-                " blocks for the verification union, so the " +
+                " tokens: a streamed call needs " + std::to_string(floor_blocks) +
+                " blocks for column 0 plus one draft column, so the " +
                 std::to_string(inputs.capacity) +
                 "-token context no longer fits the --kv-resident pool and every full-attention "
                 "layer keeps its KV resident; a smaller --max-context or "

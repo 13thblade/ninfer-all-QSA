@@ -89,7 +89,7 @@ __device__ __forceinline__ unsigned long long* counters(const KvStreamMap& m) {
 __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(KvStreamMap m, const int* __restrict__ first_word,
                    const int* __restrict__ selected, int* __restrict__ counts, int tokens,
-                   int selected_stride) {
+                   int selected_stride, bool draft_columns) {
     __shared__ int s_misses, s_lookups, s_refreshes, s_cut, s_primary;
     __shared__ int s_listed, s_written; // compact copy-list indices, independent of s_misses
     __shared__ int s_evicted_draft;     // draft slots this call reclaimed for a primary block
@@ -179,14 +179,19 @@ __global__ void __launch_bounds__(kResolveThreads)
             const int slot = m.table[b];
             if (slot >= 0) {
                 // A draft column never downgrades a block column 0 already reads: the fallback
-                // may take a draft's slot, never a primary one.
-                if (m.slot_ref[slot] != kRefPrimary) { m.slot_ref[slot] = kRefDraft; }
+                // may take a draft's slot, never a primary one. A call without draft columns
+                // reads only committed tokens, so every block it reads is primary.
+                if (!draft_columns || m.slot_ref[slot] == kRefPrimary) {
+                    m.slot_ref[slot] = kRefPrimary;
+                } else {
+                    m.slot_ref[slot] = kRefDraft;
+                }
             } else if (slot == -1 && atomicCAS(&m.table[b], -1, -2) == -1) {
                 const int at = atomicAdd(&s_misses, 1);
                 if (at < m.slots) {
                     const int pos       = atomicAdd(&s_listed, 1);
                     m.copy_block[pos]   = b;
-                    m.copy_primary[pos] = 0;
+                    m.copy_primary[pos] = draft_columns ? 0 : 1;
                 }
             }
         }
@@ -324,19 +329,24 @@ __global__ void __launch_bounds__(kResolveThreads)
         m.control[1]     = hand;
         m.control[2]     = copies;
         if (placed < need || s_evicted_draft > 0) {
-            // Code 2 means even the blocks the fallback must keep did not fit: column 0's
-            // shortlist would be dirty, so no in-place degradation is safe and the caller
-            // refuses the round instead of returning a bad token. Code 1 also covers a call that
-            // placed every missing block by reclaiming a draft column's slot: that column's KV is
-            // gone, so its drafts are withheld even though the pool looked roomy.
-            const int code = s_primary <= placed ? 1 : 2;
+            // Code 2 means the blocks this call must keep did not fit: column 0's shortlist (or,
+            // for a call without draft columns, any committed column's) would be dirty, so no
+            // in-place degradation is safe and the caller refuses the call instead of returning
+            // hidden states computed from missing KV. Code 1 also covers a call that placed every
+            // missing block by reclaiming a draft column's slot: that column's KV is gone, so its
+            // drafts are withheld even though the pool looked roomy.
+            const int code = draft_columns && s_primary <= placed ? 1 : 2;
             m.control[3]   = code;
             if (m.round_flags != nullptr) {
                 atomicMax(m.round_flags + m.lane, code);
+            }
+            if (draft_columns && m.round_flags != nullptr) {
                 // The dropped draft blocks are -1 in the table. sparse_softmax_attention indexes
                 // the table without a bounds check, so empty the draft columns' shortlists: they
                 // then read only their own incomplete block, which the call wrote and resolve
-                // kept. The MTP acceptance path withholds their drafts entirely.
+                // kept. The MTP acceptance path withholds their drafts entirely. A call whose
+                // columns are committed tokens never takes this path: emptying one of them would
+                // make a real prompt position attend to a single block.
                 for (int q = 1; q < tokens; ++q) { counts[q] = 0; }
             }
         }
@@ -529,7 +539,7 @@ void kv_stream_reset(const KvStreamMap& map, cudaStream_t stream) {
 void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
                        const Tensor& selected, const Tensor& counts, const PagedKVLayerView& host,
                        const PagedKVLayerView& pool, const KvStreamPrefixSource& prefix,
-                       cudaStream_t stream) {
+                       bool draft_columns, cudaStream_t stream) {
     require(map.table != nullptr, "an empty map");
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
                 selected.ne[0] >= 1 && selected.ne[0] <= kQsaTopBlocksMax && selected.ne[1] > 0,
@@ -551,7 +561,7 @@ void kv_stream_resolve(const KvStreamMap& map, const Tensor& first_position,
     const Planes planes = planes_of(map, host, pool);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         map, static_cast<const int*>(first_position.data), static_cast<const int*>(selected.data),
-        static_cast<int*>(counts.data), tokens, stride);
+        static_cast<int*>(counts.data), tokens, stride, draft_columns);
     CUDA_CHECK(cudaGetLastError());
     copy_kernel<<<kCopyBlocks, kCopyThreads, 0, stream>>>(map, planes, prefix);
     CUDA_CHECK(cudaGetLastError());

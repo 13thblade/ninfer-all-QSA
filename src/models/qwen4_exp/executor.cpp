@@ -3946,7 +3946,9 @@ struct Executor::Impl {
                                     selected, counts, s);
         }
         if (pooled_read) {
-            ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, s);
+            // The pooled read is this model's decode/verification tier, where columns 1.. are the
+            // drafter's proposals.
+            ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, true, s);
         }
         Tensor attention(columns(p.attention, d * nq, column, 2), DType::BF16, {d, nq, n});
         {

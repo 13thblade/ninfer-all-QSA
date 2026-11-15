@@ -108,18 +108,17 @@ offered under the same Apache-2.0 license.
   the layers stream from pinned host memory. `auto` follows the upstream preset
   (all with device experts, 32,768 with host or disk experts).
 - `src/ops/kv_stream/kv_stream.cu` and `include/ninfer/ops/kv_stream.h` move the
-  authoritative KV to pinned host memory behind one shared staging layer and size
-  the device pool from the verification union (`planning/startup.cpp`:
-  `width * (budget + 1)` blocks), because one call reads that whole union and a
-  smaller pool would let the prefill and first-token paths read reclaimed KV.
-  A pool that does not fit the context keeps every layer's KV resident instead,
-  which is what happens at 16k and below with the default 512-block window. The
-  resolve keeps column 0's blocks and the written pages in a compact copy list
-  (at most one entry per slot, then the written pages), drops the draft columns'
-  blocks, resets their table entries and reports the round's overflow without
-  ever writing past the list; its partition runs before the slot sweep so the
-  blocks the fallback keeps take the first slots, and the block, its slot and its
-  class move together (`copy_block`, `copy_slot`, `copy_primary`).
+  authoritative KV to pinned host memory behind one shared staging layer and plan
+  the device pool at column 0 plus one column of draft headroom
+  (`planning/startup.cpp`). Consecutive drafts re-read most of column 0's blocks,
+  so this floor covers most verification rounds; a round whose union outgrows it
+  keeps column 0's blocks and the written pages in a compact copy list (at most
+  one entry per slot, then the written pages), drops the draft columns' blocks,
+  resets their table entries and reports the overflow without ever writing past
+  the list. A prefill never uses the pool: its columns are committed prompt
+  tokens, so it reads the staged layer with dense attention, and a call declared
+  without draft columns refuses an overflowing pool (control[3] 2) instead of
+  emptying a real column's shortlist.
 - An overflowing round degrades on the device, before acceptance:
   `resolve_kernel` writes the worst overflow code into a per-lane device flag and
   empties the draft columns' shortlists (their blocks are `-1` in the table),
