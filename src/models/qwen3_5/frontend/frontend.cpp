@@ -994,8 +994,10 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
-        const std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
+        // No separate Vision ceiling: one request's visual budget is bounded by the context window
+        // exactly like its text. The remaining limit is the live-media quota checked just below,
+        // which costs 12,288 bytes per merged token.
+        const std::uint64_t vision_tokens = options.max_context;
         // Raw patches per soft token and values per patch: Gemma 4 pools 3 x 3 patches of
         // 3 x 16 x 16, DeepSeek-V4.1 merges 3 x 3 of 3 x 14 x 14, Qwen 2 x 2 of 2 x 3 x 16 x 16.
         const std::uint64_t patches_per_token =
@@ -1013,7 +1015,8 @@ public:
                 processor.max_raw_patches * patch_features * sizeof(std::uint16_t);
             if (minimum_live > options.media_live_bytes) {
                 throw std::invalid_argument(
-                    "media live-byte capacity cannot hold the maximum supported Vision prompt");
+                    "media live-byte capacity cannot hold the maximum supported Vision "
+                    "prompt; raise --media-live-mib or lower --max-context");
             }
             media_cache = std::make_shared<fi::MediaPreprocessCache>(
                 options.media_cache_bytes, options.media_live_bytes,

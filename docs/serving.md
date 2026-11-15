@@ -2387,7 +2387,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
-| `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
+| `--media-live-mib N` | all live prepared BF16 media payloads; an accounting ceiling, not a startup reservation | `12288` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--request-log-max-mib N` | rotate the request log once it reaches N MiB: the file is renamed to `FILE.1`, older copies move up to `FILE.<keep>` and the oldest is dropped, and the new file starts with the `server_start` record; requires `--request-log-jsonl` | `0` (one unbounded file) |

@@ -36,7 +36,10 @@ inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 
-inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
+// Sized to a 1M-context equivalent: 1,048,576 merged vision tokens x 12,288 B. This is an accounting
+// ceiling for live prepared payloads, not a reservation -- nothing is allocated at startup, so a
+// large default costs nothing until a prompt actually holds media.
+inline constexpr std::size_t kDefaultMediaLiveBytes      = 12ULL << 30;
 
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 

@@ -650,7 +650,7 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
                 std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         } else {
             std::size_t remaining_media_bytes =
-                std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+                options_.max_request_bytes;
             ninfer::PromptInput input =
                 to_prompt_input(request, semantics, [&](const ContentPart& part) {
                     return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
@@ -731,7 +731,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+            options_.max_request_bytes;
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
@@ -765,7 +765,7 @@ std::string GenerationService::render_prompt(const GenerationRequest& request,
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+            options_.max_request_bytes;
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
