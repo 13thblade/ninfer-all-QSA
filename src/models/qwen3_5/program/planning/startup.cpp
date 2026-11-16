@@ -256,8 +256,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // lane: pinning the pool to logical_pages makes C near-full-history sessions look like C*L
     // pages against an L-page pool, so a later turn is refused with a Paged KV pool reservation
     // error even though host RAM already holds all C histories. Give the pool C*L page groups;
-    // the staging copy still addresses only its first L pages through the identity table, the MTP
-    // pool stays at L (+draft window), and every address space keeps its L-page cap.
+    // the staging copy still addresses only its first L pages through the identity table, and
+    // every address space keeps its L-page cap.
+    //
+    // The MTP pool cannot stay at L either. MTP KV is dense and never streamed, so every live
+    // lane keeps its complete history there: C near-full-history lanes need C*L page groups, the
+    // same as the text pool. Pinned at L, the first lane's prompt filled the pool and every other
+    // lane's admission failed with "context cache exhausted: an idle Engine found no placement"
+    // (measured: pool 2,052 pages at --max-context 131072, first prompt 1,287 pages, the next
+    // needing 1,054 found 763). The draft windows are per lane already.
     const std::uint32_t stream_text_pages = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages,
         "QSA streamed text KV page pool exceeds int32"));
@@ -265,9 +272,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         plan.stream_slots != 0 ? stream_text_pages : physical_pages;
     const std::uint32_t mtp_page_groups =
         plan.stream_slots != 0
-            ? static_cast<std::uint32_t>(
-                  checked_i32(static_cast<std::uint64_t>(logical_pages) + mtp_extra_pages,
-                              "MTP Paged KV physical pages exceed int32"))
+            ? static_cast<std::uint32_t>(checked_i32(
+                  static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages +
+                      mtp_extra_pages,
+                  "MTP Paged KV physical pages exceed int32"))
             : mtp_physical_pages;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
