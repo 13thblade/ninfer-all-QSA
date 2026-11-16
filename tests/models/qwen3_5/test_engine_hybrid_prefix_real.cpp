@@ -607,16 +607,21 @@ int exercise_stop_string(const char* artifact, ninfer::SpeculativeBackend backen
     }
     const std::string stop = whole.substr(*cut, kStopBytes);
 
-    ninfer::Engine engine(options());
+    // The reference below has to be a cold run, but it does not need this Engine alive:
+    // collect the results first and release the weights before building the reference Engine.
+    // Two resident copies of a 27B model do not fit on a 24 GiB card, while one does.
+    std::optional<ninfer::Engine> engine;
+    engine.emplace(options());
     ninfer::RequestOptions stopped = request(240);
     stopped.stop.strings.push_back(ninfer::StopString{.text = stop});
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare(conversation({system, first_user})), stopped);
+        engine->generate(engine->prepare(conversation({system, first_user})), stopped);
     const std::vector<ninfer::ChatMessage> turns{
         system, first_user, text_message(ninfer::ChatRole::Assistant, first.content), next_user};
     const ninfer::GenerationResult second =
-        engine.generate(engine.prepare(conversation(turns)), request(12));
-    const ninfer::RuntimeStats stats = engine.runtime_stats();
+        engine->generate(engine->prepare(conversation(turns)), request(12));
+    const ninfer::RuntimeStats stats = engine->runtime_stats();
+    engine.reset();
 
     ninfer::Engine fresh(options());
     const ninfer::GenerationResult reference =
