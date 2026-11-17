@@ -31,6 +31,9 @@ Example (already-QSA GGUF, no donor)::
       --out E:\\LLMs\\Qwen3.8-27B-QSA.ninfer
 
 Model card: https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF
+
+The indexed proposal head (``--lm-head-draft``) is packed by default. Pass
+``--no-proposal`` to omit it.
 """
 from __future__ import annotations
 
@@ -134,8 +137,9 @@ def main() -> int:
     p.add_argument("--out", type=Path, required=True, help="output .ninfer path")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--components", default="text,vision,mtp,dflash2")
-    p.add_argument("--proposal", action="store_true",
-                   help="pack the indexed proposal head (required for --lm-head-draft)")
+    p.add_argument("--proposal", action=argparse.BooleanOptionalAction, default=True,
+                   help="pack the indexed proposal head (default: on; required for "
+                        "--lm-head-draft). pass --no-proposal to omit it")
     p.add_argument("--proposal-rows", type=int, default=131072,
                    help="shortlist size of the proposal head (default 131072)")
     p.add_argument("--ranking", type=Path, default=None,
