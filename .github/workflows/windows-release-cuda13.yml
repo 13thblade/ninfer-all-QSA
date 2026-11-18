@@ -1,0 +1,306 @@
+# Windows x64 release for CUDA 13.4.x on GitHub-hosted runners.
+#
+# A fork-only counterpart to native-release.yml: one Toolkit (CUDA 13.4.3), every architecture it
+# supports (sm_75 .. sm_120a), and a plain zip on a GitHub release. Upstream keeps its object cache
+# in a private HuggingFace bucket whose writer guard names iamwavecut/ninfer-all; this workflow
+# carries the same objects between jobs in the run's own artifacts instead, so it needs no
+# repository secrets.
+#
+# The compile is sharded the way native-release.yml shards it (build-object-shard.py, two jobs per
+# runner to stay inside 16 GB), then the package job replays the whole graph against the restored
+# ccache, links, and packages.
+name: Windows release (CUDA 13.4.3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: CUDA architectures
+        type: string
+        default: '75;80;86;89;120a'
+      publish:
+        description: Create a GitHub release with the zip
+        type: boolean
+        default: true
+      tag:
+        description: Release tag (empty names it win-cuda13.4-<commit>)
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CUDA_VERSION: '13.4.3'
+  CUDA_PACKAGES: '["nvcc","crt","nvvm","cudart","cublas","cublas_dev","nvtx","thrust","cuda_profiler_api","cuobjdump","nvprune"]'
+  CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+  CCACHE_MAXSIZE: 8Gi
+  CCACHE_COMPILERCHECK: content
+  CCACHE_DEPEND: 'true'
+  CCACHE_COMPRESSLEVEL: '5'
+  SHARD_COUNT: '8'
+
+jobs:
+  vcpkg:
+    name: Build the vcpkg ports
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Import Visual Studio 2022 environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV }
+          }
+      - name: Resolve the pinned vcpkg revision
+        id: vcpkg
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.vcpkg.outputs.baseline }}
+          path: .vcpkg
+      - name: Install the manifest's ports
+        timeout-minutes: 110
+        run: |
+          foreach ($attempt in 0..5) {
+            & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 5) { throw 'vcpkg bootstrap failed' }
+            Start-Sleep -Seconds ([math]::Pow(2, $attempt) * 10)
+          }
+          & .\.vcpkg\vcpkg.exe install --triplet x64-windows --x-install-root="$pwd\vcpkg-tree"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vcpkg-x64-windows
+          path: vcpkg-tree
+          compression-level: 0
+          retention-days: 3
+
+  objects:
+    name: Compile shard ${{ matrix.shard }}
+    needs: vcpkg
+    runs-on: windows-2022
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          name: vcpkg-x64-windows
+          path: vcpkg-tree
+      - name: Install the official CUDA Toolkit
+        run: |
+          $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_$($env:CUDA_VERSION)_windows_x86_64_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $packages = ($env:CUDA_PACKAGES | ConvertFrom-Json) | ForEach-Object { "${_}_$short" }
+          $process = Start-Process $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'bin\nvprune.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
+          }
+          python .github/scripts/fetch-cuda-license.py --version $env:CUDA_VERSION --output "$cuda/EULA.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA licence extraction failed' }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          "$cuda\bin" >> $env:GITHUB_PATH
+      - name: Import Visual Studio 2022 environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'CUDA_PATH', 'VCPKG_ROOT') {
+              if ($before[$Matches[1]] -cne $Matches[2]) { "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV }
+            }
+          }
+      - name: Install the pinned ccache
+        run: python .github/scripts/install-compiler-cache.py
+      - name: Configure
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
+            "-DNINFER_VCPKG_TREE=$pwd/vcpkg-tree/x64-windows" `
+            "-DVCPKG_INSTALLED_DIR=$pwd/vcpkg-tree" "-DVCPKG_TARGET_TRIPLET=x64-windows" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      - name: Compile the shard
+        timeout-minutes: 320
+        run: |
+          python .github/scripts/build-object-shard.py --shard ${{ matrix.shard }} --count $env:SHARD_COUNT --jobs 2
+          if ($LASTEXITCODE -ne 0) { throw 'Shard compilation failed' }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: objects-${{ matrix.shard }}
+          path: .cache/objects
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 3
+
+  package:
+    name: Link and package
+    needs: objects
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          name: vcpkg-x64-windows
+          path: vcpkg-tree
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: objects-*
+          path: .cache/objects
+          merge-multiple: true
+      - name: Install the official CUDA Toolkit
+        run: |
+          $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_$($env:CUDA_VERSION)_windows_x86_64_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $packages = ($env:CUDA_PACKAGES | ConvertFrom-Json) | ForEach-Object { "${_}_$short" }
+          $process = Start-Process $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'bin\nvprune.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
+          }
+          python .github/scripts/fetch-cuda-license.py --version $env:CUDA_VERSION --output "$cuda/EULA.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA licence extraction failed' }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          "$cuda\bin" >> $env:GITHUB_PATH
+      - name: Import Visual Studio 2022 environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'CUDA_PATH', 'VCPKG_ROOT') {
+              if ($before[$Matches[1]] -cne $Matches[2]) { "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV }
+            }
+          }
+      - name: Install the pinned ccache
+        run: python .github/scripts/install-compiler-cache.py
+      - name: Configure
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
+            "-DNINFER_VCPKG_TREE=$pwd/vcpkg-tree/x64-windows" `
+            "-DVCPKG_INSTALLED_DIR=$pwd/vcpkg-tree" "-DVCPKG_TARGET_TRIPLET=x64-windows" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      - name: Link the release products
+        timeout-minutes: 300
+        run: |
+          cmake --build build-release -j 2 --target ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile -- -k 0
+          if ($LASTEXITCODE -ne 0) { throw 'Release link failed' }
+      - name: Package and zip
+        run: |
+          $env:NINFER_BUILD_ROOT = "$pwd/build-release"
+          pwsh -NoProfile -File scripts/package-release.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+          $product = Get-ChildItem dist -Directory | Select-Object -First 1
+          $zip = Join-Path $pwd ("dist\{0}.zip" -f $product.Name)
+          Compress-Archive -LiteralPath $product.FullName -DestinationPath $zip -CompressionLevel Optimal
+          Remove-Item -Path 'dist\*.7z*', 'dist\SHA256SUMS-*.txt' -Force -ErrorAction SilentlyContinue
+          $size = (Get-Item $zip).Length
+          "zip: $size bytes"
+          if ($size -gt 1900MB) {
+            # One release asset is capped at 2 GiB: split the zip into 1900 MiB parts that
+            # `copy /b part.001+part.002+... restored.zip` reassembles.
+            $stream = [System.IO.File]::OpenRead($zip)
+            try {
+              $buffer = New-Object byte[] (4MB)
+              $index = 1
+              while ($stream.Position -lt $stream.Length) {
+                $target = "{0}.{1:000}" -f $zip, $index
+                $out = [System.IO.File]::Create($target)
+                try {
+                  $written = 0
+                  while ($written -lt 1900MB) {
+                    $want = [Math]::Min($buffer.Length, 1900MB - $written)
+                    $read = $stream.Read($buffer, 0, $want)
+                    if ($read -le 0) { break }
+                    $out.Write($buffer, 0, $read)
+                    $written += $read
+                  }
+                } finally { $out.Dispose() }
+                $index++
+              }
+            } finally { $stream.Dispose() }
+            Remove-Item -LiteralPath $zip
+          }
+          Get-ChildItem dist -File | Where-Object { $_.Name -match '\.zip(\.\d{3})?$' } |
+            ForEach-Object { "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } |
+            Set-Content -Path dist\SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-cuda13.4
+          path: |
+            dist/*.zip*
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Publish release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if (-not $tag) { $tag = 'win-cuda13.4-' + '${{ github.sha }}'.Substring(0, 12) }
+          $files = @(Get-ChildItem dist -File | Where-Object { $_.Name -match '\.zip(\.\d{3})?$' } | ForEach-Object FullName)
+          $files += (Join-Path $pwd 'dist\SHA256SUMS.txt')
+          $notes = "Windows x64, CUDA 13.4.3 (${{ inputs.archs }}), built by GitHub Actions from ${{ github.sha }}. Unpack the zip, or reassemble split parts with copy /b; see SHA256SUMS.txt."
+          gh release view $tag --repo ${{ github.repository }} *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --repo ${{ github.repository }} --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          } else {
+            gh release create $tag @files --repo ${{ github.repository }} --target '${{ github.sha }}' --title "Windows x64 CUDA 13.4.3" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+          }
