@@ -282,49 +282,31 @@ std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<con
 } // namespace
 
 void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
-    // R1: reads the lanes' own records (advanced where the KV frontier moves), not the checkpoint
-    // catalog -- the hybrid cache never fills a catalogued continuation, so a diagnostic built on
-    // one could only ever report zero. The three-way choice is upstream's: the longest of the
-    // stored image, the turn closure (a lane's last prompt) and the endpoint (a lane's live
-    // prefix). The store lands in R4; it is reported so the log has its final shape.
+    // R1/R4: reads the lanes' own records (advanced where the KV frontier moves), not the
+    // checkpoint catalog -- the hybrid cache never fills a catalogued continuation, so a
+    // diagnostic built on one could only ever report zero. The three-way choice is upstream's and
+    // lives in qsa_choose_reuse, the same function the admission will call once the store is
+    // wired; the log reports each source's best so it can be checked against the capacity model.
     if (!qsa_indexer_state.has_value() || !qsa_reuse_trace_enabled()) { return; }
-    const std::span<const TokenId> prompt_tokens(prompt.token_ids);
-    std::uint32_t best_live     = 0;
-    std::uint32_t best_anchored = 0;
-    std::uint32_t best_lane     = 0;
-    std::uint32_t scanned       = 0;
-    std::uint32_t max_held      = 0;
-    for (std::size_t lane = 0; lane < qsa_lane_prefix.size(); ++lane) {
+    std::uint32_t scanned  = 0;
+    std::uint32_t max_held = 0;
+    for (std::size_t lane = 0; lane < qsa_lane_prefix.size() && lane < lane_epochs.size(); ++lane) {
         const LanePrefixRecord& record = qsa_lane_prefix[lane];
         if (record.epoch == 0 || record.epoch != lane_epochs[lane] || record.held.empty()) {
             continue;
         }
         ++scanned;
         max_held = std::max(max_held, record.held.position);
-        // Each side is keyed at its own length: the lane's media identity describes the tokens it
-        // wrote, the prompt's the same-length prefix of the incoming prompt. Comparing them is
-        // what upstream's media check does unit by unit.
-        const std::uint32_t live =
-            qsa_prefix_reuse(record.held, prompt_tokens,
-                             qsa_vision_key_at(prompt, record.held.position));
-        const std::uint32_t anchored =
-            record.anchor.empty()
-                ? 0U
-                : qsa_prefix_reuse(record.anchor, prompt_tokens,
-                                   qsa_vision_key_at(prompt, record.anchor.position));
-        if (std::max(live, anchored) > std::max(best_live, best_anchored)) {
-            best_live     = live;
-            best_anchored = anchored;
-            best_lane     = static_cast<std::uint32_t>(lane);
-        }
     }
-    const std::uint32_t store = 0;
-    const char* chosen        = store > std::max(best_live, best_anchored)
-                                    ? "store"
-                                    : (best_anchored > best_live
-                                           ? "turn_closure"
-                                           : (best_live > 0 ? "endpoint" : "root"));
-    qsa_reuse_trace(best_lane, best_live, best_anchored, store, chosen, scanned, max_held);
+    const QsaReuseChoice choice = qsa_choose_reuse(qsa_lane_prefix, lane_epochs, nullptr,
+                                                   prompt.token_ids, prompt.block_extras);
+    const char* chosen         = choice.from_store
+                                     ? "store"
+                                     : (choice.path_kind == 1
+                                            ? "turn_closure"
+                                            : (choice.tokens != 0 ? "endpoint" : "root"));
+    qsa_reuse_trace(choice.lane, choice.live, choice.anchored, choice.stored, chosen, scanned,
+                    max_held);
 }
 
 std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,

@@ -251,6 +251,12 @@ public:
     // Longest stored prefix of `prompt` (upstream find_stored :1336): index and length.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t>
     find_stored(std::span<const TokenId> prompt_tokens, std::uint64_t prompt_vision_key) const;
+    // The same, keyed per length: each image's key is its own prefix's cumulative Vision key, so
+    // the prompt side is read at that image's length. `whole` lets an image serve the entire
+    // prompt (an image carries the continuation hidden a regenerate needs).
+    [[nodiscard]] std::pair<std::size_t, std::uint32_t>
+    find_stored(std::span<const TokenId> prompt_tokens,
+                std::span<const std::uint64_t> prompt_media, bool whole) const;
     [[nodiscard]] std::optional<std::size_t>
     stored_index(const HeldPrefix& key) const;
 
@@ -307,5 +313,81 @@ private:
     std::vector<std::byte*> free_pages_;
     std::vector<StoredImage> stored_;
 };
+
+// ---- Three-way admission (R4) ----------------------------------------------------------------
+// Upstream qwen4_exp_core.cpp:1650-1690: the longest of the stored image, the turn closure (the
+// lane's last prompt) and the endpoint (the lane's live prefix). `whole` lets an anchor or an
+// image serve the entire prompt (a regenerate): the first new token is sampled from the
+// continuation hidden the image carries, so the prefix does not have to be one token shorter than
+// the prompt. The live prefix keeps the strict rule -- its last written token is a sample a prior
+// turn was decoding, not a prompt boundary.
+struct QsaReuseChoice {
+    std::uint32_t tokens    = 0;
+    std::uint32_t live      = 0; // best the lanes' live prefixes offered
+    std::uint32_t anchored  = 0; // best the lanes' anchors offered
+    std::uint32_t stored    = 0; // best the store offered
+    std::uint32_t lane      = 0;
+    std::size_t image       = 0;
+    bool from_store         = false;
+    bool whole              = false; // covers the whole prompt
+    std::uint32_t path_kind = 0;     // 0 endpoint, 1 turn closure, 2 stored image
+};
+
+[[nodiscard]] inline QsaReuseChoice
+qsa_choose_reuse(std::span<const LanePrefixRecord> records,
+                 std::span<const std::uint64_t> lane_epochs, const QsaContinuationStore* store,
+                 std::span<const TokenId> prompt_tokens,
+                 std::span<const std::uint64_t> prompt_media) {
+    QsaReuseChoice best;
+    std::uint32_t best_live     = 0;
+    std::uint32_t best_anchored = 0;
+    for (std::size_t lane = 0; lane < records.size(); ++lane) {
+        const LanePrefixRecord& record = records[lane];
+        if (record.epoch == 0 || lane >= lane_epochs.size() ||
+            record.epoch != lane_epochs[lane] || record.held.empty()) {
+            continue;
+        }
+        const std::uint32_t live =
+            qsa_prefix_reuse(record.held, prompt_tokens,
+                             qsa_media_key_at(prompt_media, record.held.position));
+        const std::uint32_t anchored =
+            record.anchor.empty()
+                ? 0U
+                : qsa_prefix_reuse(record.anchor, prompt_tokens,
+                                   qsa_media_key_at(prompt_media, record.anchor.position), true);
+        if (live > best_live) {
+            best_live          = live;
+            best.live          = live;
+            best.tokens        = live;
+            best.lane          = static_cast<std::uint32_t>(lane);
+            best.from_store    = false;
+            best.whole         = false;
+            best.path_kind     = 0;
+        }
+        if (anchored > best_anchored) {
+            best_anchored  = anchored;
+            best.anchored  = anchored;
+            if (anchored > best_live) {
+                best.tokens     = anchored;
+                best.lane       = static_cast<std::uint32_t>(lane);
+                best.from_store = false;
+                best.whole      = anchored == prompt_tokens.size();
+                best.path_kind  = 1;
+            }
+        }
+    }
+    const auto [image, stored] =
+        store != nullptr ? store->find_stored(prompt_tokens, prompt_media, true)
+                         : std::pair<std::size_t, std::uint32_t>{0, 0};
+    best.stored = stored;
+    if (stored > std::max(best_live, best_anchored)) {
+        best.tokens     = stored;
+        best.image      = image;
+        best.from_store = true;
+        best.whole      = stored == prompt_tokens.size();
+        best.path_kind  = 2;
+    }
+    return best;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

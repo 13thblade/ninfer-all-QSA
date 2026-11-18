@@ -204,6 +204,30 @@ QsaContinuationStore::find_stored(std::span<const TokenId> prompt_tokens,
     return best;
 }
 
+std::pair<std::size_t, std::uint32_t>
+QsaContinuationStore::find_stored(std::span<const TokenId> prompt_tokens,
+                                  std::span<const std::uint64_t> prompt_media,
+                                  bool whole) const {
+    std::pair<std::size_t, std::uint32_t> best{0, 0};
+    if (prompt_tokens.empty()) { return best; }
+    for (std::size_t i = 0; i < stored_.size(); ++i) {
+        if (stored_[i].pages.empty()) { continue; }
+        const StoredImage& image = stored_[i];
+        const std::size_t held   = image.key.tokens.size();
+        // Strict prefix, or the whole prompt when the image carries the continuation hidden a
+        // regenerate samples from (upstream `whole` for a branched read; here also regenerate).
+        if (held == 0 || held > prompt_tokens.size() - (whole ? 0U : 1U)) { continue; }
+        if (!std::equal(image.key.tokens.begin(), image.key.tokens.end(), prompt_tokens.begin())) {
+            continue;
+        }
+        // Keyed at the image's own length: the prompt's cumulative Vision key at `held` must be
+        // the one the image was written with.
+        if (image.key.vision_key != qsa_media_key_at(prompt_media, held)) { continue; }
+        if (held > best.second) { best = {i, static_cast<std::uint32_t>(held)}; }
+    }
+    return best;
+}
+
 bool QsaContinuationStore::store_image(const HeldPrefix& key, std::uint64_t image_bytes,
                                        std::uint32_t path_kind, std::uint64_t hidden_bytes) {
     if (key.tokens.size() < kMinStoredTokens || host_budget_ == 0) { return false; }

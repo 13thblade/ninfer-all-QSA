@@ -26,7 +26,9 @@ namespace {
 
 using ninfer::TokenId;
 using ninfer::models::qwen3_5::detail::HeldPrefix;
+using ninfer::models::qwen3_5::detail::LanePrefixRecord;
 using ninfer::models::qwen3_5::detail::QsaContinuationStore;
+using ninfer::models::qwen3_5::detail::qsa_choose_reuse;
 using ninfer::models::qwen3_5::detail::qsa_prefix_reuse;
 
 int failures = 0;
@@ -293,6 +295,56 @@ void test_image_hidden_roundtrip() {
     expect(store.used_bytes() == 0, "the hidden is released with its image");
 }
 
+void test_three_way_choice() {
+    QsaContinuationStore store(64ULL << 20);
+    std::vector<TokenId> prompt(256);
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+        prompt[i] = static_cast<TokenId>(i + 1);
+    }
+    std::vector<LanePrefixRecord> records(2);
+    const std::vector<std::uint64_t> epochs{1, 1};
+    records[0].epoch = 1;
+    records[0].held.tokens.assign(prompt.begin(), prompt.begin() + 200);
+    records[0].held.position = 200;
+    records[0].anchor.tokens.assign(prompt.begin(), prompt.begin() + 128);
+    records[0].anchor.position = 128;
+    records[1].epoch = 1; // a lane that holds nothing
+
+    // The prompt grows past the lane's live prefix: the endpoint resumes 200.
+    auto choice = qsa_choose_reuse(records, epochs, &store, prompt, {});
+    expect(choice.tokens == 200 && choice.path_kind == 0 && !choice.from_store,
+           "the live prefix wins when it is the longest");
+    expect(choice.lane == 0, "the choice names the lane that holds it");
+
+    // A regenerate of the anchor's prompt: equal length, so only `whole` can resume it, and the
+    // live prefix (200 > 127) is rejected outright.
+    const std::vector<TokenId> same(prompt.begin(), prompt.begin() + 128);
+    choice = qsa_choose_reuse(records, epochs, &store, same, {});
+    expect(choice.tokens == 128 && choice.path_kind == 1,
+           "an equal-length prompt resumes at the lane's anchor");
+    expect(choice.whole, "the anchor covers the whole prompt");
+
+    // A stored image of the whole prompt beats both (a regenerate after the lane moved on).
+    HeldPrefix whole_key;
+    whole_key.tokens   = prompt;
+    whole_key.position = static_cast<std::uint32_t>(prompt.size());
+    expect(store.store_image(whole_key, 4096, 1, 64), "store the whole prompt with a hidden");
+    choice = qsa_choose_reuse(records, epochs, &store, prompt, {});
+    expect(choice.from_store && choice.tokens == 256 && choice.whole,
+           "the stored image serves the whole prompt");
+
+    // The same image read with a different media identity does not match.
+    const std::vector<std::uint64_t> media{0xAAULL};
+    choice = qsa_choose_reuse(records, epochs, &store, prompt, media);
+    expect(!choice.from_store, "a media mismatch rejects the stored image");
+
+    // An epoch mismatch invalidates the lane's records.
+    const std::vector<std::uint64_t> advanced{2, 2};
+    choice = qsa_choose_reuse(records, advanced, &store, prompt, {});
+    expect(choice.tokens == 256 && choice.from_store,
+           "a lane that changed tenants keeps only the store");
+}
+
 } // namespace
 
 int main() {
@@ -307,6 +359,7 @@ int main() {
     test_image_save_load_roundtrip();
     test_plane_chunks_roundtrip();
     test_image_hidden_roundtrip();
+    test_three_way_choice();
     if (failures != 0) {
         std::cerr << failures << " QSA continuation-store checks failed\n";
         return 1;
