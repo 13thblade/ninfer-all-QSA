@@ -1,22 +1,16 @@
 // Host tier persistence of the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
 // §5.5). The file holds exactly what a restarted Engine can resume from: every Host-backed
-// snapshot and the backed block path it anchors on (a host slab, or, under the streamed tier, the
-// writer's per-sequence stream image), with the block record bytes. Nothing in it is trusted
-// unless the fingerprint (model artifact, KV and state formats, binary) and the Host geometry
-// match; a damaged or foreign file loads nothing.
+// snapshot and the Host-resident block path it anchors on, with the slab bytes. Nothing in it is
+// trusted unless the fingerprint (model artifact, KV and state formats, binary) and the Host
+// geometry match; a damaged or foreign file loads nothing.
 //
-// Layout (version 6): the header, the block table (parents first), the image table (one run of
-// block file indices per per-sequence stream image, shallowest run first), the snapshot table,
-// then the slab bytes of every slab-backed block in table order, the block record bytes of every
-// image in table and run order, the slab bytes of every snapshot in table order, then the footer.
-// A block's bytes sit in its image's run when the block is image-backed and in the slab section
-// otherwise. The tables come first so a Host tier smaller than the file can choose what to
-// restore before reading any bytes.
+// Layout (version 5): the header, the block table (parents first), the snapshot table, then the
+// slab bytes of every block and of every snapshot in table order, then the footer. The tables come
+// first so a Host tier smaller than the file can choose what to restore before reading any slab.
 
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "ninfer/request.h"
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -37,7 +31,7 @@ namespace {
 
 constexpr std::array<char, 8> kMagic  = {'N', 'I', 'N', 'F', 'H', 'P', 'C', '1'};
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'E', 'N', 'D', '1'};
-constexpr std::uint32_t kVersion      = 6;
+constexpr std::uint32_t kVersion      = 5;
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint64_t kFooterBytes  = kFooter.size() + 2U * sizeof(std::uint32_t);
 constexpr const char* kSaveAbandoned  = "abandoned; the previous file is kept";
@@ -183,14 +177,7 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
     };
     std::vector<pc::NodeRef> nodes;
     std::vector<pc::SnapshotRef> snapshots;
-    std::vector<pc::PersistableImage> images;
-    index_->collect_persistable(nodes, snapshots, &images);
-    // The image runs, shallowest first: a run's parent chain always lies in an earlier run, so a
-    // load that walks the table in order restores parents before children.
-    std::stable_sort(images.begin(), images.end(), [&](const pc::PersistableImage& left,
-                                                       const pc::PersistableImage& right) {
-        return index_->node(left.run.front()).depth < index_->node(right.run.front()).depth;
-    });
+    index_->collect_persistable(nodes, snapshots);
 
     std::filesystem::path temporary = path;
     temporary += ".tmp";
@@ -203,7 +190,6 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
         const Geometry geometry = geometry_of(host_layout_);
         writer.value(geometry);
         writer.value(static_cast<std::uint32_t>(nodes.size()));
-        writer.value(static_cast<std::uint32_t>(images.size()));
         writer.value(static_cast<std::uint32_t>(snapshots.size()));
 
         std::unordered_map<std::uint32_t, std::int32_t> file_index;
@@ -216,12 +202,6 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
             writer.value(identity.extra);
             writer.bytes(identity.tokens.data(), identity.tokens.size_bytes());
             file_index.emplace(node.index, static_cast<std::int32_t>(file_index.size()));
-        }
-        for (const pc::PersistableImage& image : images) {
-            writer.value(static_cast<std::uint32_t>(image.run.size()));
-            for (const pc::NodeRef node : image.run) {
-                writer.value(static_cast<std::uint32_t>(file_index.at(node.index)));
-            }
         }
         for (const pc::SnapshotRef snapshot : snapshots) {
             const pc::SnapshotView view = index_->snapshot(snapshot);
@@ -239,19 +219,8 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
                                                    (view.periodic ? 2U : 0U)));
         }
         for (const pc::NodeRef node : nodes) {
-            const pc::NodeView view = index_->node(node);
-            // An image-backed block's bytes live in its image's run, written below.
-            if (view.host_image != pc::kNoId) { continue; }
             check_abandoned();
-            writer.bytes(slab(view.host_slab), host_layout_.slab_bytes);
-        }
-        for (const pc::PersistableImage& image : images) {
-            const std::byte* data = stream_image_data(image.image);
-            for (std::size_t i = 0; i < image.run.size(); ++i) {
-                check_abandoned();
-                writer.bytes(data + static_cast<std::size_t>(i) * host_layout_.slab_bytes,
-                             host_layout_.slab_bytes);
-            }
+            writer.bytes(slab(index_->node(node).host_slab), host_layout_.slab_bytes);
         }
         for (const pc::SnapshotRef snapshot : snapshots) {
             for (const std::uint32_t slab_id : index_->snapshot(snapshot).host_slabs) {
@@ -327,17 +296,14 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
         const std::uint64_t file_bytes = std::filesystem::file_size(path);
         const std::uint64_t slab_bytes = host_layout_.slab_bytes;
         const auto node_count          = reader.value<std::uint32_t>();
-        const auto image_count         = reader.value<std::uint32_t>();
         const auto snapshot_count      = reader.value<std::uint32_t>();
         // Every entry takes at least one slab of the file: bounds the tables before allocating.
-        if (static_cast<std::uint64_t>(node_count) + image_count + snapshot_count >
-            file_bytes / slab_bytes) {
+        if (static_cast<std::uint64_t>(node_count) + snapshot_count > file_bytes / slab_bytes) {
             throw std::runtime_error("prefix cache file header is damaged");
         }
 
         std::vector<SavedBlock> blocks(node_count);
         std::vector<std::int32_t> parents(node_count);
-        std::vector<std::uint32_t> depth(node_count, 0);
         for (std::uint32_t index = 0; index < node_count; ++index) {
             SavedBlock& block = blocks[index];
             block.parent      = reader.value<std::int32_t>();
@@ -348,32 +314,6 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
                 throw std::runtime_error("prefix cache file block order is damaged");
             }
             parents[index] = block.parent;
-            depth[index]   = block.parent < kRootIndex
-                                 ? 0U
-                                 : depth[static_cast<std::size_t>(block.parent)] + 1U;
-        }
-        // The image runs: block file indices in path order. Every block sits in at most one run;
-        // the rest are slab-backed.
-        std::vector<std::vector<std::uint32_t>> image_runs(image_count);
-        std::vector<std::uint8_t> block_image(node_count, 0);
-        for (std::uint32_t image = 0; image < image_count; ++image) {
-            const auto run_count = reader.value<std::uint32_t>();
-            image_runs[image].resize(run_count);
-            for (std::uint32_t i = 0; i < run_count; ++i) {
-                const auto block_index = reader.value<std::uint32_t>();
-                if (block_index >= node_count || block_image[block_index]) {
-                    throw std::runtime_error("prefix cache file image run is damaged");
-                }
-                image_runs[image][i] = block_index;
-                block_image[block_index] = 1;
-            }
-            // The run is a parents-first chain: block i + 1's parent is block i.
-            for (std::uint32_t i = 1U; i < run_count; ++i) {
-                if (parents[image_runs[image][i]] !=
-                    static_cast<std::int32_t>(image_runs[image][i - 1U])) {
-                    throw std::runtime_error("prefix cache file image run is damaged");
-                }
-            }
         }
         std::vector<SavedSnapshot> snapshots(snapshot_count);
         std::vector<pc::SavedSnapshotShape> shapes(snapshot_count);
@@ -417,81 +357,33 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
         out.required_host_bytes = slabs * slab_bytes;
         out.host_bytes          = static_cast<std::uint64_t>(config_.host_slabs) * slab_bytes;
 
-        const pc::HostRestorePlan plan = pc::plan_host_restore_v6(
-            parents, block_image, shapes, config_.host_slabs, config_.stream_image_budget_bytes,
-            slab_bytes, config_);
-        const std::uint64_t planned = reader.read() + plan.slabs * slab_bytes + plan.image_bytes +
-                                      kFooterBytes;
+        const pc::HostRestorePlan plan =
+            pc::plan_host_restore(parents, shapes, config_.host_slabs, config_);
+        const std::uint64_t planned = reader.read() + plan.slabs * slab_bytes + kFooterBytes;
         phase.emplace(observer, StartupPhase::PrefixCacheLoad, StartupProgressUnit::Bytes, planned);
         phase->progress(reader.read(), planned);
 
         // Restored index ids of the file's blocks; absent when a block was not chosen or did not
         // restore, so its descendants and the snapshots on it are skipped too.
         std::vector<std::optional<pc::NodeRef>> restored(node_count);
-        std::uint64_t image_records = 0;
-        for (const std::vector<std::uint32_t>& run : image_runs) {
-            image_records += run.size();
-        }
-        const std::uint64_t slab_records = static_cast<std::uint64_t>(node_count) - image_records;
-        // The slab section holds the slab-backed blocks in table order.
-        std::uint64_t slab_record = 0;
         for (std::uint32_t index = 0; index < node_count; ++index) {
-            if (block_image[index]) { continue; }
             const SavedBlock& saved_block = blocks[index];
-            if (plan.blocks[index] &&
-                (saved_block.parent == kRootIndex ||
-                 restored[static_cast<std::size_t>(saved_block.parent)].has_value())) {
-                const pc::NodeRef parent = saved_block.parent == kRootIndex
-                                               ? pc::NodeRef{}
-                                               : *restored[static_cast<std::size_t>(saved_block.parent)];
-                const std::optional<pc::RestoredBlock> block = index_->restore_host_block(
-                    parent, saved_block.hash, saved_block.tokens, saved_block.extra);
-                if (block) {
-                    reader.seek(payload + slab_record * slab_bytes);
-                    reader.bytes(slab(block->slab), slab_bytes);
-                    restored[index] = block->node;
-                    ++out.blocks;
-                    phase->progress(reader.read(), planned);
-                }
+            if (!plan.blocks[index] ||
+                (saved_block.parent != kRootIndex &&
+                 !restored[static_cast<std::size_t>(saved_block.parent)])) {
+                continue;
             }
-            ++slab_record;
-        }
-        std::uint64_t image_record = slab_records;
-        for (std::uint32_t image = 0; image < image_count; ++image) {
-            const std::vector<std::uint32_t>& run = image_runs[image];
-            // Chosen blocks on a chain form a prefix from the root, so the chosen part of a run
-            // is its prefix.
-            std::size_t prefix = 0;
-            while (prefix < run.size() && plan.blocks[run[prefix]]) { ++prefix; }
-            if (prefix != 0 &&
-                (parents[run[0]] == kRootIndex ||
-                 restored[static_cast<std::size_t>(parents[run[0]])].has_value())) {
-                const pc::NodeRef parent = parents[run[0]] == kRootIndex
-                                               ? pc::NodeRef{}
-                                               : *restored[static_cast<std::size_t>(parents[run[0]])];
-                std::vector<pc::SavedStreamBlock> saved_blocks(prefix);
-                for (std::size_t i = 0; i < prefix; ++i) {
-                    const SavedBlock& saved_block = blocks[run[i]];
-                    saved_blocks[i] = {.lookup_hash = saved_block.hash,
-                                      .tokens      = std::span<const TokenId>(
-                                          saved_block.tokens.data(), pc::kBlockTokens),
-                                      .extra       = saved_block.extra};
-                }
-                const std::optional<pc::RestoredStreamImage> restored_image =
-                    index_->restore_stream_image(parent, saved_blocks, depth[run[0]],
-                                                 static_cast<std::uint64_t>(prefix) * slab_bytes);
-                if (restored_image) {
-                    reader.seek(payload + image_record * slab_bytes);
-                    reader.bytes(stream_image_data(restored_image->image),
-                                 static_cast<std::size_t>(prefix) * slab_bytes);
-                    for (std::size_t i = 0; i < prefix; ++i) {
-                        restored[run[i]] = restored_image->nodes[i];
-                        ++out.blocks;
-                    }
-                    phase->progress(reader.read(), planned);
-                }
-            }
-            image_record += run.size();
+            const pc::NodeRef parent = saved_block.parent == kRootIndex
+                                           ? pc::NodeRef{}
+                                           : *restored[static_cast<std::size_t>(saved_block.parent)];
+            const std::optional<pc::RestoredBlock> block = index_->restore_host_block(
+                parent, saved_block.hash, saved_block.tokens, saved_block.extra);
+            if (!block) { continue; }
+            reader.seek(payload + static_cast<std::uint64_t>(index) * slab_bytes);
+            reader.bytes(slab(block->slab), slab_bytes);
+            restored[index] = block->node;
+            ++out.blocks;
+            phase->progress(reader.read(), planned);
         }
         for (std::uint32_t index = 0; index < snapshot_count; ++index) {
             const SavedSnapshot& saved_snapshot = snapshots[index];

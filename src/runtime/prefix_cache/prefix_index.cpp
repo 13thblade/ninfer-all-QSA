@@ -299,25 +299,6 @@ std::uint32_t PrefixCacheIndex::supersede(SnapshotRef snapshot, Supersession cau
 
 // ---- pins --------------------------------------------------------------------------------------
 
-void PrefixCacheIndex::bump_node_pins(std::uint32_t node, int delta) {
-    Node& entry = nodes_[node];
-    if (delta < 0) {
-        if (entry.pins == 0) { invariant("prefix cache node unpinned without a pin"); }
-        entry.pins -= 1U;
-    } else {
-        entry.pins += 1U;
-    }
-    if (entry.host_image != kNoId) {
-        StreamImage& image = stream_images_[entry.host_image];
-        if (delta < 0) {
-            if (image.pins == 0) { invariant("prefix cache stream image pin underflow"); }
-            image.pins -= 1U;
-        } else {
-            image.pins += 1U;
-        }
-    }
-}
-
 void PrefixCacheIndex::acquire_path(std::span<const NodeRef> path) {
     std::uint32_t expected_parent = kNoId;
     for (const NodeRef ref : path) {
@@ -326,7 +307,7 @@ void PrefixCacheIndex::acquire_path(std::span<const NodeRef> path) {
         expected_parent = ref.index;
     }
     for (const NodeRef ref : path) {
-        bump_node_pins(ref.index, +1);
+        ++nodes_[ref.index].pins;
         refresh_node(ref.index);
     }
 }
@@ -340,21 +321,22 @@ void PrefixCacheIndex::release_path(std::span<const NodeRef> path) {
         expected_parent = ref.index;
     }
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
-        bump_node_pins(it->index, -1);
+        --nodes_[it->index].pins;
         refresh_node(it->index);
     }
 }
 
 void PrefixCacheIndex::pin_path_from(std::uint32_t node) {
     for (std::uint32_t current = node; current != kNoId; current = nodes_[current].parent) {
-        bump_node_pins(current, +1);
+        ++nodes_[current].pins;
         refresh_node(current);
     }
 }
 
 void PrefixCacheIndex::unpin_path_from(std::uint32_t node, bool) {
     for (std::uint32_t current = node; current != kNoId; current = nodes_[current].parent) {
-        bump_node_pins(current, -1);
+        if (nodes_[current].pins == 0) { invariant("prefix cache node unpinned without a pin"); }
+        --nodes_[current].pins;
         refresh_node(current);
     }
 }
@@ -391,9 +373,8 @@ void PrefixCacheIndex::unpin_snapshot(SnapshotRef snapshot) {
 void PrefixCacheIndex::refresh_node(std::uint32_t index) {
     const Node& node = nodes_[index];
     const bool lru   = node.occupied && node.device == CopyState::Resident && node.pins == 0;
-    // Host-backed means a host slab or a bound stream image (streamed tier).
-    const bool backed = node.host == CopyState::Resident || node.host_image != kNoId;
-    const std::uint8_t list = lru ? (backed ? kBacked : kUnbacked) : kNoList;
+    const std::uint8_t list =
+        lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
     if (lru_links_[index].list != list) {
         if (lru_links_[index].list != kNoList) { lru_remove(index); }
         if (list != kNoList) { lru_append(index, list); }
@@ -531,10 +512,7 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     if (device_id == kNoId) { throw std::invalid_argument("prefix cache block has no device id"); }
     if (const auto existing = find_child(parent, lookup_hash, block_tokens, extra)) {
         Node& node = nodes_[existing->index];
-        // A binding node's image counts every pin its run holds (register_stream_image sums
-        // node pins); a later pin must reach the image too, or release_path/unpin_snapshot
-        // would decrement the image below zero on a run the lane re-inserted or reattached.
-        bump_node_pins(existing->index, +1);
+        ++node.pins;
         bool attached = false;
         if (node.device == CopyState::Absent) {
             // A host-only block recomputed by this sequence regains its Device copy.
@@ -562,7 +540,6 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     set_device(node, CopyState::Resident);
     node.host_slab      = kNoId;
     node.host           = CopyState::Absent;
-    node.host_image     = kNoId;
     node.pins           = 1;
     node.live_below     = 0;
     node.retained_below = 0;
@@ -580,9 +557,9 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
 
 void PrefixCacheIndex::begin_device_fill(NodeRef ref, std::uint32_t device_id) {
     Node& node = require(ref);
-    const bool backed = node.host == CopyState::Resident || node.host_image != kNoId;
-    if (node.device != CopyState::Absent || !backed || node.pins == 0 || device_id == kNoId) {
-        invariant("prefix cache device fill requires a pinned host-backed node");
+    if (node.device != CopyState::Absent || node.host != CopyState::Resident || node.pins == 0 ||
+        device_id == kNoId) {
+        invariant("prefix cache device fill requires a pinned host-only node");
     }
     set_device(node, CopyState::Filling);
     node.device_id = device_id;
@@ -650,7 +627,7 @@ std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool 
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];
-            if (node.host == CopyState::Resident || node.host_image != kNoId) {
+            if (node.host == CopyState::Resident) {
                 drop_node_device_copy(entry);
                 ++counters_.device_block_evictions;
                 ++released;
@@ -867,183 +844,6 @@ void PrefixCacheIndex::abort_tail_device_fill(SnapshotRef ref) {
     snapshot.tail_device_copy = CopyState::Absent;
     refresh_tail(ref.index);
     backend_->release_device_block(id);
-}
-
-// ---- streamed-tier per-sequence images -------------------------------------------------------
-
-PrefixCacheIndex::StreamImage& PrefixCacheIndex::require_stream_image(std::uint32_t image) {
-    if (image >= stream_images_.size() || !stream_images_[image].occupied) {
-        invariant("stale prefix cache stream image reference");
-    }
-    return stream_images_[image];
-}
-
-std::pair<std::uint32_t, std::uint32_t> PrefixCacheIndex::stream_image_range(std::uint32_t image) {
-    StreamImage& entry = require_stream_image(image);
-    return {entry.first_block, entry.block_count};
-}
-
-void PrefixCacheIndex::stream_image_link(std::uint32_t image, bool newest) {
-    StreamImage& entry = stream_images_[image];
-    if (entry.in_list) { invariant("prefix cache stream image is linked twice"); }
-    entry.in_list = true;
-    if (newest) {
-        entry.prev = kNoId;
-        entry.next = stream_image_head_;
-        if (stream_image_head_ != kNoId) { stream_images_[stream_image_head_].prev = image; }
-        stream_image_head_ = image;
-        if (stream_image_tail_ == kNoId) { stream_image_tail_ = image; }
-    } else {
-        entry.next = kNoId;
-        entry.prev = stream_image_tail_;
-        if (stream_image_tail_ != kNoId) { stream_images_[stream_image_tail_].next = image; }
-        stream_image_tail_ = image;
-        if (stream_image_head_ == kNoId) { stream_image_head_ = image; }
-    }
-}
-
-void PrefixCacheIndex::stream_image_unlink(std::uint32_t image) {
-    StreamImage& entry = stream_images_[image];
-    if (!entry.in_list) { invariant("prefix cache stream image is unlinked twice"); }
-    if (entry.prev != kNoId) {
-        stream_images_[entry.prev].next = entry.next;
-    } else {
-        stream_image_head_ = entry.next;
-    }
-    if (entry.next != kNoId) {
-        stream_images_[entry.next].prev = entry.prev;
-    } else {
-        stream_image_tail_ = entry.prev;
-    }
-    entry.prev  = kNoId;
-    entry.next  = kNoId;
-    entry.in_list = false;
-}
-
-void PrefixCacheIndex::unbind_stream_image(std::uint32_t image) {
-    StreamImage& entry = stream_images_[image];
-    for (std::uint32_t node : entry.bound) {
-        // A node dropped earlier in this loop is gone already.
-        if (!nodes_[node].occupied || nodes_[node].host_image != image) { continue; }
-        Node& n = nodes_[node];
-        n.host_image = kNoId;
-        if (n.device == CopyState::Absent && n.host == CopyState::Absent) {
-            if (n.pins != 0) { invariant("prefix cache stream image held a pinned node"); }
-            // The last copy is gone: the unpinned subtree is dead (§9.4).
-            remove_subtree(node);
-        } else {
-            // Losing the image changes the node's Host backing; its LRU list follows.
-            refresh_node(node);
-        }
-    }
-    entry.bound.clear();
-}
-
-void PrefixCacheIndex::drop_stream_image(std::uint32_t image) {
-    StreamImage& entry = stream_images_[image];
-    if (!entry.occupied) { invariant("prefix cache drops a free stream image"); }
-    if (entry.pins != 0) { invariant("prefix cache drops a pinned stream image"); }
-    stream_image_unlink(image);
-    stream_image_bytes_used_ -= entry.bytes;
-    entry.occupied    = false;
-    entry.bytes       = 0;
-    entry.first_block = 0;
-    entry.block_count = 0;
-    entry.pins        = 0;
-    entry.bound.clear();
-    entry.prev        = kNoId;
-    entry.next        = kNoId;
-    entry.in_list     = false;
-    ++entry.generation;
-    ++counters_.stream_image_evictions;
-    backend_->release_stream_image(image);
-}
-
-void PrefixCacheIndex::evict_stream_image(std::uint32_t image) {
-    StreamImage& entry = stream_images_[image];
-    if (!entry.occupied) { invariant("prefix cache evicts a free stream image"); }
-    if (entry.pins != 0) { invariant("prefix cache evicts a pinned stream image"); }
-    unbind_stream_image(image);
-    drop_stream_image(image);
-}
-
-std::optional<std::uint32_t> PrefixCacheIndex::register_stream_image(
-    std::span<const NodeRef> nodes, std::uint32_t first_block, std::uint32_t block_count,
-    std::uint64_t bytes) {
-    if (nodes.size() != block_count || block_count == 0) {
-        invariant("prefix cache stream image does not cover a full run");
-    }
-    std::uint32_t bound = 0;
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-        const Node& node = require(nodes[i]);
-        if (i == 0 && node.depth != first_block) {
-            invariant("prefix cache stream image does not start at its first block");
-        }
-        if (i != 0 && nodes[i - 1U].index != node.parent) {
-            invariant("prefix cache stream image run is not a root path run");
-        }
-        if (node.pins == 0) { invariant("prefix cache stream image node is not pinned"); }
-        if (node.host_image != kNoId) { ++bound; }
-    }
-    if (bound == nodes.size()) {
-        // The run is already handed off: the earlier writer's image keeps the copy.
-        return std::nullopt;
-    }
-    if (bound != 0) { invariant("prefix cache stream image run is partially bound"); }
-    if (bytes == 0 || bytes > config_.stream_image_budget_bytes) { return std::nullopt; }
-    while (stream_image_bytes_used_ + bytes > config_.stream_image_budget_bytes) {
-        std::uint32_t victim = kNoId;
-        for (std::uint32_t image = stream_image_tail_; image != kNoId;
-             image            = stream_images_[image].prev) {
-            if (stream_images_[image].pins == 0) { victim = image; break; }
-        }
-        if (victim == kNoId) { return std::nullopt; }
-        evict_stream_image(victim);
-    }
-    const std::optional<std::uint32_t> slot = backend_->allocate_stream_image(bytes);
-    if (!slot) { return std::nullopt; }
-    const std::uint32_t index = *slot;
-    if (index >= stream_images_.size()) { stream_images_.resize(index + 1U); }
-    StreamImage& image = stream_images_[index];
-    image.occupied    = true;
-    image.bytes       = bytes;
-    image.first_block = first_block;
-    image.block_count = block_count;
-    image.pins        = 0;
-    image.bound.clear();
-    image.prev        = kNoId;
-    image.next        = kNoId;
-    image.in_list     = false;
-    for (const NodeRef node : nodes) {
-        Node& n          = nodes_[node.index];
-        n.host_image     = index;
-        image.pins      += n.pins;
-        image.bound.push_back(node.index);
-    }
-    stream_image_link(index, true);
-    stream_image_bytes_used_ += bytes;
-    return index;
-}
-
-void PrefixCacheIndex::pin_stream_image(std::uint32_t image) {
-    StreamImage& entry = require_stream_image(image);
-    ++entry.pins;
-    // Resuming from an image is its access: it becomes the newest candidate.
-    if (entry.in_list) { stream_image_unlink(image); }
-    stream_image_link(image, true);
-}
-
-void PrefixCacheIndex::unpin_stream_image(std::uint32_t image) {
-    StreamImage& entry = require_stream_image(image);
-    if (entry.pins == 0) { invariant("prefix cache stream image unpinned without a pin"); }
-    --entry.pins;
-}
-
-void PrefixCacheIndex::abort_stream_image(std::uint32_t image) {
-    StreamImage& entry = require_stream_image(image);
-    if (entry.pins != 0) { invariant("prefix cache aborts a pinned stream image"); }
-    unbind_stream_image(image);
-    drop_stream_image(image);
 }
 
 // ---- snapshots ---------------------------------------------------------------------------------
@@ -1488,16 +1288,6 @@ void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
     if (node.pins != 0 || node.device == CopyState::Filling || node.host == CopyState::Filling) {
         invariant("prefix cache removes a pinned or transferring node");
     }
-    if (node.host_image != kNoId) {
-        const std::uint32_t image  = node.host_image;
-        node.host_image            = kNoId;
-        StreamImage& entry         = stream_images_[image];
-        entry.bound.erase(std::find(entry.bound.begin(), entry.bound.end(), index));
-        if (entry.occupied && entry.bound.empty()) {
-            // Orphan: no node references the image anymore; return its buffer.
-            drop_stream_image(image);
-        }
-    }
     if (node.host == CopyState::Resident) { free_slab(node.host_slab); }
     node.host      = CopyState::Absent;
     node.host_slab = kNoId;
@@ -1558,7 +1348,6 @@ NodeView PrefixCacheIndex::node(NodeRef ref) const {
     view.device               = node.device;
     view.host_slab            = node.host_slab;
     view.host                 = node.host;
-    view.host_image           = node.host_image;
     view.pins                 = node.pins;
     view.live_snapshots_below = node.live_below;
     return view;
@@ -1598,11 +1387,9 @@ BlockIdentity PrefixCacheIndex::block_identity(NodeRef ref) const {
 // ---- persistence -------------------------------------------------------------------------------
 
 void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
-                                           std::vector<SnapshotRef>& snapshots,
-                                           std::vector<PersistableImage>* images) const {
+                                           std::vector<SnapshotRef>& snapshots) const {
     nodes.clear();
     snapshots.clear();
-    if (images != nullptr) { images->clear(); }
     std::vector<bool> keep(nodes_.size(), false);
     for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
         const Snapshot& snapshot = snapshots_[index];
@@ -1610,13 +1397,10 @@ void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
         if (!snapshot.occupied || snapshot.host != CopyState::Resident || snapshot.superseded) {
             continue;
         }
-        // A block is backed by its host slab or, under the streamed tier, its writer's
-        // per-sequence stream image.
         bool backed = true;
         for (std::uint32_t current = snapshot.anchor; current != kNoId && backed;
              current               = nodes_[current].parent) {
-            backed = nodes_[current].host == CopyState::Resident ||
-                     nodes_[current].host_image != kNoId;
+            backed = nodes_[current].host == CopyState::Resident;
         }
         if (!backed) { continue; }
         for (std::uint32_t current = snapshot.anchor; current != kNoId && !keep[current];
@@ -1631,22 +1415,6 @@ void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
     std::stable_sort(nodes.begin(), nodes.end(), [&](NodeRef left, NodeRef right) {
         return nodes_[left.index].depth < nodes_[right.index].depth;
     });
-    if (images == nullptr) { return; }
-    // Kept blocks on a chain form a prefix from the root, so each image's kept blocks are the
-    // prefix of its bound run.
-    for (std::uint32_t image = 0; image < stream_images_.size(); ++image) {
-        const StreamImage& entry = stream_images_[image];
-        if (!entry.occupied) { continue; }
-        std::vector<NodeRef> run;
-        run.reserve(entry.bound.size());
-        for (const std::uint32_t node : entry.bound) {
-            if (!keep[node]) { break; }
-            run.push_back(ref_of_node(node));
-        }
-        if (!run.empty()) {
-            images->push_back(PersistableImage{.image = image, .run = std::move(run)});
-        }
-    }
 }
 
 bool PrefixCacheIndex::take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out) {
@@ -1688,7 +1456,6 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     node.device_id      = kNoId;
     node.host_slab      = slab.front();
     node.host           = CopyState::Resident;
-    node.host_image     = kNoId;
     node.pins           = 0;
     node.live_below     = 0;
     node.retained_below = 0;
@@ -1703,80 +1470,6 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     return RestoredBlock{ref_of_node(index), slab.front()};
 }
 
-std::optional<RestoredStreamImage> PrefixCacheIndex::restore_stream_image(
-    NodeRef parent, std::span<const SavedStreamBlock> blocks, std::uint32_t first_block,
-    std::uint64_t bytes) {
-    if (blocks.empty()) { invariant("prefix cache stream image restore has no run"); }
-    if (bytes == 0 || bytes > config_.stream_image_budget_bytes) { return std::nullopt; }
-    if (stream_image_bytes_used_ + bytes > config_.stream_image_budget_bytes) { return std::nullopt; }
-    for (const SavedStreamBlock& block : blocks) {
-        if (block.tokens.size() != kBlockTokens) {
-            throw std::invalid_argument("prefix cache stream image restore requires full blocks");
-        }
-    }
-    if (free_nodes_.size() < blocks.size()) { return std::nullopt; }
-    const std::uint32_t parent_index = parent.valid() ? parent.index : kNoId;
-    if (parent_index == kNoId ? first_block != 0U
-                             : nodes_[parent_index].depth + 1U != first_block) {
-        invariant("prefix cache stream image restore does not start at its parent");
-    }
-    const std::optional<std::uint32_t> slot = backend_->allocate_stream_image(bytes);
-    if (!slot) { return std::nullopt; }
-    const std::uint32_t image_id = *slot;
-    if (image_id >= stream_images_.size()) { stream_images_.resize(image_id + 1U); }
-    StreamImage& image = stream_images_[image_id];
-    // The run's nodes, path order; the caller's plan already sized the budget, so a failure from
-    // here on aborts the whole load (the caller drops the partially restored index).
-    std::vector<NodeRef> created;
-    created.reserve(blocks.size());
-    std::uint32_t current_parent = parent_index;
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-        const SavedStreamBlock& block = blocks[i];
-        if (find_child(ref_of_node(current_parent), block.lookup_hash, block.tokens, block.extra)) {
-            invariant("prefix cache stream image restore duplicates a block");
-        }
-        const std::uint32_t index = free_nodes_.back();
-        free_nodes_.pop_back();
-        Node& node    = nodes_[index];
-        node.occupied = true;
-        node.parent   = current_parent;
-        node.depth    = current_parent == kNoId ? 0U : nodes_[current_parent].depth + 1U;
-        node.hash     = block.lookup_hash;
-        node.extra    = block.extra;
-        std::copy(block.tokens.begin(), block.tokens.end(), node.tokens.begin());
-        node.children.clear();
-        node.snapshots.clear();
-        node.device_id      = kNoId;
-        node.device         = CopyState::Absent;
-        node.host_slab      = kNoId;
-        node.host           = CopyState::Absent;
-        node.host_image     = image_id;
-        node.pins           = 0;
-        node.live_below     = 0;
-        node.retained_below = 0;
-        if (current_parent == kNoId) { root_children_.push_back(index); }
-        else { nodes_[current_parent].children.push_back(index); }
-        children_.emplace(child_key(current_parent, block.lookup_hash), index);
-        ++node_count_;
-        created.push_back(ref_of_node(index));
-        current_parent = index;
-    }
-    image.occupied    = true;
-    image.bytes       = bytes;
-    image.first_block = first_block;
-    image.block_count = static_cast<std::uint32_t>(created.size());
-    image.pins        = 0;
-    image.bound.clear();
-    image.prev        = kNoId;
-    image.next        = kNoId;
-    image.in_list     = false;
-    for (const NodeRef node : created) { image.bound.push_back(node.index); }
-    stream_image_link(image_id, true);
-    stream_image_bytes_used_ += bytes;
-    for (const NodeRef node : created) { refresh_node(node.index); }
-    return RestoredStreamImage{.image = image_id, .nodes = std::move(created)};
-}
-
 std::optional<SnapshotRef>
 PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                         std::span<const TokenId> tail, SnapshotKind kind,
@@ -1786,11 +1479,8 @@ PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
     }
     const std::uint32_t anchor_index = anchor.valid() ? anchor.index : kNoId;
     const std::uint32_t base = anchor.valid() ? (require(anchor).depth + 1U) * kBlockTokens : 0U;
-    // The anchor must be backed (a host slab or, under the streamed tier, a stream image) so a
-    // resume can read its path.
     if (frontier == 0 || frontier != base + static_cast<std::uint32_t>(tail.size()) ||
-        (anchor.valid() && nodes_[anchor_index].host != CopyState::Resident &&
-         nodes_[anchor_index].host_image == kNoId)) {
+        (anchor.valid() && nodes_[anchor_index].host != CopyState::Resident)) {
         throw std::invalid_argument("prefix cache restored snapshot does not match its anchor");
     }
     std::vector<std::uint32_t>& anchored =
@@ -1919,97 +1609,6 @@ HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
     return plan;
 }
 
-HostRestorePlan plan_host_restore_v6(std::span<const std::int32_t> block_parents,
-                                     std::span<const std::uint8_t> block_image,
-                                     std::span<const SavedSnapshotShape> snapshots,
-                                     std::uint64_t host_slabs,
-                                     std::uint64_t stream_image_budget_bytes,
-                                     std::uint64_t image_block_bytes,
-                                     const PrefixIndexConfig& config) {
-    if (block_image.size() != block_parents.size()) {
-        throw std::invalid_argument("saved prefix cache blocks miss their backing");
-    }
-    const std::size_t block_count = block_parents.size();
-    HostRestorePlan plan{.blocks    = std::vector<bool>(block_count, false),
-                         .snapshots = std::vector<bool>(snapshots.size(), false)};
-    // Blocks on each block's path, itself included.
-    std::vector<std::uint32_t> path_blocks(block_count);
-    for (std::size_t index = 0; index < block_count; ++index) {
-        const std::int32_t parent = block_parents[index];
-        if (parent >= static_cast<std::int32_t>(index) || parent < -1) {
-            throw std::invalid_argument("saved prefix cache blocks are not parents first");
-        }
-        path_blocks[index] = parent < 0 ? 1U : path_blocks[static_cast<std::size_t>(parent)] + 1U;
-    }
-    // Each block's cost in its own pool: one host slab, or one block of stream image bytes.
-    std::uint64_t total_slabs   = 0;
-    std::uint64_t total_images  = 0;
-    for (std::size_t index = 0; index < block_count; ++index) {
-        if (block_image[index]) { total_images += image_block_bytes; } else { ++total_slabs; }
-    }
-    for (const SavedSnapshotShape& snapshot : snapshots) {
-        if (snapshot.anchor >= static_cast<std::int32_t>(block_count) || snapshot.anchor < -1 ||
-            snapshot.slabs < config.image_slabs) {
-            throw std::invalid_argument("saved prefix cache snapshot is inconsistent");
-        }
-        total_slabs += snapshot.slabs;
-    }
-    if (total_slabs <= host_slabs && total_images <= stream_image_budget_bytes) {
-        plan.blocks.assign(block_count, true);
-        plan.snapshots.assign(snapshots.size(), true);
-        plan.slabs       = total_slabs;
-        plan.image_bytes = total_images;
-        return plan;
-    }
-
-    std::vector<double> density(snapshots.size());
-    for (std::size_t index = 0; index < snapshots.size(); ++index) {
-        const SavedSnapshotShape& snapshot = snapshots[index];
-        const std::uint64_t path =
-            snapshot.anchor < 0 ? 0U : path_blocks[static_cast<std::size_t>(snapshot.anchor)];
-        const double saved = config.cost.prefill_seconds(0, snapshot.frontier) -
-                             config.cost.restore_seconds(config.image_bytes);
-        const double size =
-            static_cast<double>(config.image_bytes) +
-            static_cast<double>(snapshot.slabs > config.image_slabs ? config.block_bytes : 0U) +
-            static_cast<double>(path) * static_cast<double>(config.block_bytes);
-        density[index] =
-            (1.0 + static_cast<double>(snapshot.hits)) * std::max(0.0, saved) / std::max(size, 1.0);
-    }
-    std::vector<std::uint32_t> order(snapshots.size());
-    for (std::uint32_t index = 0; index < order.size(); ++index) { order[index] = index; }
-    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
-        if (density[left] != density[right]) { return density[left] > density[right]; }
-        return snapshots[left].frontier > snapshots[right].frontier;
-    });
-
-    std::uint64_t slabs_left = host_slabs;
-    std::uint64_t image_left = stream_image_budget_bytes;
-    for (const std::uint32_t index : order) {
-        const SavedSnapshotShape& snapshot = snapshots[index];
-        std::uint64_t need_slabs   = snapshot.slabs;
-        std::uint64_t need_images  = 0;
-        for (std::int32_t block = snapshot.anchor;
-             block >= 0 && !plan.blocks[static_cast<std::size_t>(block)];
-             block = block_parents[static_cast<std::size_t>(block)]) {
-            if (block_image[static_cast<std::size_t>(block)]) { need_images += image_block_bytes; }
-            else { ++need_slabs; }
-        }
-        if (need_slabs > slabs_left || need_images > image_left) { continue; }
-        for (std::int32_t block = snapshot.anchor;
-             block >= 0 && !plan.blocks[static_cast<std::size_t>(block)];
-             block = block_parents[static_cast<std::size_t>(block)]) {
-            plan.blocks[static_cast<std::size_t>(block)] = true;
-        }
-        plan.snapshots[index] = true;
-        slabs_left -= need_slabs;
-        image_left -= need_images;
-    }
-    plan.slabs       = host_slabs - slabs_left;
-    plan.image_bytes = stream_image_budget_bytes - image_left;
-    return plan;
-}
-
 std::optional<SnapshotRef> PrefixCacheIndex::slot_owner(std::uint32_t slot) const {
     if (slot >= slot_state_.size() || slot_state_[slot] != SlotState::Owned) {
         return std::nullopt;
@@ -2026,12 +1625,6 @@ PrefixIndexStats PrefixCacheIndex::stats() const noexcept {
     stats.device_evictable_blocks = device_evictable_blocks();
     stats.device_resident_blocks  = device_resident_;
     stats.free_device_slots       = free_slots_;
-    std::uint32_t stream_images   = 0;
-    for (const StreamImage& image : stream_images_) {
-        if (image.occupied) { ++stream_images; }
-    }
-    stats.stream_images     = stream_images;
-    stats.stream_image_bytes = stream_image_bytes_used_;
     return stats;
 }
 
@@ -2042,9 +1635,7 @@ void PrefixCacheIndex::check_invariants() const {
     for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
         const Node& node = nodes_[i];
         if (!node.occupied) {
-            if (lru_links_[i].list != kNoList || node.in_dead || node.host_image != kNoId) {
-                invariant("free node is linked");
-            }
+            if (lru_links_[i].list != kNoList || node.in_dead) { invariant("free node is linked"); }
             continue;
         }
         ++occupied_nodes;
@@ -2057,23 +1648,16 @@ void PrefixCacheIndex::check_invariants() const {
         } else if (node.depth != 0) {
             invariant("root child has nonzero depth");
         }
-        if (node.device == CopyState::Absent && node.host == CopyState::Absent &&
-            node.host_image == kNoId) {
+        if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
             invariant("node has no copy");
         }
         if (node.host != CopyState::Absent) {
             if (node.host_slab >= config_.host_slabs) { invariant("node slab out of range"); }
             ++slab_uses[node.host_slab];
         }
-        if (node.host_image != kNoId) {
-            if (node.host_image >= stream_images_.size() ||
-                !stream_images_[node.host_image].occupied) {
-                invariant("node stream image binding is stale");
-            }
-        }
-        const bool lru    = node.device == CopyState::Resident && node.pins == 0;
-        const bool backed = node.host == CopyState::Resident || node.host_image != kNoId;
-        const std::uint8_t list = lru ? (backed ? kBacked : kUnbacked) : kNoList;
+        const bool lru = node.device == CopyState::Resident && node.pins == 0;
+        const std::uint8_t list =
+            lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
         if (lru_links_[i].list != list) { invariant("node LRU membership is inconsistent"); }
         const bool dead =
             node.host == CopyState::Resident && node.live_below == 0 && node.pins == 0;
@@ -2152,44 +1736,6 @@ void PrefixCacheIndex::check_invariants() const {
     for (const std::uint32_t slab : free_slabs_) { ++slab_uses[slab]; }
     for (const std::uint32_t uses : slab_uses) {
         if (uses != 1) { invariant("host slab is leaked or shared"); }
-    }
-    std::uint64_t image_bytes_total = 0;
-    std::uint32_t images_occupied   = 0;
-    std::uint32_t images_in_list    = 0;
-    for (std::uint32_t i = 0; i < stream_images_.size(); ++i) {
-        const StreamImage& image = stream_images_[i];
-        if (!image.occupied) {
-            if (image.in_list || !image.bound.empty() || image.bytes != 0 || image.pins != 0) {
-                invariant("free stream image is live");
-            }
-            continue;
-        }
-        ++images_occupied;
-        if (!image.in_list) { invariant("occupied stream image is not in its recency list"); }
-        if (image.bytes == 0 || image.bytes > config_.stream_image_budget_bytes) {
-            invariant("stream image size is out of range");
-        }
-        if (image.block_count == 0 || image.bound.size() != image.block_count) {
-            invariant("stream image run is inconsistent");
-        }
-        std::uint32_t node_pins = 0;
-        for (std::uint32_t node : image.bound) {
-            if (!nodes_[node].occupied || nodes_[node].host_image != i) {
-                invariant("stream image bound node is inconsistent");
-            }
-            node_pins += nodes_[node].pins;
-        }
-        if (image.pins < node_pins) { invariant("stream image pins are undercounted"); }
-        image_bytes_total += image.bytes;
-    }
-    for (std::uint32_t image = stream_image_head_; image != kNoId;
-         image            = stream_images_[image].next) {
-        if (!stream_images_[image].occupied) { invariant("stream image list entry is free"); }
-        ++images_in_list;
-    }
-    if (images_in_list != images_occupied) { invariant("stream image recency count mismatch"); }
-    if (image_bytes_total != stream_image_bytes_used_) {
-        invariant("stream image byte count mismatch");
     }
     std::array<std::uint32_t, 2> counted{};
     for (std::uint8_t list = 0; list < 2; ++list) {

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1755,6 +1756,18 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         throw std::invalid_argument(
             "--use-original-prefix-caching and --use-alt-prefix-caching select different prefix "
             "caching systems");
+    }
+    // The streamed tier's QSA continuation store is not wired yet: the hybrid prefix cache's Host
+    // layout describes the dense Device pages, which under --kv-resident are bookkeeping
+    // placeholders carrying no KV, so a block copied from them would restore nothing. Until the
+    // store takes over, a QSA request on the streamed tier runs root-only -- exactly the
+    // --no-prefix-reuse engine shape -- and says so, rather than caching empty pages.
+    if (options.qwen38_27b_qsa && options.kv_resident_positions.has_value() &&
+        options.allow_prefix_reuse) {
+        std::fprintf(stderr,
+                     "qwen3_5: hybrid prefix cache disabled on the streamed tier "
+                     "(qsa store pending); running root-only\n");
+        options.allow_prefix_reuse = false;
     }
     // The hybrid prefix cache is the default. What only the checkpoint catalog serves selects the
     // catalog instead: one of its options, several devices, disabled prefix reuse (the hybrid
