@@ -4,7 +4,7 @@
 
 本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，QSA注意力窗口筛选反而带来额外开销，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
 
-支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。注：引擎内核对 GDN A/B controls 张量仅支持 BF16 精度，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失，因此本仓库的格式转换器从Qwen官方原生精度中剪裁了对应的 BF16 张量并进行嫁接，张量文件见 release。QSA注意力的 indexer 张量也见release。
+支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。注：引擎内核对 GDN A/B controls 张量仅支持 BF16 精度，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失，因此本仓库的格式转换器从Qwen官方原生精度中剪裁了对应的 BF16 张量并进行嫁接，张量文件见 release。QSA注意力的 indexer 张量也见release，上游对QSA indexer只有BF16内核的支持，转换器会自动将F32的indexer转换为BF16，因此本fork直接提供BF16的版本。
 
 后续计划：
 1. 提供Dflash2和Dspine草稿的支持。
@@ -17,7 +17,7 @@
 | --- | --- | --- | --- |
 | `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 仍对该层完整 KV 做 dense 因果注意力）。要求 artifact 自带 indexer；只能用单卡、不开张量并行，投机后端只能是模型自带的 MTP。并发解码支持到 `--max-concurrency 8`（每条序列各自持有索引器状态与流式 KV；并发 > 1 时关闭 CUDA graphs，decode 走非捕获路径）。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
 | `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
-| `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device 专家（本模型即如此）为 `all`，也就是默认不流式 |
+| `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device KV（本模型即如此）为 `all`，也就是默认不流式 |
 
 `--kv-resident` 取非`0`/`all`时的自动下限是 2 ×`--qsa-top-blocks` 个块。开启MTP时，连续草稿的块选区高度重合，因此绝大部分情况下不必为每个草稿都预留一份注意力窗口；当注意力窗口并集偶发超出resident时，流式 resolve 保住 column 0 的选区与本次写入的块、丢弃草稿列的块，等价于当前verify轮次接受度为0。显式给更大的 `--kv-resident` 仍生效；当取值不小于上下文时流式关闭、整段历史全驻留。典型用法：
 
@@ -45,25 +45,6 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（其 prefill 实际仍为 dense 注意力），teacher-forced PPL 严格一致（3.91997）。而在 prefill 阶段强制走 QSA（NINFER_QSA_DENSE_PREFILL=0）会使同一评测的尾部 PPL 上升 5.73%（512 块）/ 2.59%（1,024 块）/ 1.12%（2,048 块）/ 0.45%（4,096 块）。
 
-## 格式转换脚本
-
-相对上游转换脚本，本 fork 的差异：
-
-1. **QSA 索引器嫁接**（`convert_qsa27b.py` + `qsa_graft_recipe.py`）：在同一次转换里，把 stock 27B GGUF 的 866 个张量按其原始 ggml 块 byte-for-byte 导入，再从 QSA donor GGUF 追加 80 个 F32 `blk.N.indexer.*` 张量，全程不落中间的 grafted GGUF。上游没有这条嫁接路径。
-2. **GDN A/B 控制原生 BF16 无损嫁接**（`gguf_blocks.py`，配合新增的 `extract_gdn_controls.py` 与资产 `tools/convert/assets/gdn_controls_bf16.safetensors`）：上游的 `gdn_control_source` 会把量化发布里的 `ssm_alpha/ssm_beta` 一律「反量化 → 舍入到 BF16」（一次有损还原）；本 fork 默认改从官方 `Qwen3.8-27B-FP8` 的原生 BF16 `in_proj_a/in_proj_b`（本就是 grouped 头序）无损直存进 `a_projection/b_projection`，且**绝不再 `untile`**（否则头序错位）。由环境变量 `NINFER_GDN_CONTROLS_BF16` 控制：默认读工作树资产；可覆盖为一个 FP8 目录；设为 `off` 则完全回退上游原行为（零回归）；资产缺失时自动回退。附带一次性头序自检，源与发布不匹配即报错。
-3. 其余转换能力（ternary、vision/mmproj、DFlash2、GGUF native 块导入等）继承上游。
-
-```bash
-# 常规 QSA 嫁接转换（默认走 GDN 原生 BF16 资产）
-python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B 目录> \
-  --gguf <stock 27B GGUF> --donor <QSA donor GGUF> --vision <mmproj-BF16.gguf> \
-  --dflash2 <dflash2 目录> --out <out.ninfer> --device cpu
-
-# 需要完全复刻上游反量化行为时
-#   Windows:  set NINFER_GDN_CONTROLS_BF16=off
-#   或指定整棵 FP8 目录作源:  set NINFER_GDN_CONTROLS_BF16=<Qwen3.8-27B-FP8 目录>
-```
-
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
 Qwen3.8-27B-QSA原模型作者的llamacpp fork仓库：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
@@ -72,7 +53,7 @@ Qwen3.8-27B-QSA原模型作者的llamacpp fork仓库：https://github.com/kurane
 
 This repository adds support for **Qwen3.8-27B-QSA-GGUF** to ninfer-all. This model grafts the QSA (Query Sparse Attention) mechanism — which originally belongs to the Qwen4 series — onto Qwen3.8-27B, enabling a KV stream: because QSA attention needs to see only 2,048 historical tokens per token by default (adjustable with `--qsa-top-blocks`), the KV cache can be kept in system memory and streamed into VRAM on demand for computation, greatly easing GPU memory capacity constraints. Prefill is usually compute-bound, so even dense attention can be computed over a streamed KV cache, whereas QSA attention window filtering introduces additional overhead. Upstream's wide-T QSA kernel is not yet optimised and a wider attention window slows prefill sharply, so this fork runs dense attention during prefill for the best quality and speed, and switches to QSA sparse attention only for decode, with an adjustable window.
 
-It supports the ViT and MTP of Qwen3.8-27B, and YaRN for contexts up to 1M. The script that grafts QSA attention onto any GGUF Qwen3.8-27B and converts it to the ninfer format lives in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point. Note: the engine's kernels accept only BF16 for the GDN A/B control tensors; upstream's converter dequantizes lower-precision models to BF16, which for some quantizations (Q4_K, Q8, …) both costs extra space and loses accuracy. This fork's converter instead cuts the corresponding BF16 tensors out of Qwen's official native-precision model and grafts them in; the tensor file is provided in the release. The QSA attention indexer tensors are also provided in the release.
+It supports the ViT and MTP of Qwen3.8-27B, and YaRN for contexts up to 1M. The script that grafts QSA attention onto any GGUF Qwen3.8-27B and converts it to the ninfer format lives in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point. Note: the engine's kernels accept only BF16 for the GDN A/B control tensors; upstream's converter dequantizes lower-precision models to BF16, which for some quantizations (Q4_K, Q8, …) both costs extra space and loses accuracy. This fork's converter instead cuts the corresponding BF16 tensors out of Qwen's official native-precision model and grafts them in; the tensor file is provided in the release. The QSA attention indexer tensors are also provided in the release: upstream has only a BF16 kernel for the QSA indexer, and the converter converts the F32 indexer to BF16 automatically, so this fork ships the BF16 version directly.
 
 Planned work:
 1. Add support for DFlash2 and DSpine drafting.
@@ -85,7 +66,7 @@ Three flags decide whether QSA runs, how far each token looks back, and where th
 | --- | --- | --- | --- |
 | `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill still attends densely over the layer's complete KV). Needs the artifact's indexer, one device, no tensor parallelism, and either no speculative backend or the model's own MTP. Concurrent decode supports up to `--max-concurrency 8` (each sequence keeps its own indexer state and streamed KV; above one concurrency, CUDA graphs are off and decode runs uncaptured). Without it the model runs its native dense attention throughout. | boolean switch | off |
 | `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
-| `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the experts sit on the device (this model), so nothing streams by default |
+| `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the KV sits on the device (this model), so nothing streams by default |
 
 When `--kv-resident` is a number other than `0`/`all`, the pool's automatic floor is 2 x `--qsa-top-blocks` blocks. With MTP on, consecutive drafts' block selections overlap heavily, so there is mostly no need to reserve one attention window per draft; when the union of the windows occasionally outgrows the resident pool, the streamed resolve keeps column 0's selection and the blocks the call wrote and drops the draft columns' blocks, equivalent to accepting nothing from that verification round. An explicit larger `--kv-resident` still takes effect; a value not below the context disables streaming and keeps the whole history resident. Typical use:
 
@@ -112,25 +93,6 @@ One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.ninfer`, int8 KV, **hy
 Aggregate prefill = sum of prompt tokens / sum of prefill seconds (the shared dense-prefill staging serializes prefill); aggregate decode = sum of output tokens / the longest decode interval (decodes overlap). The TTFT staircase comes from the serialization of that shared staging.
 
 PPL: whether the default dense path without QSA, or the QSA path (whose prefill is still dense attention), teacher-forced PPL is strictly identical (3.91997). Forcing QSA during the prefill phase (`NINFER_QSA_DENSE_PREFILL=0`) raises the tail PPL of the same evaluation by 5.73% (512 blocks) / 2.59% (1,024 blocks) / 1.12% (2,048 blocks) / 0.45% (4,096 blocks).
-
-## Conversion scripts
-
-Differences from the upstream conversion scripts:
-
-1. **QSA indexer graft** (`convert_qsa27b.py` + `qsa_graft_recipe.py`): in a single pass it imports the 866 tensors of a stock 27B GGUF byte-for-byte in their original ggml block formats, then appends the 80 F32 `blk.N.indexer.*` tensors from a QSA donor GGUF, without ever writing an intermediate grafted GGUF. Upstream has no such graft path.
-2. **GDN A/B controls grafted losslessly from native BF16** (`gguf_blocks.py`, with the new `extract_gdn_controls.py` and the asset `tools/convert/assets/gdn_controls_bf16.safetensors`): upstream's `gdn_control_source` dequantizes the `ssm_alpha/ssm_beta` of a quantized release and rounds to BF16 (one lossy round-trip); this fork instead reads the official `Qwen3.8-27B-FP8` native BF16 `in_proj_a/in_proj_b` (already in grouped head order) straight into `a_projection/b_projection`, and never re-`untile`s them (which would misalign the heads). The environment variable `NINFER_GDN_CONTROLS_BF16` controls it: by default it reads the committed asset; it may be set to a full FP8 directory; setting it to `off` restores the upstream dequant behavior exactly (zero regression); and if the asset is missing it falls back to the original path. A one-time head-order self-check raises if the source and the release are not the same model.
-3. All other conversion capabilities (ternary, vision/mmproj, DFlash2, GGUF native block import, etc.) are inherited from upstream.
-
-```bash
-# Normal QSA-graft conversion (uses the native BF16 GDN asset by default)
-python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B dir> \
-  --gguf <stock 27B GGUF> --donor <QSA donor GGUF> --vision <mmproj-BF16.gguf> \
-  --dflash2 <dflash2 dir> --out <out.ninfer> --device cpu
-
-# To reproduce the upstream dequant behavior exactly:
-#   Windows:  set NINFER_GDN_CONTROLS_BF16=off
-#   or point at the whole FP8 tree as the source:  set NINFER_GDN_CONTROLS_BF16=<Qwen3.8-27B-FP8 dir>
-```
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 
