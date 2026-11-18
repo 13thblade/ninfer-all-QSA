@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/prefix/qsa_continuation.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -279,6 +280,48 @@ std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<con
 }
 
 } // namespace
+
+void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
+    // S1: purely observational. Under QSA with tracing on, report the largest `live` prefix any
+    // lane currently holds that continues this prompt. The authoritative media check is the same
+    // `prefix_matches` used by matched_prefix_tokens; HeldPrefix/vision_key is the compact form the
+    // store (S2+) will key on. anchored/store stay zero until their snapshots exist (S4+).
+    if (!qsa_indexer_state.has_value() || !qsa_reuse_trace_enabled()) { return; }
+    std::uint32_t best_live   = 0;
+    std::uint32_t best_lane   = 0;
+    std::uint32_t scanned     = 0;
+    std::uint32_t max_held    = 0;
+    const auto& prompt_tokens = prompt.token_ids;
+    // A finished request's sequence moves from Active to Catalogued but keeps its ledger and KV,
+    // so its held prefix is still available. In the --no-prefix-reuse path the engine never walks
+    // these (reuse_search is off), which is exactly why this diagnostic derives them itself.
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        const ContinuationSlotRole role = continuation_slots[index].role;
+        if (role != ContinuationSlotRole::Active && role != ContinuationSlotRole::Catalogued) {
+            continue;
+        }
+        ++scanned;
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv || sequence.text_kv_valid == 0) { continue; }
+        const std::size_t held =
+            std::min<std::size_t>(sequence.text_kv_valid, sequence.ledger.size());
+        max_held = std::max(max_held, static_cast<std::uint32_t>(held));
+        HeldPrefix prefix;
+        prefix.tokens.assign(sequence.ledger.begin(), sequence.ledger.begin() + held);
+        prefix.position   = static_cast<std::uint32_t>(prefix.tokens.size());
+        prefix.vision_key = qsa_vision_key_at(prompt, prefix.position);
+        const std::uint32_t live =
+            qsa_prefix_reuse(prefix, prompt_tokens, prefix.vision_key);
+        // The compact key gates cheaply; the full identity is authoritative (media, token types,
+        // rewrite frontiers, adapter key), matching matched_prefix_tokens.
+        if (live > best_live &&
+            prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, live)) {
+            best_live = live;
+            best_lane = sequence.lane;
+        }
+    }
+    qsa_reuse_trace(best_lane, best_live, 0, 0, "root", scanned, max_held);
+}
 
 std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,
                                                  const PreparedPromptData& prompt) const {
@@ -635,6 +678,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         runtime_support::include_rebuild_boundary(base->root_rebuild_tail_begin, frontier,
                                                   base->summary.prompt_tokens);
     }
+    qsa_trace_admission(prompt);
     return RequestBasePlan(std::move(base));
 }
 

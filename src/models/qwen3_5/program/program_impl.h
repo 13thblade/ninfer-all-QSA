@@ -1672,6 +1672,10 @@ private:
         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
         std::span<const std::optional<std::uint32_t>> stop_holds,
         runtime::ExecutionTiming* failed_timing);
+    // S1 (NINFER_DEBUG_REUSE): record the content-three-way inputs and log them. Purely
+    // observational - it derives each lane's held prefix from live SequenceState and never
+    // changes admission. The store (S2+) and the resume decision (S4+) consume the same key.
+    void qsa_trace_admission(const PreparedPromptData& prompt);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
     [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
