@@ -27,6 +27,7 @@ namespace {
 using ninfer::TokenId;
 using ninfer::models::qwen3_5::detail::HeldPrefix;
 using ninfer::models::qwen3_5::detail::LanePrefixRecord;
+using ninfer::models::qwen3_5::detail::QsaLaneRetentionView;
 using ninfer::models::qwen3_5::detail::QsaContinuationStore;
 using ninfer::models::qwen3_5::detail::qsa_choose_reuse;
 using ninfer::models::qwen3_5::detail::qsa_prefix_reuse;
@@ -245,54 +246,47 @@ void test_plane_chunks_roundtrip() {
     expect(threw, "a short image buffer is refused");
 }
 
-void test_image_hidden_roundtrip() {
+void test_image_payload_roundtrip() {
     constexpr std::size_t kPage = QsaContinuationStore::kHostPageBytes;
-    constexpr std::uint64_t kHidden = 2 * 5120; // one BF16 hidden row
     QsaContinuationStore store(64ULL << 20);
     const HeldPrefix key = key_of(11, 4096);
 
     // Two planes inside one page, each a distinct pattern.
     std::vector<std::byte> plane_a((1U << 20) + 7, std::byte{0x11});
     std::vector<std::byte> plane_b(4096, std::byte{0x22});
-    std::vector<std::byte> hidden_src(kHidden, std::byte{0x33});
     std::vector<ImageChunk> chunks{{plane_a.data(), plane_a.size()},
                                    {plane_b.data(), plane_b.size()}};
     const std::uint64_t payload = qsa_image_chunk_bytes(chunks);
 
-    expect(store.store_image(key, payload, 0, kHidden), "an image with a hidden stores");
+    expect(store.store_image(key, payload, 0, true), "an endpoint image stores");
     const auto index = store.stored_index(key);
     expect(index.has_value(), "the stored image is found by its key");
-    expect(store.has_hidden(*index), "the image reports its hidden");
-    expect(store.used_bytes() == kPage + kHidden, "the budget charges pages plus the hidden");
+    expect(store.images()[*index].whole, "an image stored at its frontier serves the whole prompt");
+    expect(store.used_bytes() == kPage, "the budget charges the image's pages");
 
-    store.write_payload(*index, chunks, hidden_src);
-    // Mutate the live planes and the source hidden, then read the image back.
+    store.write_payload(*index, chunks);
+    // Mutate the live planes, then read the image back.
     std::fill(plane_a.begin(), plane_a.end(), std::byte{0x00});
     std::fill(plane_b.begin(), plane_b.end(), std::byte{0x00});
-    std::fill(hidden_src.begin(), hidden_src.end(), std::byte{0x00});
-    std::vector<std::byte> hidden_dst(kHidden, std::byte{0x00});
-    store.read_payload(*index, chunks, hidden_dst);
+    store.read_payload(*index, chunks);
     expect(std::all_of(plane_a.begin(), plane_a.end(),
                        [](std::byte b) { return b == std::byte{0x11}; }),
            "the first plane round-trips through the image");
     expect(std::all_of(plane_b.begin(), plane_b.end(),
                        [](std::byte b) { return b == std::byte{0x22}; }),
            "the second plane round-trips through the image");
-    expect(std::all_of(hidden_dst.begin(), hidden_dst.end(),
-                       [](std::byte b) { return b == std::byte{0x33}; }),
-           "the continuation hidden round-trips through the image");
 
     // A payload that does not match the image is refused, not truncated.
     bool threw = false;
     try {
         std::vector<ImageChunk> short_chunks{{plane_a.data(), plane_a.size()}};
-        store.write_payload(*index, short_chunks, hidden_src);
+        store.write_payload(*index, short_chunks);
     } catch (const std::logic_error&) { threw = true; }
     expect(threw, "a short payload is refused");
 
-    // Eviction releases the hidden too, so the budget returns to zero.
+    // Eviction releases the pages, so the budget returns to zero.
     expect(store.make_host_room(64ULL << 20), "making room evicts the image");
-    expect(store.used_bytes() == 0, "the hidden is released with its image");
+    expect(store.used_bytes() == 0, "the image's pages are released with it");
 }
 
 void test_three_way_choice() {
@@ -301,48 +295,60 @@ void test_three_way_choice() {
     for (std::size_t i = 0; i < prompt.size(); ++i) {
         prompt[i] = static_cast<TokenId>(i + 1);
     }
-    std::vector<LanePrefixRecord> records(2);
-    const std::vector<std::uint64_t> epochs{1, 1};
-    records[0].epoch = 1;
-    records[0].held.tokens.assign(prompt.begin(), prompt.begin() + 200);
-    records[0].held.position = 200;
-    records[0].anchor.tokens.assign(prompt.begin(), prompt.begin() + 128);
-    records[0].anchor.position = 128;
-    records[1].epoch = 1; // a lane that holds nothing
+    LanePrefixRecord record;
+    record.epoch = 7;
+    record.held.tokens.assign(prompt.begin(), prompt.begin() + 200);
+    record.held.position = 200;
+    record.anchor.tokens.assign(prompt.begin(), prompt.begin() + 128);
+    record.anchor.position = 128;
+    constexpr std::uint64_t kEpoch = 7;
+    QsaLaneRetentionView retention;
+    retention.live               = true;
+    retention.snapshot           = true;
+    retention.snapshot_drafter_follows = true;
 
-    // The prompt grows past the lane's live prefix: the endpoint resumes 200.
-    auto choice = qsa_choose_reuse(records, epochs, &store, prompt, {});
+    // The prompt grows past the lane's live state: the endpoint resumes 200.
+    auto choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, {});
     expect(choice.tokens == 200 && choice.path_kind == 0 && !choice.from_store,
-           "the live prefix wins when it is the longest");
-    expect(choice.lane == 0, "the choice names the lane that holds it");
+           "the live state wins when it is the longest");
+    expect(choice.live == 200 && choice.anchored == 128,
+           "the log reports what each source offered");
 
     // A regenerate of the anchor's prompt: equal length, so only `whole` can resume it, and the
-    // live prefix (200 > 127) is rejected outright.
+    // live state (200 > 127) is rejected outright.
     const std::vector<TokenId> same(prompt.begin(), prompt.begin() + 128);
-    choice = qsa_choose_reuse(records, epochs, &store, same, {});
+    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, same, {});
     expect(choice.tokens == 128 && choice.path_kind == 1,
-           "an equal-length prompt resumes at the lane's anchor");
-    expect(choice.whole, "the anchor covers the whole prompt");
+           "an equal-length prompt resumes at the lane's prompt-end snapshot");
+    expect(choice.whole, "the snapshot covers the whole prompt");
 
-    // A stored image of the whole prompt beats both (a regenerate after the lane moved on).
+    // A stored endpoint image of the whole prompt beats both (the lane moved on).
     HeldPrefix whole_key;
     whole_key.tokens   = prompt;
     whole_key.position = static_cast<std::uint32_t>(prompt.size());
-    expect(store.store_image(whole_key, 4096, 1, 64), "store the whole prompt with a hidden");
-    choice = qsa_choose_reuse(records, epochs, &store, prompt, {});
+    expect(store.store_image(whole_key, 4096, 0, true), "store an endpoint image of the prompt");
+    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, {});
     expect(choice.from_store && choice.tokens == 256 && choice.whole,
            "the stored image serves the whole prompt");
 
+    // An anchor image (state only) never serves a store resume: it has no KV to land.
+    expect(store.store_image(key_of(3, 300), 4096, 1, true), "an anchor image stores");
+    choice = qsa_choose_reuse(record, kEpoch + 1, retention, true, &store, prompt, {});
+    expect(choice.tokens == 256 && choice.from_store,
+           "a lane that changed tenants keeps only the endpoint image");
+
     // The same image read with a different media identity does not match.
     const std::vector<std::uint64_t> media{0xAAULL};
-    choice = qsa_choose_reuse(records, epochs, &store, prompt, media);
+    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, media);
     expect(!choice.from_store, "a media mismatch rejects the stored image");
 
-    // An epoch mismatch invalidates the lane's records.
-    const std::vector<std::uint64_t> advanced{2, 2};
-    choice = qsa_choose_reuse(records, advanced, &store, prompt, {});
-    expect(choice.tokens == 256 && choice.from_store,
-           "a lane that changed tenants keeps only the store");
+    // An image carries no draft KV: a drafting request cannot resume from one.
+    choice = qsa_choose_reuse(record, kEpoch + 1, retention, false, &store, prompt, {});
+    expect(choice.tokens == 0, "a store resume is refused while a drafter runs");
+
+    // A lane that retains nothing offers nothing.
+    choice = qsa_choose_reuse(record, kEpoch, {}, false, nullptr, prompt, {});
+    expect(choice.tokens == 0, "an empty lane and an absent store admit a root");
 }
 
 } // namespace
@@ -358,7 +364,7 @@ int main() {
     test_image_bytes_arithmetic_all_positions();
     test_image_save_load_roundtrip();
     test_plane_chunks_roundtrip();
-    test_image_hidden_roundtrip();
+    test_image_payload_roundtrip();
     test_three_way_choice();
     if (failures != 0) {
         std::cerr << failures << " QSA continuation-store checks failed\n";

@@ -2372,7 +2372,13 @@ void ProgramImpl::finalize_context_transaction() noexcept {
 }
 
 bool ProgramImpl::has_context_transaction() const noexcept {
-    return !std::holds_alternative<std::monostate>(context_transaction_);
+    // The streamed tier's admission completes synchronously, so what is left between the
+    // reservation and the Engine's first progress step is the publication itself
+    // (`qsa_pending_published_`). It still has to read as a transaction: the Engine drives that
+    // step as a Materialization (QsaResourceManager), and nothing may interleave with the
+    // half-started sequence in between.
+    return !std::holds_alternative<std::monostate>(context_transaction_) ||
+           qsa_pending_published_.has_value();
 }
 
 bool ProgramImpl::vision_pending(SequenceHandle sequence) const noexcept {

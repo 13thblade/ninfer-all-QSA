@@ -282,14 +282,22 @@ std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<con
 } // namespace
 
 void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
-    // R1/R4: reads the lanes' own records (advanced where the KV frontier moves), not the
-    // checkpoint catalog -- the hybrid cache never fills a catalogued continuation, so a
-    // diagnostic built on one could only ever report zero. The three-way choice is upstream's and
-    // lives in qsa_choose_reuse, the same function the admission will call once the store is
-    // wired; the log reports each source's best so it can be checked against the capacity model.
-    if (!qsa_indexer_state.has_value() || !qsa_reuse_trace_enabled()) { return; }
-    std::uint32_t scanned  = 0;
-    std::uint32_t max_held = 0;
+    // Reads the lanes' own records (advanced where the KV frontier moves), not the checkpoint
+    // catalog: the streamed tier grows no catalogued continuation, so a diagnostic built on one
+    // could only ever report zero. Each lane is asked through the same qsa_choose_reuse the
+    // admission uses, and the best answer is reported -- per lane, because a live or anchor
+    // resume can only come from the lane that owns the KV planes.
+    if (!qsa_live_continuation() || !qsa_reuse_trace_enabled()) { return; }
+    const bool store_allowed = speculative_backend != SpeculativeBackend::Mtp;
+    std::uint32_t scanned    = 0;
+    std::uint32_t max_held   = 0;
+    std::uint32_t best_lane  = 0;
+    std::uint32_t best_live  = 0;
+    std::uint32_t best_anchor = 0;
+    std::uint32_t best_store  = 0;
+    bool from_store           = false;
+    std::uint32_t best_tokens = 0;
+    std::uint32_t best_kind   = 0;
     for (std::size_t lane = 0; lane < qsa_lane_prefix.size() && lane < lane_epochs.size(); ++lane) {
         const LanePrefixRecord& record = qsa_lane_prefix[lane];
         if (record.epoch == 0 || record.epoch != lane_epochs[lane] || record.held.empty()) {
@@ -297,16 +305,24 @@ void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
         }
         ++scanned;
         max_held = std::max(max_held, record.held.position);
+        const QsaReuseChoice choice =
+            qsa_choose_reuse(record, lane_epochs[lane], qsa_retention_view(static_cast<std::uint32_t>(lane)),
+                             store_allowed, qsa_store_.get(), prompt.token_ids,
+                             prompt.block_extras);
+        if (choice.tokens > best_tokens) {
+            best_tokens = choice.tokens;
+            best_lane   = static_cast<std::uint32_t>(lane);
+            best_live   = choice.live;
+            best_anchor = choice.anchored;
+            best_store  = choice.stored;
+            from_store  = choice.from_store;
+            best_kind   = choice.path_kind;
+        }
     }
-    const QsaReuseChoice choice = qsa_choose_reuse(qsa_lane_prefix, lane_epochs, nullptr,
-                                                   prompt.token_ids, prompt.block_extras);
-    const char* chosen         = choice.from_store
-                                     ? "store"
-                                     : (choice.path_kind == 1
-                                            ? "turn_closure"
-                                            : (choice.tokens != 0 ? "endpoint" : "root"));
-    qsa_reuse_trace(choice.lane, choice.live, choice.anchored, choice.stored, chosen, scanned,
-                    max_held);
+    const char* chosen = from_store ? "store"
+                                     : (best_kind == 1 ? "turn_closure"
+                                                       : (best_tokens != 0 ? "endpoint" : "root"));
+    qsa_reuse_trace(best_lane, best_live, best_anchor, best_store, chosen, scanned, max_held);
 }
 
 std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,

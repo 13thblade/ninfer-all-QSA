@@ -268,6 +268,11 @@ struct QsaAdmissionQuote {
     bool from_store         = false;
     bool whole              = false;
     std::uint32_t path_kind = 0; // 0 endpoint, 1 turn closure, 2 stored image
+    // True when this lane carries another conversation's retained prefix that this prompt did
+    // not continue. Admission prefers a clean lane for a root request: dropping the foreign
+    // state here would destroy a session that may still return, and with serial prefill every
+    // arrival would otherwise stack onto the lowest-index lane and evict its predecessor.
+    bool lane_carries_foreign_state = false;
     std::shared_ptr<detail::QsaQuoteImpl> impl;
 };
 

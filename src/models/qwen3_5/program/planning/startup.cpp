@@ -1975,11 +1975,21 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             !impl->context_cache.max_shared_prefixes) {
             throw std::logic_error("Qwen3.5 context cache options are not normalized");
         }
-        resolve_host_cache_budget(impl->context_cache,
-                                  *impl->context_cache.max_private_continuations,
-                                  *impl->context_cache.max_shared_prefixes, impl->capacity,
-                                  impl->persistent.state_images.host.image_bytes,
-                                  impl->persistent.host_kv_text_page_stride);
+        if (impl->context_cache.mode == ContextCacheMode::Qsa) {
+            // On the streamed tier the budget is the image store's alone (program_impl.cpp): a
+            // lane's authoritative KV already sits in pinned Host planes, and the images are
+            // whole-lane snapshots the store allocates and evicts itself. The Legacy Host pools
+            // therefore stay empty -- resolving a Legacy Host KV tier here would price pages that
+            // no sequence can address and hand the store a budget it never sees.
+            impl->context_cache.host_state_slots       = 0;
+            impl->context_cache.host_kv_capacity_bytes = 0;
+        } else {
+            resolve_host_cache_budget(impl->context_cache,
+                                      *impl->context_cache.max_private_continuations,
+                                      *impl->context_cache.max_shared_prefixes, impl->capacity,
+                                      impl->persistent.state_images.host.image_bytes,
+                                      impl->persistent.host_kv_text_page_stride);
+        }
     }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {

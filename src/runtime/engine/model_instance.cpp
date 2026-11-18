@@ -342,8 +342,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument(
             "direct grafts are held in the context cache, which is disabled");
     }
-    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid && direct_grafts != 0) {
-        // A direct graft lives in a pinned Legacy shared-prefix slot; the hybrid tree has none.
+    if (cache.enabled && cache.mode != ContextCacheMode::Legacy && direct_grafts != 0) {
+        // A direct graft lives in a pinned Legacy shared-prefix slot; neither the hybrid tree nor
+        // the streamed tier keeps one.
         throw std::invalid_argument("direct grafts require the legacy context cache");
     }
     if (options.qwen38_27b_qsa && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
@@ -398,6 +399,54 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.endpoint_anchors             = false;
         cache.progress_anchor_tokens       = 0;
         cache.stop_hold_images             = false;
+        return options;
+    }
+    if (cache.enabled && cache.mode == ContextCacheMode::Qsa) {
+        // The streamed tier keeps its own image store: the Host budget sizes that store (a lane's
+        // KV planes plus the state image), not a Legacy Host KV tier, so the Legacy capacity
+        // options stay rejected. Policies that would need a catalog are rejected only when asked
+        // for; the two that default on (endpoint and progress anchors) are catalog features and
+        // are turned off here, exactly as the hybrid branch does.
+        if ((cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
+            (cache.max_long_anchors_per_continuation &&
+             *cache.max_long_anchors_per_continuation != 0)) {
+            throw std::invalid_argument(
+                "the QSA streamed tier keeps no shared prefixes and no long anchors: its images "
+                "are one lane's exact token prefix");
+        }
+        if (cache.rolling_retention || cache.release_diverged_checkpoints ||
+            cache.thorough_admission_search || cache.recency_eviction || cache.value_aware_demote ||
+            cache.automatic_long_anchors || cache.branch_anchors || !cache.disk_kv_path.empty()) {
+            throw std::invalid_argument(
+                "the QSA streamed tier does not accept Legacy cache policies (rolling retention, "
+                "diverged-checkpoint release, thorough admission search, recency eviction, "
+                "value-aware demotion, automatic long anchors, branch anchors, disk tier)");
+        }
+        cache.host_state_slots       = 0;
+        cache.host_kv_capacity_bytes = 0;
+        cache.max_shared_prefixes    = 0;
+        cache.max_long_anchors_per_continuation = 0;
+        cache.max_cache_markers_per_request     = 0;
+        cache.stop_hold_images                  = false;
+        cache.endpoint_anchors                  = false;
+        cache.progress_anchor_tokens            = 0;
+        // The private catalog is bookkeeping on this tier -- one continuation per lane, the
+        // resume itself comes from the lane's retention or the store -- but the Program still
+        // binds a sequence to a catalog slot and sizes its KV address space from the count, so
+        // it has to be as wide as the lanes (the hybrid branch keeps the same shape).
+        cache.max_private_continuations = concurrency;
+        // One extra StateImage per lane: the sequence in flight holds one, and the lane keeps its
+        // prompt-end snapshot in the other (the live state is the same slot the sequence holds,
+        // adopted by the next turn). Two per lane, so the pool is C + C.
+        if (cache.device_state_slots && *cache.device_state_slots < concurrency) {
+            throw std::invalid_argument(
+                "the QSA streamed tier keeps one state image per lane for its prompt-end "
+                "snapshot: --device-state-slots cannot be below --max-concurrency");
+        }
+        cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
+        // `--host-cache-mib auto` has no streamed-tier model yet: without an explicit budget the
+        // store stays absent and the tier admits roots only, which is the pre-store shape.
+        if (cache.host_cache_auto) { cache.host_cache_budget_bytes.reset(); }
         return options;
     }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {

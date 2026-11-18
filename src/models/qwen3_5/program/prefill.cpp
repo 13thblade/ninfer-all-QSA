@@ -1780,6 +1780,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 fetch_readout(schedule_state.readout_count);
             }
         }
+        // The prompt has ended and the state is still exactly there: this is where upstream takes
+        // the snapshot a later turn closure resumes from (qwen4_exp_core.cpp:2219, `snapshot`
+        // before the first generated token advances the state).
+        if (qsa_live_continuation()) { qsa_capture_anchor(sequence); }
         const std::uint32_t draft_count = staged.prepare_mtp ? staged.initial_mtp_extent : 0U;
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
         const bool drafts_pending = token_left && draft_count != 0;

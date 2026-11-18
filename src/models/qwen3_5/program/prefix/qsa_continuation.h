@@ -221,12 +221,17 @@ struct StoredImage {
     std::vector<std::byte*> pages; // 8 MiB slices; empty while only on disk
     std::uint64_t bytes     = 0;   // exact image bytes (<= pages.size() * page_bytes)
     std::uint64_t last_used = 0;
-    std::uint32_t path_kind = 0;   // PrefixReusePath semantics (0 = endpoint, 1 = turn closure)
-    // The continuation hidden of the last stored token, kept beside the pages: it is one layer's
-    // BF16 row (tens of KB), not a page-sized region, and it is what lets an image serve the whole
-    // prompt (a regenerate) instead of a strict prefix of it. Empty when the image has none.
-    std::vector<std::byte> hidden;
-    std::uint64_t hidden_bytes = 0; // charged to the budget separately from the pages
+    // 0: an endpoint image -- the StateImage half followed by the lane's KV planes, so it can
+    //    serve a lane that no longer owns its planes.
+    // 1: an anchor image -- the StateImage half only, taken where a turn's prompt ended. Its
+    //    planes stay in the lane (an anchor resume is same-lane by construction), and carrying a
+    //    second copy of them would halve how many turns the budget holds.
+    std::uint32_t path_kind = 0;
+    // The image ends exactly where its key ends: the StateImage's continuation hidden is that
+    // key's last position, so a prompt whose last token is the key's last token samples its first
+    // new token from this image instead of prefilling one. False when the sequence was cut behind
+    // its frontier (a stop string), where the hidden sits ahead of the key.
+    bool whole = true;
 };
 
 class QsaContinuationStore {
@@ -253,8 +258,9 @@ public:
     [[nodiscard]] std::pair<std::size_t, std::uint32_t>
     find_stored(std::span<const TokenId> prompt_tokens, std::uint64_t prompt_vision_key) const;
     // The same, keyed per length: each image's key is its own prefix's cumulative Vision key, so
-    // the prompt side is read at that image's length. `whole` lets an image serve the entire
-    // prompt (an image carries the continuation hidden a regenerate needs).
+    // the prompt side is read at that image's length. Only an endpoint image can serve a store
+    // resume (it carries the plane half); `whole` additionally admits the image whose key is the
+    // whole prompt, which a regenerate samples from.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t>
     find_stored(std::span<const TokenId> prompt_tokens,
                 std::span<const std::uint64_t> prompt_media, bool whole) const;
@@ -262,24 +268,18 @@ public:
     stored_index(const HeldPrefix& key) const;
 
     // Upstream store_image (:1500): exact-key images refresh last_used; short prefixes and a
-    // zero budget are ignored; a full store evicts before taking pages. `hidden_bytes` is charged
-    // beside the pages and is not part of `image_bytes` (the payload the pages cover).
+    // zero budget are ignored; a full store evicts before taking pages.
     bool store_image(const HeldPrefix& key, std::uint64_t image_bytes, std::uint32_t path_kind,
-                     std::uint64_t hidden_bytes = 0);
+                     bool whole = true);
     // Upstream restore_stored (:1551) returns the image index; the caller copies the payload via
     // load_image (S3). Restoring refreshes last_used.
     [[nodiscard]] std::optional<std::size_t> restore_stored(const HeldPrefix& key);
 
-    // Copies a lane's planes into the image's pages (save) and its continuation hidden into the
-    // image's own buffer, or back out on load. The payload must be exactly `image_bytes`; a
-    // mismatched buffer throws rather than truncating a plane.
-    void write_payload(std::size_t index, std::span<const ImageChunk> chunks,
-                       std::span<const std::byte> hidden);
-    void read_payload(std::size_t index, std::span<const ImageChunk> chunks,
-                      std::span<std::byte> hidden) const;
-    [[nodiscard]] bool has_hidden(std::size_t index) const noexcept {
-        return index < stored_.size() && stored_[index].hidden_bytes != 0;
-    }
+    // Copies a lane's planes into the image's pages (save) and back out on load, in image byte
+    // order. The payload must be exactly `image_bytes`; a mismatched buffer throws rather than
+    // truncating a plane.
+    void write_payload(std::size_t index, std::span<const ImageChunk> chunks);
+    void read_payload(std::size_t index, std::span<const ImageChunk> chunks) const;
 
     // Upstream drop_stored_prefixes (:1158): drop every image whose key is a prefix of `prompt`.
     void drop_stored_prefixes(std::span<const TokenId> prompt_tokens);
@@ -322,71 +322,73 @@ private:
 // continuation hidden the image carries, so the prefix does not have to be one token shorter than
 // the prompt. The live prefix keeps the strict rule -- its last written token is a sample a prior
 // turn was decoding, not a prompt boundary.
+// What a lane still holds outside the store, the counterpart of upstream's Slot.fed / Slot.snapshot
+// (qwen4_exp_core.cpp:1648-1700): the state at the live frontier and the state at the end of the
+// lane's last prompt. Both are StateImage slots the lane keeps across turns, so a resume that
+// lands either of them copies no KV at all -- the lane's planes already are that prefix.
+struct QsaLaneRetentionView {
+    bool live                     = false;
+    bool snapshot                 = false;
+    // MTP: the snapshot's draft KV covers the anchor, so a drafting request may resume from it
+    // (upstream `slot.snapshot.drafter_follows`).
+    bool snapshot_drafter_follows = true;
+};
+
 struct QsaReuseChoice {
     std::uint32_t tokens    = 0;
-    std::uint32_t live      = 0; // best the lanes' live prefixes offered
-    std::uint32_t anchored  = 0; // best the lanes' anchors offered
-    std::uint32_t stored    = 0; // best the store offered
-    std::uint32_t lane      = 0;
-    std::size_t image       = 0;
+    std::uint32_t live      = 0; // what the lane's live state offered
+    std::uint32_t anchored  = 0; // what the lane's prompt-end snapshot offered
+    std::uint32_t stored    = 0; // what the store offered
+    std::size_t image       = 0; // only a store resume lands from an image
     bool from_store         = false;
     bool whole              = false; // covers the whole prompt
     std::uint32_t path_kind = 0;     // 0 endpoint, 1 turn closure, 2 stored image
 };
 
+// Upstream's three-way admission (qwen4_exp_core.cpp:1650-1690) for one lane, in its own order:
+// the longest of the store, the lane's prompt-end snapshot and the lane's live state. The lane is
+// the one admission is about to use -- a live or anchor resume reads that lane's own KV planes, so
+// another lane's prefix is not a candidate (upstream reads `slots[s]` for the slot it was given,
+// and so do we). A live prefix keeps the strict rule (its last written token is a sample a prior
+// turn was decoding); the snapshot and an image admit the whole prompt, which is what a regenerate
+// resumes at. `store_allowed` is false while a drafter runs: an image carries no draft KV, so a
+// store resume would hand the drafter KV it never wrote (upstream refuses the same way, through
+// its image's `drafter_follows` bit).
 [[nodiscard]] inline QsaReuseChoice
-qsa_choose_reuse(std::span<const LanePrefixRecord> records,
-                 std::span<const std::uint64_t> lane_epochs, const QsaContinuationStore* store,
-                 std::span<const TokenId> prompt_tokens,
+qsa_choose_reuse(const LanePrefixRecord& record, std::uint64_t lane_epoch,
+                 const QsaLaneRetentionView& retention, bool store_allowed,
+                 const QsaContinuationStore* store, std::span<const TokenId> prompt_tokens,
                  std::span<const std::uint64_t> prompt_media) {
     QsaReuseChoice best;
-    std::uint32_t best_live     = 0;
-    std::uint32_t best_anchored = 0;
-    for (std::size_t lane = 0; lane < records.size(); ++lane) {
-        const LanePrefixRecord& record = records[lane];
-        if (record.epoch == 0 || lane >= lane_epochs.size() ||
-            record.epoch != lane_epochs[lane] || record.held.empty()) {
-            continue;
-        }
-        const std::uint32_t live =
+    const bool current = record.epoch != 0 && record.epoch == lane_epoch && !record.held.empty();
+    if (current && retention.live) {
+        best.live =
             qsa_prefix_reuse(record.held, prompt_tokens,
                              qsa_media_key_at(prompt_media, record.held.position));
-        const std::uint32_t anchored =
-            record.anchor.empty()
-                ? 0U
-                : qsa_prefix_reuse(record.anchor, prompt_tokens,
-                                   qsa_media_key_at(prompt_media, record.anchor.position), true);
-        if (live > best_live) {
-            best_live          = live;
-            best.live          = live;
-            best.tokens        = live;
-            best.lane          = static_cast<std::uint32_t>(lane);
-            best.from_store    = false;
-            best.whole         = false;
-            best.path_kind     = 0;
-        }
-        if (anchored > best_anchored) {
-            best_anchored  = anchored;
-            best.anchored  = anchored;
-            if (anchored > best_live) {
-                best.tokens     = anchored;
-                best.lane       = static_cast<std::uint32_t>(lane);
-                best.from_store = false;
-                best.whole      = anchored == prompt_tokens.size();
-                best.path_kind  = 1;
-            }
+        best.tokens = best.live;
+    }
+    if (current && retention.snapshot && retention.snapshot_drafter_follows &&
+        !record.anchor.empty()) {
+        best.anchored =
+            qsa_prefix_reuse(record.anchor, prompt_tokens,
+                             qsa_media_key_at(prompt_media, record.anchor.position), true);
+        if (best.anchored > best.tokens) {
+            best.tokens     = best.anchored;
+            best.from_store = false;
+            best.whole      = best.anchored == prompt_tokens.size();
+            best.path_kind  = 1;
         }
     }
-    const auto [image, stored] =
-        store != nullptr ? store->find_stored(prompt_tokens, prompt_media, true)
-                         : std::pair<std::size_t, std::uint32_t>{0, 0};
-    best.stored = stored;
-    if (stored > std::max(best_live, best_anchored)) {
-        best.tokens     = stored;
-        best.image      = image;
-        best.from_store = true;
-        best.whole      = stored == prompt_tokens.size();
-        best.path_kind  = 2;
+    if (store_allowed && store != nullptr) {
+        const auto [image, stored] = store->find_stored(prompt_tokens, prompt_media, true);
+        best.stored                = stored;
+        if (stored > best.tokens) {
+            best.tokens     = stored;
+            best.image      = image;
+            best.from_store = true;
+            best.whole      = stored == prompt_tokens.size() && store->images()[image].whole;
+            best.path_kind  = 2;
+        }
     }
     return best;
 }

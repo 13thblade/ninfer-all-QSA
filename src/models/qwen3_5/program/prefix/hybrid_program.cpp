@@ -1640,21 +1640,10 @@ std::span<const cudaEvent_t> ProgramImpl::hybrid_take_restore_layers(std::uint32
 
 void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
-    if (qsa_stream_state.has_value()) {
-        // Streamed tier: the staging copy is keyed on the lane's tenure, not on the prefix
-        // cache, so this runs whether or not a hybrid cache exists. Bump the generation so the
-        // next tenant cannot reuse the staging bytes this one left, and drop the cached
-        // (lane, layer, frontier) triple with it (a changed state object can never hit the
-        // cache, qwen4_exp's kv_staged identity key).
-        auto& generation = qsa_stream_state->lane_generation[lane];
-        ++generation;
-        if (generation == 0) { ++generation; }
-        qsa_stream_state->staged_lane  = -1;
-        qsa_stream_state->staged_layer = -1;
-        qsa_stream_state->staged_end   = 0;
-    }
-    // The lane's KV is about to be released, so nothing it held can be resumed from this lane;
-    // without a store (R4) that means the record goes with it.
+    // Streamed tier: the staging copy is keyed on the lane's tenure, not on the prefix cache, so
+    // this runs whether or not a hybrid cache exists. Then the lane's prefix record and whatever
+    // it retained go with the tenure.
+    qsa_end_lane_tenure(lane);
     qsa_clear_lane_prefix(lane);
     if (!hybrid_) { return; }
     HybridLaneState& state = hybrid_lanes_[lane];

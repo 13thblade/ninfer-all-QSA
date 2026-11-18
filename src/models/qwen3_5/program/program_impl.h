@@ -902,11 +902,19 @@ public:
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
 
     // ---- QSA streamed-tier reuse (ContextCacheMode::Qsa) --------------------------------------
-    // The resume is a token-exact prefix: a lane's live prefix or anchor (both on its pinned host
-    // KV), or a stored image. Everything a resume needs beside the KV -- the GDN conv/recurrent
-    // state and the continuation hidden -- rides in the image's StateImage part, so a store
-    // restore lands the same state a lane holds.
+    // Upstream qwen4_exp's three ways to resume (qwen4_exp_core.cpp:1648-1700): the lane's live
+    // state, the snapshot at the end of its last prompt, or a stored image. The first two are
+    // StateImage slots the lane keeps across turns -- the counterpart of upstream's Slot.fed and
+    // Slot.snapshot -- so they cost no copy; the image is the fallback for a lane some other
+    // conversation took, and carries the state beside the KV planes.
     [[nodiscard]] bool qsa_prefix_cache() const noexcept { return qsa_store_ != nullptr; }
+    // The streamed tier itself, with or without a host image store: a lane keeps its live state
+    // and its prompt-end snapshot either way, so this is what selects the terminal settlement and
+    // the admission path.
+    [[nodiscard]] bool qsa_live_continuation() const noexcept {
+        return context_cache.enabled && context_cache.mode == ContextCacheMode::Qsa &&
+               qsa_stream_state.has_value();
+    }
     [[nodiscard]] QsaAdmissionQuote qsa_quote(const PreparedPromptData& prompt,
                                               const RequestBasePlan& base,
                                               runtime::LaneId destination);
@@ -914,10 +922,32 @@ public:
     qsa_reserve_materialization(QsaAdmissionQuote&& quote, const PreparedPromptData& prompt,
                                 const std::function<PreparedPromptData()>& take_prompt,
                                 runtime::CancellationFlagView cancellation);
+    // Terminal settlement: writes the lane's images, keeps the live state and the prompt-end
+    // snapshot bound to the lane, and releases everything else. `consistent` is false when the
+    // lane's state may not describe its own frontier, and then nothing is retained.
+    [[nodiscard]] bool qsa_finish_lane(SequenceState& sequence, RequestControl& request,
+                                       std::uint32_t lane, bool consistent) noexcept;
     void qsa_retire(SequenceState& sequence) noexcept;
     void qsa_forget(SequenceState& sequence) noexcept;
     void qsa_retire_handle(SequenceHandle sequence) noexcept;
     void qsa_forget_handle(SequenceHandle sequence) noexcept;
+    // The full-lane image is written at eviction, not at every turn end: while the lane lives its
+    // state and its pinned planes are the resume source, and copying them aside on each finish
+    // would cost an H2H of the whole window per request. `qsa_write_lane_image` is the one copy;
+    // `qsa_store_lane_image` reads the lane's retained endpoint at the point it is being dropped.
+    void qsa_write_lane_image(std::uint32_t lane, StateImageHandle state, bool whole) noexcept;
+    void qsa_store_lane_image(std::uint32_t lane) noexcept;
+    // The snapshot a turn closure resumes from, taken where the prompt ended (upstream's
+    // `executor.snapshot(s, slot.snapshot)` at qwen4_exp_core.cpp:2219).
+    void qsa_capture_anchor(SequenceState& sequence) noexcept;
+    // Drops what a lane retains: called when a new tenure starts on it and the resume does not
+    // consume the retained state, so a later conversation can never land a stale image.
+    void qsa_drop_lane_retention(std::uint32_t lane, bool save_image = true) noexcept;
+    // The staging half of a lane release: the next tenant must not read the last one's staged
+    // bytes. Separate from `hybrid_release_lane`, which also clears the prefix record a resumed
+    // lane still needs.
+    void qsa_end_lane_tenure(std::uint32_t lane) noexcept;
+    [[nodiscard]] detail::QsaLaneRetentionView qsa_retention_view(std::uint32_t lane) const;
     // The sequence a QSA reservation started: the reservation is synchronous, so the engine's
     // progress step publishes it from here instead of driving a Legacy materialization.
     [[nodiscard]] std::optional<StartResult> take_qsa_published() noexcept {
@@ -1149,10 +1179,26 @@ public:
     // lane's tenure ends. `epoch` is lane_epochs[lane], so the next tenant can never read a stale
     // record. Empty and untouched when the model carries no QSA indexer state.
     std::vector<detail::LanePrefixRecord> qsa_lane_prefix;
-    // The images a lane's prefix survives in after the lane is released: the StateImage part
+    // The images a lane's prefix survives in after it is released: the StateImage part
     // (GDN conv/recurrent, continuation hidden, draft state) followed by the lane's KV planes.
     // Absent unless --host-cache-mib gave the streamed tier a host budget.
     std::unique_ptr<detail::QsaContinuationStore> qsa_store_;
+    // Per lane, the two states upstream's Slot keeps (qwen4_exp_core.cpp:573-620): the live state
+    // its last turn ended in and the snapshot at the end of its last prompt. Both are StateImage
+    // slots held outside the catalog, like `stop_holds_`; the lane's draft KV rides along so a
+    // drafting request can resume from either without handing the drafter KV it never wrote.
+    struct QsaLaneRetention {
+        std::optional<StateImageHandle> live;
+        std::optional<StateImageHandle> snapshot;
+        std::optional<KVAddressSpaceHandle> backend;
+        std::uint32_t backend_pages   = 0;
+        bool snapshot_drafter_follows = false;
+        // Whether the live state's frontier equals its prefix key. Stored at turn end (where the
+        // sequence still knows both); read when the lane is evicted and the image is written.
+        bool live_whole               = false;
+        std::uint64_t epoch           = 0;
+    };
+    std::array<QsaLaneRetention, kMaximumConcurrency> qsa_lane_retention_{};
     std::optional<StartResult> qsa_pending_published_;
     void qsa_begin_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
                                const SequenceState& sequence);

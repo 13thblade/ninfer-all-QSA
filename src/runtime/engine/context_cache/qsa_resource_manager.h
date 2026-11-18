@@ -136,17 +136,28 @@ public:
         if (!program.isolated_request_feasible(base)) {
             return {.readiness = Readiness::PermanentlyInfeasible};
         }
-        std::optional<LaneId> destination;
+        // qwen4_exp binds a conversation to the slot that holds its KV: a turn-2 prompt is quoted
+        // against every free lane and the lane whose retained prefix actually continues it wins.
+        // Taking the first free lane here instead would hand it to whichever session happened to
+        // arrive in that order, so a four-session turn would re-prefill all four from root.
+        std::optional<Quote> best;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
-            if (lanes_[lane] == Lane::Free) {
-                destination = LaneId{lane};
-                break;
-            }
+            if (lanes_[lane] != Lane::Free) { continue; }
+            Quote quote = program.qsa_quote(prompt, base, LaneId{lane});
+            if (quote.readiness != Readiness::Ready) { continue; }
+            // Highest reuse wins. Ties (notably four root arrivals for four different sessions)
+            // go to a lane that carries no other conversation's state: a root admission drops
+            // the lane's record, so taking an owned lane would evict a session that may still
+            // resume there. With serial prefill this is what spreads sessions across lanes
+            // instead of stacking all of them on the lowest-index one.
+            const bool better =
+                !best || quote.reuse > best->reuse ||
+                (quote.reuse == best->reuse && best->lane_carries_foreign_state &&
+                 !quote.lane_carries_foreign_state);
+            if (better) { best.emplace(std::move(quote)); }
         }
-        if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
-        Quote quote = program.qsa_quote(prompt, base, *destination);
-        if (quote.readiness != Readiness::Ready) { return {.readiness = quote.readiness}; }
-        return {.readiness = Readiness::Ready, .choice = Choice(std::move(quote))};
+        if (!best) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        return {.readiness = Readiness::Ready, .choice = Choice(std::move(*best))};
     }
 
     // No persistent backfill proof: the streamed tier resumes from whole images, not from a

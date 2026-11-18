@@ -899,8 +899,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             stream.staging_bytes += kv_pool.plane(i).bytes();
         }
         // The host tier the images live in. It is the same budget the hybrid cache would have
-        // taken; a zero or absent one keeps the streamed tier root-only, exactly as before.
-        if (context_cache.host_cache_budget_bytes.has_value() &&
+        // taken; a zero or absent one keeps the streamed tier on its lane-retained states only.
+        if (context_cache.mode == ContextCacheMode::Qsa &&
+            context_cache.host_cache_budget_bytes.has_value() &&
             *context_cache.host_cache_budget_bytes != 0) {
             qsa_store_ =
                 std::make_unique<QsaContinuationStore>(*context_cache.host_cache_budget_bytes);
@@ -1610,6 +1611,10 @@ void ProgramImpl::qsa_note_lane_frontier(const SequenceState& sequence, std::uin
 void ProgramImpl::qsa_clear_lane_prefix(std::uint32_t lane) noexcept {
     if (lane >= qsa_lane_prefix.size()) { return; }
     qsa_lane_prefix[lane].clear();
+    // Whatever the lane retained belongs to the tenure that just ended: those slots go back with
+    // it, so a later conversation can never land a stale image. The QSA terminal settlement does
+    // not come through here -- it keeps both states and the prefix record on purpose.
+    qsa_drop_lane_retention(lane);
 }
 
 

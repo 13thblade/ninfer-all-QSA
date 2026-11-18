@@ -699,11 +699,20 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
+    if (qsa_live_continuation()) {
+        // QSA streamed tier: the store replaces the catalog. The lane keeps its live state and
+        // its prompt-end snapshot (settled inside qsa_finish_lane), so nothing is published.
+        out.timings     = request.timings;
+        out.speculative = std::move(request.speculative_stats);
+        const bool consistent =
+            (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable) &&
+            !state.state.fork_pending;
+        if (!qsa_finish_lane(state, request, lane, consistent)) { return out; }
+        out.disposition = runtime::FinishDisposition::Released;
+        out.status      = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
     if (!request.publish_continuation) {
-        // The streamed tier retires the lane's prefix into its image store before the lane (and
-        // the sequence's StateImage slot with it) goes away: the anchor image serves a later
-        // turn, the endpoint image a regenerate of this one.
-        if (qsa_store_) { qsa_retire(state); }
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
         out.timings     = request.timings;
@@ -1035,6 +1044,17 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
+    if (qsa_live_continuation()) {
+        // A cancelled sequence's state may not describe its frontier, so nothing is retained:
+        // `clear_lane_strict` releases the lane's record and its retained slots with the tenure.
+        out.timings     = request.timings;
+        out.speculative = std::move(request.speculative_stats);
+        if (!clear_lane_strict(state, request)) { return out; }
+        invalidate_lane(lane);
+        advance_resource_revision();
+        out.status = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
     if (salvage_continuation(state, request, lane, continuation_index, out) ||
         retain_prefill_progress(state, request, lane, continuation_index, out)) {
         out.status = runtime::ConsumeStatus::Consumed;
@@ -1138,6 +1158,9 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
 std::optional<qwen3_5::PhysicalUsageSnapshot>
 ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
     pending_transaction_.reset();
+    // A streamed-tier reservation that never got its publication step is dropped here with the
+    // rest: its sequence is released by the continuation sweep below.
+    qsa_pending_published_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted) { synchronize_transfer_streams(); }
         abort_active_capture(*transaction);
