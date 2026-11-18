@@ -221,6 +221,11 @@ struct StoredImage {
     std::uint64_t bytes     = 0;   // exact image bytes (<= pages.size() * page_bytes)
     std::uint64_t last_used = 0;
     std::uint32_t path_kind = 0;   // PrefixReusePath semantics (0 = endpoint, 1 = turn closure)
+    // The continuation hidden of the last stored token, kept beside the pages: it is one layer's
+    // BF16 row (tens of KB), not a page-sized region, and it is what lets an image serve the whole
+    // prompt (a regenerate) instead of a strict prefix of it. Empty when the image has none.
+    std::vector<std::byte> hidden;
+    std::uint64_t hidden_bytes = 0; // charged to the budget separately from the pages
 };
 
 class QsaContinuationStore {
@@ -250,11 +255,24 @@ public:
     stored_index(const HeldPrefix& key) const;
 
     // Upstream store_image (:1500): exact-key images refresh last_used; short prefixes and a
-    // zero budget are ignored; a full store evicts before taking pages.
-    bool store_image(const HeldPrefix& key, std::uint64_t image_bytes, std::uint32_t path_kind);
+    // zero budget are ignored; a full store evicts before taking pages. `hidden_bytes` is charged
+    // beside the pages and is not part of `image_bytes` (the payload the pages cover).
+    bool store_image(const HeldPrefix& key, std::uint64_t image_bytes, std::uint32_t path_kind,
+                     std::uint64_t hidden_bytes = 0);
     // Upstream restore_stored (:1551) returns the image index; the caller copies the payload via
     // load_image (S3). Restoring refreshes last_used.
     [[nodiscard]] std::optional<std::size_t> restore_stored(const HeldPrefix& key);
+
+    // Copies a lane's planes into the image's pages (save) and its continuation hidden into the
+    // image's own buffer, or back out on load. The payload must be exactly `image_bytes`; a
+    // mismatched buffer throws rather than truncating a plane.
+    void write_payload(std::size_t index, std::span<const ImageChunk> chunks,
+                       std::span<const std::byte> hidden);
+    void read_payload(std::size_t index, std::span<const ImageChunk> chunks,
+                      std::span<std::byte> hidden) const;
+    [[nodiscard]] bool has_hidden(std::size_t index) const noexcept {
+        return index < stored_.size() && stored_[index].hidden_bytes != 0;
+    }
 
     // Upstream drop_stored_prefixes (:1158): drop every image whose key is a prefix of `prompt`.
     void drop_stored_prefixes(std::span<const TokenId> prompt_tokens);

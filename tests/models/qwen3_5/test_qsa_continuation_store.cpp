@@ -243,6 +243,56 @@ void test_plane_chunks_roundtrip() {
     expect(threw, "a short image buffer is refused");
 }
 
+void test_image_hidden_roundtrip() {
+    constexpr std::size_t kPage = QsaContinuationStore::kHostPageBytes;
+    constexpr std::uint64_t kHidden = 2 * 5120; // one BF16 hidden row
+    QsaContinuationStore store(64ULL << 20);
+    const HeldPrefix key = key_of(11, 4096);
+
+    // Two planes inside one page, each a distinct pattern.
+    std::vector<std::byte> plane_a((1U << 20) + 7, std::byte{0x11});
+    std::vector<std::byte> plane_b(4096, std::byte{0x22});
+    std::vector<std::byte> hidden_src(kHidden, std::byte{0x33});
+    std::vector<ImageChunk> chunks{{plane_a.data(), plane_a.size()},
+                                   {plane_b.data(), plane_b.size()}};
+    const std::uint64_t payload = qsa_image_chunk_bytes(chunks);
+
+    expect(store.store_image(key, payload, 0, kHidden), "an image with a hidden stores");
+    const auto index = store.stored_index(key);
+    expect(index.has_value(), "the stored image is found by its key");
+    expect(store.has_hidden(*index), "the image reports its hidden");
+    expect(store.used_bytes() == kPage + kHidden, "the budget charges pages plus the hidden");
+
+    store.write_payload(*index, chunks, hidden_src);
+    // Mutate the live planes and the source hidden, then read the image back.
+    std::fill(plane_a.begin(), plane_a.end(), std::byte{0x00});
+    std::fill(plane_b.begin(), plane_b.end(), std::byte{0x00});
+    std::fill(hidden_src.begin(), hidden_src.end(), std::byte{0x00});
+    std::vector<std::byte> hidden_dst(kHidden, std::byte{0x00});
+    store.read_payload(*index, chunks, hidden_dst);
+    expect(std::all_of(plane_a.begin(), plane_a.end(),
+                       [](std::byte b) { return b == std::byte{0x11}; }),
+           "the first plane round-trips through the image");
+    expect(std::all_of(plane_b.begin(), plane_b.end(),
+                       [](std::byte b) { return b == std::byte{0x22}; }),
+           "the second plane round-trips through the image");
+    expect(std::all_of(hidden_dst.begin(), hidden_dst.end(),
+                       [](std::byte b) { return b == std::byte{0x33}; }),
+           "the continuation hidden round-trips through the image");
+
+    // A payload that does not match the image is refused, not truncated.
+    bool threw = false;
+    try {
+        std::vector<ImageChunk> short_chunks{{plane_a.data(), plane_a.size()}};
+        store.write_payload(*index, short_chunks, hidden_src);
+    } catch (const std::logic_error&) { threw = true; }
+    expect(threw, "a short payload is refused");
+
+    // Eviction releases the hidden too, so the budget returns to zero.
+    expect(store.make_host_room(64ULL << 20), "making room evicts the image");
+    expect(store.used_bytes() == 0, "the hidden is released with its image");
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +306,7 @@ int main() {
     test_image_bytes_arithmetic_all_positions();
     test_image_save_load_roundtrip();
     test_plane_chunks_roundtrip();
+    test_image_hidden_roundtrip();
     if (failures != 0) {
         std::cerr << failures << " QSA continuation-store checks failed\n";
         return 1;

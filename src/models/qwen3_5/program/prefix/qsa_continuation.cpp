@@ -142,10 +142,13 @@ std::vector<std::byte*> QsaContinuationStore::take_pages(std::uint64_t bytes) {
 }
 
 void QsaContinuationStore::give_back(StoredImage& image) noexcept {
-    const std::uint64_t released = static_cast<std::uint64_t>(image.pages.size()) * page_bytes_;
+    const std::uint64_t released = static_cast<std::uint64_t>(image.pages.size()) * page_bytes_ +
+                                   image.hidden_bytes;
     host_used_ -= released > host_used_ ? host_used_ : released;
     free_pages_.insert(free_pages_.end(), image.pages.begin(), image.pages.end());
     image.pages.clear();
+    image.hidden.clear();
+    image.hidden_bytes = 0;
 }
 
 void QsaContinuationStore::drop_dead() noexcept {
@@ -202,23 +205,64 @@ QsaContinuationStore::find_stored(std::span<const TokenId> prompt_tokens,
 }
 
 bool QsaContinuationStore::store_image(const HeldPrefix& key, std::uint64_t image_bytes,
-                                       std::uint32_t path_kind) {
+                                       std::uint32_t path_kind, std::uint64_t hidden_bytes) {
     if (key.tokens.size() < kMinStoredTokens || host_budget_ == 0) { return false; }
     if (const auto known = stored_index(key)) {
         stored_[*known].last_used = ++use_clock_;
         return false; // upstream: an already-stored prefix only refreshes last_used
     }
-    if (image_bytes > host_budget_) { return false; }
-    if (!make_host_room(page_rounded(image_bytes, page_bytes_))) { return false; }
+    if (image_bytes > host_budget_ || hidden_bytes > host_budget_ - image_bytes) { return false; }
+    if (!make_host_room(page_rounded(image_bytes, page_bytes_) + hidden_bytes)) { return false; }
     StoredImage image;
-    image.key       = key;
-    image.path_kind = path_kind;
-    image.bytes     = image_bytes;
-    image.pages     = take_pages(image_bytes);
+    image.key          = key;
+    image.path_kind    = path_kind;
+    image.bytes        = image_bytes;
+    image.hidden_bytes = hidden_bytes;
+    image.pages        = take_pages(image_bytes);
     if (image.pages.empty()) { return false; }
+    if (hidden_bytes != 0) {
+        // The hidden lives beside the pages, not in them: it is one BF16 row, and rounding it to
+        // an 8 MiB page would cost more than the KV it accompanies on short prompts.
+        host_used_ += hidden_bytes;
+        image.hidden.resize(static_cast<std::size_t>(hidden_bytes));
+    }
     image.last_used = ++use_clock_;
     stored_.push_back(std::move(image));
     return true;
+}
+
+void QsaContinuationStore::write_payload(std::size_t index, std::span<const ImageChunk> chunks,
+                                         std::span<const std::byte> hidden) {
+    if (index >= stored_.size()) { throw std::out_of_range("qsa store: image index"); }
+    StoredImage& image = stored_[index];
+    const std::uint64_t payload = qsa_image_chunk_bytes(chunks);
+    if (payload != image.bytes || hidden.size() != image.hidden_bytes) {
+        throw std::logic_error("qsa store: the payload does not match the image");
+    }
+    std::vector<ImageRegion> regions;
+    regions.reserve(chunks.size());
+    for (const ImageChunk& chunk : chunks) { regions.push_back(ImageRegion{chunk.data, chunk.bytes}); }
+    qsa_copy_image(regions, image.pages, page_bytes_, true);
+    if (!hidden.empty()) {
+        std::copy(hidden.begin(), hidden.end(), image.hidden.begin());
+    }
+}
+
+void QsaContinuationStore::read_payload(std::size_t index, std::span<const ImageChunk> chunks,
+                                        std::span<std::byte> hidden) const {
+    if (index >= stored_.size()) { throw std::out_of_range("qsa store: image index"); }
+    const StoredImage& image = stored_[index];
+    const std::uint64_t payload = qsa_image_chunk_bytes(chunks);
+    if (payload != image.bytes || hidden.size() != image.hidden_bytes) {
+        throw std::logic_error("qsa store: the payload does not match the image");
+    }
+    std::vector<ImageRegion> regions;
+    regions.reserve(chunks.size());
+    for (const ImageChunk& chunk : chunks) { regions.push_back(ImageRegion{chunk.data, chunk.bytes}); }
+    qsa_copy_image(regions, image.pages, page_bytes_, false);
+    if (!hidden.empty()) {
+        std::copy(image.hidden.begin(), image.hidden.end(), hidden.begin());
+    }
 }
 
 std::optional<std::size_t> QsaContinuationStore::restore_stored(const HeldPrefix& key) {
