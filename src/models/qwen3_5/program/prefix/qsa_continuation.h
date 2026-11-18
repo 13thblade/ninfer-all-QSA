@@ -187,6 +187,28 @@ struct ImageRegion {
 void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
                     std::size_t page_bytes, bool save);
 
+// One contiguous run of a lane's authoritative KV: a plane of one streamed layer. `data` is the
+// live pinned host plane (a `[leading, 128, heads, pages]` tensor) and `bytes` its whole extent.
+// The image keeps the planes whole -- the page is the tensors' innermost axis, so a position's
+// pages are strided and cannot be sliced off with one memcpy; a whole-plane copy is one memcpy per
+// plane and round-trips exactly.
+struct ImageChunk {
+    std::byte* data = nullptr;
+    std::size_t bytes = 0;
+};
+
+[[nodiscard]] inline std::size_t qsa_image_chunk_bytes(std::span<const ImageChunk> chunks) {
+    std::size_t total = 0;
+    for (const ImageChunk& chunk : chunks) { total += chunk.bytes; }
+    return total;
+}
+
+// Gathers the chunks into `image` (save) or scatters them back out (load), in chunk order. The
+// image must be exactly qsa_image_chunk_bytes(chunks) long; a shorter one throws rather than
+// truncating a plane.
+void qsa_copy_plane_chunks(std::span<const ImageChunk> chunks, std::span<std::byte> image,
+                           bool save);
+
 // ---- The image store (S2) --------------------------------------------------------------------
 // Upstream qwen4_exp_core.cpp:743-767, 1446-1527 translated to a host-only, GPU-free component.
 // An image is a token-exact prefix whose bytes live in a run of kHostPageBytes pinned pages. This

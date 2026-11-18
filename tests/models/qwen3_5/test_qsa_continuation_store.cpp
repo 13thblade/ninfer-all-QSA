@@ -4,17 +4,22 @@
 
 #include "models/qwen3_5/program/prefix/qsa_continuation.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
+using ninfer::models::qwen3_5::detail::ImageChunk;
 using ninfer::models::qwen3_5::detail::ImageRegion;
 using ninfer::models::qwen3_5::detail::QsaImageGeometry;
 using ninfer::models::qwen3_5::detail::qsa_copy_image;
+using ninfer::models::qwen3_5::detail::qsa_copy_plane_chunks;
 using ninfer::models::qwen3_5::detail::qsa_image_bytes;
+using ninfer::models::qwen3_5::detail::qsa_image_chunk_bytes;
 using ninfer::models::qwen3_5::detail::qsa_kv_bytes_per_head_token;
 
 namespace {
@@ -207,6 +212,37 @@ void test_image_save_load_roundtrip() {
     expect(a_copy == a && b_copy == b, "save->load round-trips every region byte-for-byte");
 }
 
+void test_plane_chunks_roundtrip() {
+    // Three chunks of different sizes stand in for a lane's planes (K, V, and a scale plane).
+    std::vector<std::byte> a(4096), b(1024), c(96);
+    for (std::size_t i = 0; i < a.size(); ++i) { a[i] = std::byte(i & 0xFF); }
+    for (std::size_t i = 0; i < b.size(); ++i) { b[i] = std::byte((i * 7) & 0xFF); }
+    for (std::size_t i = 0; i < c.size(); ++i) { c[i] = std::byte((i * 13) & 0xFF); }
+    const std::vector<std::byte> a_orig = a;
+    const std::vector<std::byte> b_orig = b;
+    const std::vector<std::byte> c_orig = c;
+    const std::vector<ImageChunk> chunks{
+        {a.data(), a.size()}, {b.data(), b.size()}, {c.data(), c.size()}};
+    expect(qsa_image_chunk_bytes(chunks) == a.size() + b.size() + c.size(),
+           "the chunk bytes are the plane bytes");
+    std::vector<std::byte> image(qsa_image_chunk_bytes(chunks), std::byte{0});
+    qsa_copy_plane_chunks(chunks, image, /*save=*/true);
+    // The live planes move on (the next sequence writes them); the image must still hold the
+    // prefix, and loading it back must restore every byte.
+    std::fill(a.begin(), a.end(), std::byte{0xEE});
+    std::fill(b.begin(), b.end(), std::byte{0xEE});
+    std::fill(c.begin(), c.end(), std::byte{0xEE});
+    qsa_copy_plane_chunks(chunks, image, /*save=*/false);
+    expect(a == a_orig && b == b_orig && c == c_orig, "load restores every plane byte-for-byte");
+
+    // A buffer that does not match the planes is refused rather than truncating a plane.
+    bool threw = false;
+    try {
+        qsa_copy_plane_chunks(chunks, std::span<std::byte>(image.data(), image.size() - 1), true);
+    } catch (const std::invalid_argument&) { threw = true; }
+    expect(threw, "a short image buffer is refused");
+}
+
 } // namespace
 
 int main() {
@@ -219,6 +255,7 @@ int main() {
     test_kv_bytes_follow_storage_precision();
     test_image_bytes_arithmetic_all_positions();
     test_image_save_load_roundtrip();
+    test_plane_chunks_roundtrip();
     if (failures != 0) {
         std::cerr << failures << " QSA continuation-store checks failed\n";
         return 1;

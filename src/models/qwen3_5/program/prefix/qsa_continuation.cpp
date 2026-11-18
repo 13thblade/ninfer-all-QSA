@@ -58,6 +58,21 @@ std::uint64_t qsa_image_bytes(std::uint32_t position, const QsaImageGeometry& g)
     return per_layer * g.full_layers + g.recurrent_bytes + g.mtp_bytes;
 }
 
+void qsa_copy_plane_chunks(std::span<const ImageChunk> chunks, std::span<std::byte> image,
+                           bool save) {
+    const std::size_t total = qsa_image_chunk_bytes(chunks);
+    if (image.size() != total) {
+        throw std::invalid_argument("qsa image: the buffer does not match the lane's planes");
+    }
+    std::size_t at = 0;
+    for (const ImageChunk& chunk : chunks) {
+        if (chunk.bytes == 0) { continue; }
+        if (save) { std::memcpy(image.data() + at, chunk.data, chunk.bytes); }
+        else { std::memcpy(chunk.data, image.data() + at, chunk.bytes); }
+        at += chunk.bytes;
+    }
+}
+
 void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
                     std::size_t page_bytes, bool save) {
     std::uint64_t total = 0;
