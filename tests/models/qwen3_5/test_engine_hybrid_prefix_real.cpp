@@ -424,8 +424,16 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
         ++failures;
     }
     if (compare_output && followed.generated_token_ids != reference) {
+        std::size_t diverged = 0;
+        while (diverged < followed.generated_token_ids.size() &&
+               diverged < reference.size() &&
+               followed.generated_token_ids[diverged] == reference[diverged]) {
+            ++diverged;
+        }
         std::cerr << "coalesce " << shared_tokens
-                  << ": the follower generated different tokens than an uncached run\n";
+                  << ": the follower generated different tokens than an uncached run (first "
+                     "difference at step "
+                  << diverged << " of " << reference.size() << ")\n";
         ++failures;
     }
     return failures;
@@ -839,9 +847,22 @@ int exercise_drafting_off(const char* artifact, ninfer::SpeculativeBackend backe
         const ninfer::TokenLogprob& b = off.reads[read];
         if (a.id != b.id || a.logprob != b.logprob || a.top_ids != b.top_ids ||
             a.top_values != b.top_values) {
-            std::cerr << name << ": read " << read
-                      << " differs from the drafting read (token " << a.id << " vs " << b.id
-                      << ")\n";
+            // How far apart the two reads actually are: a one-BF16-step logprob on the same
+            // token is rounding, a different top-k ordering is not.
+            const float delta_logprob = std::fabs(a.logprob - b.logprob);
+            bool same_top_ids         = a.top_ids == b.top_ids;
+            float worst_top_value     = 0.0F;
+            const std::size_t shared_top =
+                std::min(a.top_values.size(), b.top_values.size());
+            for (std::size_t k = 0; k < shared_top; ++k) {
+                worst_top_value =
+                    std::max(worst_top_value, std::fabs(a.top_values[k] - b.top_values[k]));
+            }
+            std::cerr << name << ": read " << read << " differs from the drafting read (token "
+                      << a.id << " vs " << b.id << ", |dlogprob| " << delta_logprob
+                      << ", top_ids same " << (same_top_ids ? 1 : 0) << ", worst top_value "
+                      << worst_top_value << ", top sizes " << a.top_values.size() << '/'
+                      << b.top_values.size() << ")\n";
             ++failures;
         }
     }
@@ -930,6 +951,13 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
                 .after_message_part_count = 1}};
         return input;
     };
+    // How many reads join the group. Four is the scenario; a smaller count separates "the wider
+    // projection rounds differently" from "the group is wider" when a readout drifts.
+    std::size_t group_reads = questions.size();
+    if (const char* setting = std::getenv("NINFER_TEST_SHARED_READS"); setting != nullptr) {
+        const std::size_t requested = static_cast<std::size_t>(std::strtoul(setting, nullptr, 10));
+        if (requested != 0 && requested < group_reads) { group_reads = requested; }
+    }
     ninfer::RequestOptions read          = greedy(1);
     read.execution.logprobs              = true;
     read.execution.speculative_drafting = false;
@@ -952,8 +980,9 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
     {
         ninfer::Engine engine(options);
         (void)engine.generate(engine.prepare(prompt(questions[0])), read);
-        for (const std::string& question : questions) {
-            alone.push_back(first_read(engine.generate(engine.prepare(prompt(question)), read)));
+        for (std::size_t index = 0; index < group_reads; ++index) {
+            alone.push_back(
+                first_read(engine.generate(engine.prepare(prompt(questions[index])), read)));
         }
     }
     // Together: after the same first read, the reads are submitted as one group.
@@ -965,9 +994,9 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
         (void)engine.generate(engine.prepare(prompt(questions[0])), read);
         before = engine.runtime_stats();
         std::vector<ninfer::GenerationSubmission> group;
-        for (const std::string& question : questions) {
-            group.push_back(ninfer::GenerationSubmission{.prompt  = engine.prepare(prompt(question)),
-                                                         .options = read});
+        for (std::size_t index = 0; index < group_reads; ++index) {
+            group.push_back(ninfer::GenerationSubmission{
+                .prompt = engine.prepare(prompt(questions[index])), .options = read});
         }
         for (ninfer::GenerationHandle& handle : engine.submit_group(std::move(group))) {
             together.push_back(first_read(handle.wait()));
@@ -978,6 +1007,10 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
     int failures = 0;
     const std::uint64_t passes   = after.shared_prefill_passes - before.shared_prefill_passes;
     const std::uint64_t requests = after.shared_prefill_requests - before.shared_prefill_requests;
+    if (std::getenv("NINFER_TEST_READOUT_DEBUG") != nullptr) {
+        std::cerr << name << ": passes " << passes << ", requests " << requests << " of "
+                  << questions.size() << '\n';
+    }
     if (passes != 1 || requests != questions.size()) {
         std::cerr << name << ": the group shared " << passes << " passes (" << requests
                   << " requests); expected one pass of " << questions.size() << '\n';
@@ -987,7 +1020,7 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
     // move by one BF16 step of its logit (0.125 between 16 and 32, 0.25 up to 64; measured on an
     // RTX 3090: at most 0.125).
     constexpr float kTolerance = 0.26F;
-    for (std::size_t index = 0; index < questions.size(); ++index) {
+    for (std::size_t index = 0; index < together.size() && index < alone.size(); ++index) {
         const Read& a = alone[index];
         const Read& b = together[index];
         float worst   = std::fabs(a.logprob.logprob - b.logprob.logprob);
@@ -995,6 +1028,18 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
                       b.logprob.readout.size() == a.logprob.readout.size();
         for (std::size_t k = 0; shaped && k < a.logprob.readout.size(); ++k) {
             worst = std::max(worst, std::fabs(a.logprob.readout[k] - b.logprob.readout[k]));
+        }
+        if (std::getenv("NINFER_TEST_READOUT_DEBUG") != nullptr && shaped) {
+            // Which readout token carries the difference, and what the two values are: a change of
+            // one BF16 step of the logit is ~0.125, so a larger change is not rounding and needs
+            // an attribution of its own.
+            std::cerr << name << ": read " << index << " chosen a=" << a.logprob.logprob
+                      << " b=" << b.logprob.logprob;
+            for (std::size_t k = 0; k < a.logprob.readout.size(); ++k) {
+                std::cerr << " | t" << read.execution.readout_tokens[k] << " a="
+                          << a.logprob.readout[k] << " b=" << b.logprob.readout[k];
+            }
+            std::cerr << '\n';
         }
         std::cerr << name << ": read " << index << " token " << b.logprob.id << " reused "
                   << b.reused << ", largest log probability change " << worst << '\n';
