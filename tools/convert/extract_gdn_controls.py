@@ -1,17 +1,22 @@
-"""Extract the native BF16 GDN controls (in_proj_a / in_proj_b) from an FP8 HF release
-into a compact, committed asset so the GGUF->ninfer converter can graft them without the
-full FP8 tree.
+"""Extract the GDN controls (in_proj_a / in_proj_b) from an HF release into a compact asset
+so the GGUF->ninfer converter can graft them without the full tree.
 
-Read-only on the FP8 source; writes two files under tools/convert/assets/:
-  gdn_controls_fp8_bf16.safetensors   96 bf16 tensors, HF keys, grouped head order VERBATIM
-  gdn_controls_fp8_bf16.manifest.json source id, per-tensor shape/dtype, asset sha256
+The controls are BF16 in every release we use: the FP8 release lists every
+``linear_attn.in_proj_a/b`` in ``quantization_config.modules_to_not_convert``, so it stores
+them unquantized, and the 96 tensors were verified bit-identical to the BF16 release
+(Qwen/Qwen3.8-27B on ModelScope, 96/96 ``torch.equal``). The asset is therefore named after
+the dtype it holds, not after the release it was read from.
+
+Read-only on the source; writes two files under tools/convert/assets/:
+  gdn_controls_bf16.safetensors   96 bf16 tensors, HF keys, grouped head order VERBATIM
+  gdn_controls_bf16.manifest.json source id, per-tensor shape/dtype, asset sha256
 
 The keys are kept as the official HF names
 (`model.language_model.layers.N.linear_attn.in_proj_{a,b}.weight`) so the converter's
-provider maps 1:1 with what it read from the FP8 tree during C1 verification.
+provider maps 1:1 with what it read from the tree during C1 verification.
 
-Run with the ninfer python env:
-  <py> tools/convert/extract_gdn_controls.py [FP8_DIR]
+Run with the ninfer python env (the source defaults to $NINFER_GDN_SOURCE):
+  <py> tools/convert/extract_gdn_controls.py [HF_DIR]
 """
 from __future__ import annotations
 
@@ -25,10 +30,9 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-SRC_DEFAULT = r"E:\LLMs\Qwen3.8-27B-FP8"
 ASSETS = Path(__file__).resolve().parent / "assets"
-ASSET_NAME = "gdn_controls_fp8_bf16.safetensors"
-MANIFEST_NAME = "gdn_controls_fp8_bf16.manifest.json"
+ASSET_NAME = "gdn_controls_bf16.safetensors"
+MANIFEST_NAME = "gdn_controls_bf16.manifest.json"
 EXPECT_ROWS, EXPECT_COLS = 48, 5120   # GDN_VALUE_HEADS, HIDDEN
 
 
@@ -75,6 +79,7 @@ def extract(src: str) -> int:
     manifest = {
         "source_id": os.path.basename(src.rstrip("\\/")),
         "tensor_count": len(manifest_tensors),
+        "dtype": "bfloat16",
         "head_order": "grouped (native HF, VERBATIM - the converter must NOT re-untile)",
         "asset_bytes": len(data),
         "asset_sha256": hashlib.sha256(data).hexdigest(),
@@ -91,4 +96,10 @@ def extract(src: str) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(extract(sys.argv[1] if len(sys.argv) > 1 else SRC_DEFAULT))
+    source = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NINFER_GDN_SOURCE")
+    if not source:
+        raise SystemExit(
+            "usage: extract_gdn_controls.py <HF release directory>\n"
+            "       (or set NINFER_GDN_SOURCE; there is no built-in path)"
+        )
+    sys.exit(extract(source))

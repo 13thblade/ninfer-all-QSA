@@ -1,0 +1,682 @@
+{
+  "asset_bytes": 104889856,
+  "asset_sha256": "05e347c1202c8d76d2575940854bb3c402ac96b0abf32a04d846c31f28640815",
+  "git_note": "*.safetensors is gitignored; ship as a GitHub Release attachment verified against asset_sha256, or rebuild from a donor GGUF",
+  "precision": "BF16 projections + F32 norms (per-tensor dtype below)",
+  "source_donor": "Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf",
+  "tensor_count": 80,
+  "tensors": {
+    "blk.11.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "a16b1b27e27148747d664a1829ae13632fcc345a61a53f50f381cf1eef725fb6",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.11.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "ea98a99652dd9ee0a8434f42fa68af18dcfb67d0f1c94256a8b85d650259cec1",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.11.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "c6c7783f332905c6c41a84496caa946bfac18eb494ba2f54c4bcb80fee7e3412",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.11.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "2450bb1af81f7b187c812d257ec1979b5324f1a16bc4e266ac996695175f1c7f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.11.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "9deeaca8e022ce5d7a8dc8df1f6d8e02f8b6745c3c871c7b02f7eaa26ab2c83a",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.15.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "18ce6e8095375994b7b7cb4c887eb48cac927f678d600e6946170e0ce4892657",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.15.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "6311fc217f47ac56a0e729a8400ab7cc06721aedc001a5b211b7b2f8274fd064",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.15.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "6423a89755404f136e77b48ff41ace329232570e11a2efe9a82c257ed1a10a56",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.15.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "6b84ad28d89c76f245a3ac404e7826514667abada1b411e39f2043446877e948",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.15.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "8426f2b1fc6759204ad8ff2e34fb39d5fa3dfaf8d22e8d7f2dd207977d46499a",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.19.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "7538128061906b62bc2573636ccaacc21ea16c161e6de937cc320e6675c112d5",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.19.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "2b9dbad6a1c9aa4fd5cce6e90ae177c0130ef492d3fd692941c5b7f25543f200",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.19.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "15058830a21b58201fc0792cba06d78fc5551e2f1719e2bcf60e39fb4ede9d71",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.19.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "79d26e504423ff2d2e7119886425481fc82cbc6aa1c15b994ad3c52e58bb121f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.19.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "5eccb00914eed7288acb3d47afb73175060229d5619488308caf316030a98859",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.23.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "8ab85d872bbf309404a81f0caa5f3aa27338aae8d09171adea639b105221eb6d",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.23.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f7253eea703d42794964567782b0cab1b58d3e0dbe7aa0258da8f3079761a924",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.23.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "b492d3e5e22a88f9b8664e627611c1b36241a483b444689e6330432043e9bd53",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.23.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "da2a72a49e8b81366437156ac5f8ee5345be21e9ae0d6a925166a4951ba7902c",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.23.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "895f88aa8b91fb25d0a4c94388b0aa067a475416f857aad74582d53e52d58e73",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.27.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "71db375bc0c301041a4557579fa898114699d0804cd0abac260968f7cf262e42",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.27.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "8ed11df7239726a578f035b330afbca33f1182d2559ebae412a39382db98a05c",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.27.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "f0159a5692b43139230e1e5b4efb0cc533bd50b1402a0d9bcffd2aecbc13bedf",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.27.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "3e197f4fe020bee1cb00a93b6396838468237204066010fa7743d65b00fdeecb",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.27.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "d08c3f5ac59fb6aad5359d93eb42018e26472e470ad4da044df0983e9da89da5",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.3.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "3827f4deebcd0043e1f94b61aa1717ea71e109e7f2c74d2fda1b28a30fc55aa2",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.3.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "816ffa1d98763443c3cd37e2c1802ea665dc780991b139e041c8c9532705b666",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.3.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "44f4f79c29f36bd2be7fdbcb059c2d7d860b61ddb542b5e401648af5b6bb21a8",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.3.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "872a740188a44f5596cdfeae96c0d0f39085c02795e5eb57ab014502626f13f3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.3.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "0c55f58c624ad30c70942d866463befb4b6ff2807d545da699fd5a0eed426d8b",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.31.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "4de501ee22511580fe257c3cc2c3c1c7f8cec00c072888b6644b68f7c87c89fb",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.31.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f9d1028a770113f5f8994cd20f5efe73b35bb756eb0d7155b35973bfba1b6b24",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.31.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "200eb83424e63b386c3f1b2d7a7b3ef8464ed6c367c85020f3a355192d7f251a",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.31.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "c283853167b4074e79739cc569aafbe21414ad07d2975a25b1afe1ab82871181",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.31.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "889fd80e9ac1ecb621560ac438b5b2097d9afe6742a7a5ca91ea2d2ffcb4ca44",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.35.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "e0f258a750bef5bbfe909d42a638457aae695aa74de00d57e8b17a756e677cf3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.35.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5c42cdb4cffecd4df706aaf53df87136ab2eb396dac69fa283ff09618bf17d66",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.35.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "97ebb6819f220373df8f41667b4e1d93167b7d2e7016e461027ecbf59e5ba79f",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.35.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5d6da354cc189c0efa82ee0ec974837a91a006c33c0c92b5bad800285bd03afa",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.35.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "e8908950b30a7eccc4b8124b3aaecd5459600944c3dc4af06801e0a2073615c0",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.39.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "b2489b607565e5465a14e1e21dcf89f9c0edd9e92b0ec96d10a235d7ea4871c5",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.39.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "950ca1b1913fef0ee2fec645712a87a60e613fdd5b48815f8420aaf98cbcb465",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.39.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "9aa7766357937017e1748c10ff9a475d32fb5d109b8d37b2598e5f6768bdd2ea",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.39.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "cc51912d76efe525332b62c6435821d8aeca2a2cd77fc4b2e20c85e2c7275d81",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.39.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "e51a38f37cfadec5c27deba5123f60ac13e874fd7a3c5b3ef71d48a352e7072d",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.43.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "2338f2cad11df6ef6f6461c0831471e24eca474d1eca8a3d4ee3cd0200352b5b",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.43.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e3634f2426c8e8c19cbb2b3e125a5cf27c662c0540ff76d8759cc2acdeda77f1",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.43.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "a85cfb8f795cf54d848291e539eac7fb57f24ec97d9b5bcf6797f73c07d50a04",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.43.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "a477467b77044dda545b4fa3c94fc45534c238d0c0b229ca134916bd804ac31d",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.43.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "ebaa28dc4616d90616749fadefbfb808f18949b0703b14e5c38a83270f84ab4e",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.47.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "27602b7eb7720946882f9f931a936a12d71ae7861831698c019530e2b115dd99",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.47.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "666986c1be0aad8dfa35cecb5935445c2f5a1f38b49e053cecf416e8d3d239fe",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.47.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "ae50511c7f8e01ea677dc5b96a2419e9fb3a7886d3ca770bde9be930afa4183b",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.47.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5edb22a35f45747bec79b4829dc955c96f6eccc86dfd66cdd0f41a49e949d7c3",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.47.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "80912588b8c3d05af902e0ee59392838772eadcbafdab28696ceaef992f35056",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.51.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "9811ba03be87bd78be70f704c5f4838b1e4dbfc6a2b89cbe3cbd0ff2b82afe76",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.51.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "44ae8dad654c2e961191c810e1a014c331d84259fd986c0bb426e80224c93acf",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.51.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "0d2652da39e0ec8fe738c78b008a1f4e9057bb06c7a975bb4e46252c74d82afe",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.51.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "29f04fbb31c9496d19d08071644bfa96fedf1d7f7454641d867f7333db79e436",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.51.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "80fcbcb31de36e05406655efce1ef1d6749ab1661e3e6b0c6ac4f4a7255de648",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.55.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "745ca6043fb8b4aa1440152c3f0b72e6959f79d3d700ee7ffa412ae42fc850a4",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.55.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "85c40f0a343c9c241ca652a9ac34ed1fa157b67cdc1b025ce51d7bc92cfcca18",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.55.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "717746bd4f39c01ce273f50d2d14469057e7cd7111ab1cc13680e08c1ae35ba9",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.55.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "cab41f2bdb5bf8c388d8466ac694bfdf02d77a095ffec82a4e8e5bdc29b790b0",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.55.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "8c6adf7b575d17e53ae004d7c46ea547ddc04e15221ea2d945ab69e9e1722d25",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.59.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "82e505841936410b3a963328e2ea78d9cd8f7ea290b871c43c0d28041cf2e568",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.59.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "20a5f91e9f36370bf2e60626c2714e3cc947a92d5381c7ab9ec4ccc6e109494e",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.59.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "832ac98f3b8db1fca1d02d21451b19251a821c269e07371b8b3b8321febc2197",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.59.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "a58d704ca482baf985ae144853ccfe40b04d3663a2d7853822b9088ec9c94e21",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.59.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "8f40b50efcd680a079b9bb98695a9a73f8cae0c620ec92f48c9cc48d374302c2",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.63.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "7133fa4f04ef00f4f83dd604b85bb395665dfd4911260764be9a1e0bd66c56a2",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.63.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "36cf56d171c6428adb712bf57cc6cc1a5bbab7863a3e1d4774ed57209be04be9",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.63.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "94d7318d0cb983510c5adbf0e47778334ef237e051889cc6bb3ce1284177ac02",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.63.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e755aee6fc1255b6f9496bf71a1c7c385e22ad9816a6074e9fc822db23c854d7",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.63.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "099303444fdfb76aa79306c5d81eb246321696cb0be909c2c818d4cbdb2142d0",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.7.indexer.k_norm.pre_weight": {
+      "dtype": "F32",
+      "sha256": "2d8deed87ae132d49244b815ea409b35e4fed81a283a98e3b840dfbdd22bb3fd",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.7.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "da8f67fc718944310fb7b9a07845ac8488a95461211d0c67a6649e01b05be973",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.7.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "93234a3ab70e32b53110fd9b2c98ab5e94457aa7e017ecc72ad3c3e6f848b894",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    },
+    "blk.7.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "70b8583b4c9e26cc19656c9530e48aad2e676865f5b8ff8e989b950d71829f8f",
+      "shape": [
+        128
+      ],
+      "stored": "verbatim donor value (norm, still carries 1 + w; F32 for the exact un-fold before the BF16 cast)"
+    },
+    "blk.7.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "fd0023720aef5d9d6cff917b537e32b17022bf1b99773d09c999e29461633f3f",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"
+    }
+  }
+}

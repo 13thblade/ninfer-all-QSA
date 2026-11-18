@@ -8,7 +8,7 @@ built from this asset is bit-identical to one built from the donor GGUF.
 Per .gitignore (`*.safetensors`) the asset is NOT committed to git; it ships as a GitHub
 Release attachment (verified against the manifest asset_sha256), or is rebuilt here from a
 donor GGUF. Run with the ninfer python env:
-  <py> tools/convert/extract_indexer_tensors.py [DONOR.gguf]
+  <py> tools/convert/extract_indexer_tensors.py DONOR.gguf   (or set QSA_INDEXER_GGUF)
 """
 from __future__ import annotations
 
@@ -27,10 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.convert import qsa_gguf                      # noqa: E402
 from tools.convert.sources.gguf import GGUFFile          # noqa: E402
 
-DONOR_DEFAULT = r"E:\LLMs\Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf"
 ASSETS = Path(__file__).resolve().parent / "assets"
-ASSET_NAME = "indexer_tensors_fp32.safetensors"
-MANIFEST_NAME = "indexer_tensors_fp32.manifest.json"
+ASSET_NAME = "indexer_tensors.safetensors"
+MANIFEST_NAME = "indexer_tensors.manifest.json"
 
 
 def extract(donor: str) -> int:
@@ -56,12 +55,24 @@ def extract(donor: str) -> int:
             raise SystemExit(f"{name}: shape {tuple(arr.shape)} != expected {tuple(shape)}")
         if not np.isfinite(arr).all():
             raise SystemExit(f"{name}: non-finite indexer weights")
+        # The engine keeps these as BF16, and the two projections are cast straight to BF16 by
+        # the converter (no arithmetic in between), so storing them as BF16 loses nothing and
+        # halves the asset. The three norms must stay F32: the converter subtracts 1.0 (the
+        # stored 1 + w) in F32 *before* the BF16 cast, and bf16(x) - 1 != bf16(x - 1).
+        keep_f32 = any(name.endswith(suffix) for suffix in ("q_norm.weight", "k_norm.weight",
+                                                            "k_norm.pre_weight"))
         t = torch.from_numpy(np.ascontiguousarray(arr.astype(np.float32)))
+        if not keep_f32:
+            t = t.to(torch.bfloat16)
         tensors[name] = t
         manifest_tensors[name] = {
-            "dtype": "F32", "shape": list(shape),
-            "sha256": hashlib.sha256(t.numpy().tobytes()).hexdigest(),
-            "stored": "verbatim donor value (norms still carry 1 + w)",
+            "dtype": "F32" if keep_f32 else "BF16",
+            "shape": list(shape),
+            "sha256": hashlib.sha256(t.view(torch.uint16).numpy().tobytes()).hexdigest(),
+            "stored": ("verbatim donor value (norm, still carries 1 + w; F32 for the exact "
+                       "un-fold before the BF16 cast)"
+                       if keep_f32 else
+                       "donor F32 rounded to BF16 (the converter casts these to BF16 anyway)"),
         }
 
     ASSETS.mkdir(exist_ok=True)
@@ -72,7 +83,7 @@ def extract(donor: str) -> int:
     manifest = {
         "source_donor": donor_path.name,
         "tensor_count": len(manifest_tensors),
-        "precision": "F32 (donor native, verbatim)",
+        "precision": "BF16 projections + F32 norms (per-tensor dtype below)",
         "asset_bytes": len(data),
         "asset_sha256": hashlib.sha256(data).hexdigest(),
         "tensors": manifest_tensors,
@@ -88,4 +99,10 @@ def extract(donor: str) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(extract(sys.argv[1] if len(sys.argv) > 1 else DONOR_DEFAULT))
+    donor = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("QSA_INDEXER_GGUF")
+    if not donor:
+        raise SystemExit(
+            "usage: extract_indexer_tensors.py DONOR.gguf "
+            "(or set QSA_INDEXER_GGUF; there is no built-in path)"
+        )
+    sys.exit(extract(donor))

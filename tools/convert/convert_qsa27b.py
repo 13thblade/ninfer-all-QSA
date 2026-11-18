@@ -47,8 +47,8 @@ ROOT = Path(__file__).resolve().parents[2]
 GRAFT_RECIPE = ROOT / "tools" / "convert" / "qsa_graft_recipe.py"
 OFFICIAL_RECIPE = "qwen3_8_27b_qsa_gguf"
 
-#: The donor this machine already has; only a fallback when --donor is omitted.
-LOCAL_DONOR = Path("E:/LLMs/Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf")
+#: The donor comes from ``--donor`` or $QSA_INDEXER_GGUF only: no machine-local default, so a
+#: missing donor fails loudly instead of silently reading someone else's checkout path.
 DONOR_ENV = "QSA_INDEXER_GGUF"
 
 
@@ -58,7 +58,7 @@ def run(argv: list[str]) -> int:
 
 
 def resolve_donor(explicit: Path | None) -> Path | None:
-    for candidate in (explicit, os.environ.get(DONOR_ENV), LOCAL_DONOR):
+    for candidate in (explicit, os.environ.get(DONOR_ENV)):
         if candidate is None:
             continue
         path = Path(candidate)
@@ -106,17 +106,25 @@ def preflight(gguf_path: Path, donor_path: Path | None, *, check: bool) -> tuple
         block_count = source.kv.get("qwen35.block_count")
 
     if not already and check:
-        if donor_path is None:
+        from tools.convert.qsa_gguf import has_indexer_asset, indexer_asset_path
+
+        if donor_path is None and not has_indexer_asset():
             raise SystemExit(
-                "error: this GGUF has no QSA indexer tensors and no donor was given;\n"
-                "       pass --donor <Qwen3.8-27B-QSA>.gguf (or set QSA_INDEXER_GGUF),\n"
-                "       or use an already-grafted GGUF"
+                "error: this GGUF has no QSA indexer tensors and neither a donor nor the "
+                "indexer asset is available;\n"
+                "       pass --donor <Qwen3.8-27B-QSA>.gguf (or set QSA_INDEXER_GGUF, or "
+                "NINFER_QSA_INDEXER_ASSET),\n"
+                "       build the asset with tools/convert/extract_indexer_tensors.py "
+                "<DONOR.gguf>, or use an already-grafted GGUF"
             )
-        with GGUFFile(donor_path) as donor:
-            print(f"donor    : {donor_path}")
-            print(f"           {donor.file_bytes:,} bytes, {len(donor.tensors)} tensors")
-            graft.check_donor(donor, block_count=block_count)
-            print("validate : PASS (QSA donor)")
+        if donor_path is None:
+            print(f"indexer  : asset {indexer_asset_path()}")
+        else:
+            with GGUFFile(donor_path) as donor:
+                print(f"donor    : {donor_path}")
+                print(f"           {donor.file_bytes:,} bytes, {len(donor.tensors)} tensors")
+                graft.check_donor(donor, block_count=block_count)
+                print("validate : PASS (QSA donor)")
     return already, mtp
 
 
@@ -135,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the source GGUF: stock (needs --donor) or already QSA-grafted")
     p.add_argument("--donor", type=Path, default=None,
                    help="Qwen3.8-27B-QSA GGUF that carries the 80 F32 indexer tensors "
-                        f"(default: ${DONOR_ENV}, then {LOCAL_DONOR})")
+                        f"(default: ${DONOR_ENV}; there is no built-in path)")
     p.add_argument("--vision", type=Path, default=None, help="mmproj-BF16.gguf")
     p.add_argument("--dflash2", type=Path, default=None,
                    help="the infer-dflash2 official weight directory")
@@ -184,12 +192,20 @@ def main() -> int:
     else:
         donor = resolve_donor(args.donor)
         if donor is None:
-            raise SystemExit(
-                "error: this GGUF has no QSA indexer tensors and no donor was found;\n"
-                f"       pass --donor <Qwen3.8-27B-QSA>.gguf or set {DONOR_ENV}"
-            )
-        print(f"plan     : graft 80 indexer tensors from {donor.name} during conversion "
-              f"(no intermediate GGUF)", flush=True)
+            from tools.convert.qsa_gguf import has_indexer_asset
+
+            if not has_indexer_asset():
+                raise SystemExit(
+                    "error: this GGUF has no QSA indexer tensors and no donor was found;\n"
+                    f"       pass --donor <Qwen3.8-27B-QSA>.gguf or set {DONOR_ENV},\n"
+                    "       or build the indexer asset with "
+                    "tools/convert/extract_indexer_tensors.py <DONOR.gguf>"
+                )
+            print("plan     : graft 80 indexer tensors from the indexer asset during "
+                  "conversion (no donor, no intermediate GGUF)", flush=True)
+        else:
+            print(f"plan     : graft 80 indexer tensors from {donor.name} during conversion "
+                  f"(no intermediate GGUF)", flush=True)
         recipe = f"{GRAFT_RECIPE}:graft_qsa_indexer"
     if "mtp" in components and not mtp:
         p.error(f"--components includes mtp but {args.gguf.name} has no blk.64.nextn.* tensors")

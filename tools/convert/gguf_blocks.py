@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from typing import Callable
 
 import numpy as np
@@ -384,11 +385,13 @@ def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
     return block_source(gguf, "output.weight", shape, rows()), True
 
 
-GDN_CONTROLS_FP8_ENV = "NINFER_GDN_CONTROLS_FP8"
-# Default graft source = the committed compact asset of native BF16 GDN controls; the env
-# override may point at this asset file OR at a full FP8 HF directory (compat).
+GDN_CONTROLS_ENV = "NINFER_GDN_CONTROLS_BF16"
+# Default graft source = the compact asset of the native BF16 GDN controls. The values are the
+# BF16 release's own BF16 words (verified bit-identical to the FP8 release's unquantized
+# in_proj_a/b, which that release lists in modules_to_not_convert); the env override may point
+# at this asset file OR at a full HF directory holding the same tensors.
 _GDN_ASSET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "assets", "gdn_controls_fp8_bf16.safetensors")
+                               "assets", "gdn_controls_bf16.safetensors")
 _GDN_CONTROL_KEY = re.compile(r"^blk\.(\d+)\.ssm_(alpha|beta)\.weight$")
 _native_controls_state: list = [None, False]   # [provider | None, probed?]
 _native_sanity_done: list = [False]
@@ -416,7 +419,7 @@ class _NativeGdnControls:
             index = os.path.join(source, "model.safetensors.index.json")
             if not os.path.exists(index):
                 raise ValueError(
-                    f"{GDN_CONTROLS_FP8_ENV}: {source} is neither an asset file nor an HF release directory")
+                    f"{GDN_CONTROLS_ENV}: {source} is neither an asset file nor an HF release directory")
             self.wm = json.load(open(index, encoding="utf-8"))["weight_map"]
 
     def get(self, layer: int, role: str):
@@ -442,11 +445,24 @@ class _NativeGdnControls:
 
 def _native_gdn_controls():
     if not _native_controls_state[1]:
-        raw = os.environ.get(GDN_CONTROLS_FP8_ENV)
+        raw = os.environ.get(GDN_CONTROLS_ENV)
         if raw is not None and raw.strip().lower() in ("off", "none", "0"):
             source = None                                  # explicit disable -> original path
         else:
             source = raw or (_GDN_ASSET_PATH if os.path.exists(_GDN_ASSET_PATH) else None)
+            if source is None:
+                # The asset is not committed and *.safetensors is gitignored, so a fresh
+                # checkout would otherwise graft nothing and say nothing. Degrading here is
+                # legal but must be visible: the GDN controls then come from the (quantized)
+                # GGUF, which measurably changes generation.
+                print(
+                    f"warning: {GDN_CONTROLS_ENV} is unset and the native BF16 GDN control "
+                    f"asset is missing ({_GDN_ASSET_PATH}); the GDN controls will be taken "
+                    "from the GGUF as stored. Generate the asset with "
+                    "tools/convert/extract_gdn_controls.py or set "
+                    f"{GDN_CONTROLS_ENV}=off to silence this.",
+                    file=sys.stderr,
+                )
         _native_controls_state[0] = _NativeGdnControls(source) if source else None
         _native_controls_state[1] = True
     return _native_controls_state[0]
@@ -488,7 +504,7 @@ def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
                     else untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1))
                 if not _native_matches_release(native, gguf_grouped):
                     raise ValueError(
-                        f"{GDN_CONTROLS_FP8_ENV}: the native FP8 GDN controls do not match the "
+                        f"{GDN_CONTROLS_ENV}: the native BF16 GDN controls do not match the "
                         f"release's grouped order at {tensor}; the configured source is not the "
                         "same model as this GGUF (or is in an unexpected head order).")
                 _native_sanity_done[0] = True

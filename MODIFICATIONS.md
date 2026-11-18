@@ -280,8 +280,8 @@ tools/bench (3)
 
 tools/convert/assets (2)
 
-- `tools/convert/assets/gdn_controls_fp8_bf16.manifest.json`
-- `tools/convert/assets/indexer_tensors_fp32.manifest.json`
+- `tools/convert/assets/gdn_controls_bf16.manifest.json`
+- `tools/convert/assets/indexer_tensors.manifest.json`
 
 tools/convert (5)
 

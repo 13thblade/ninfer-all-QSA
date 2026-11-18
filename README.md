@@ -50,7 +50,7 @@ PPL：无论是不开 QSA 的默认 dense 路径，还是开启 QSA 的路径（
 相对上游转换脚本，本 fork 的差异：
 
 1. **QSA 索引器嫁接**（`convert_qsa27b.py` + `qsa_graft_recipe.py`）：在同一次转换里，把 stock 27B GGUF 的 866 个张量按其原始 ggml 块 byte-for-byte 导入，再从 QSA donor GGUF 追加 80 个 F32 `blk.N.indexer.*` 张量，全程不落中间的 grafted GGUF。上游没有这条嫁接路径。
-2. **GDN A/B 控制原生 BF16 无损嫁接**（`gguf_blocks.py`，配合新增的 `extract_gdn_controls.py` 与资产 `tools/convert/assets/gdn_controls_fp8_bf16.safetensors`）：上游的 `gdn_control_source` 会把量化发布里的 `ssm_alpha/ssm_beta` 一律「反量化 → 舍入到 BF16」（一次有损还原）；本 fork 默认改从官方 `Qwen3.8-27B-FP8` 的原生 BF16 `in_proj_a/in_proj_b`（本就是 grouped 头序）无损直存进 `a_projection/b_projection`，且**绝不再 `untile`**（否则头序错位）。由环境变量 `NINFER_GDN_CONTROLS_FP8` 控制：默认读工作树资产；可覆盖为一个 FP8 目录；设为 `off` 则完全回退上游原行为（零回归）；资产缺失时自动回退。附带一次性头序自检，源与发布不匹配即报错。
+2. **GDN A/B 控制原生 BF16 无损嫁接**（`gguf_blocks.py`，配合新增的 `extract_gdn_controls.py` 与资产 `tools/convert/assets/gdn_controls_bf16.safetensors`）：上游的 `gdn_control_source` 会把量化发布里的 `ssm_alpha/ssm_beta` 一律「反量化 → 舍入到 BF16」（一次有损还原）；本 fork 默认改从官方 `Qwen3.8-27B-FP8` 的原生 BF16 `in_proj_a/in_proj_b`（本就是 grouped 头序）无损直存进 `a_projection/b_projection`，且**绝不再 `untile`**（否则头序错位）。由环境变量 `NINFER_GDN_CONTROLS_BF16` 控制：默认读工作树资产；可覆盖为一个 FP8 目录；设为 `off` 则完全回退上游原行为（零回归）；资产缺失时自动回退。附带一次性头序自检，源与发布不匹配即报错。
 3. 其余转换能力（ternary、vision/mmproj、DFlash2、GGUF native 块导入等）继承上游。
 
 ```bash
@@ -60,8 +60,8 @@ python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B 目录> \
   --dflash2 <dflash2 目录> --out <out.ninfer> --device cpu
 
 # 需要完全复刻上游反量化行为时
-#   Windows:  set NINFER_GDN_CONTROLS_FP8=off
-#   或指定整棵 FP8 目录作源:  set NINFER_GDN_CONTROLS_FP8=<Qwen3.8-27B-FP8 目录>
+#   Windows:  set NINFER_GDN_CONTROLS_BF16=off
+#   或指定整棵 FP8 目录作源:  set NINFER_GDN_CONTROLS_BF16=<Qwen3.8-27B-FP8 目录>
 ```
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
@@ -118,7 +118,7 @@ PPL: whether the default dense path without QSA, or the QSA path (whose prefill 
 Differences from the upstream conversion scripts:
 
 1. **QSA indexer graft** (`convert_qsa27b.py` + `qsa_graft_recipe.py`): in a single pass it imports the 866 tensors of a stock 27B GGUF byte-for-byte in their original ggml block formats, then appends the 80 F32 `blk.N.indexer.*` tensors from a QSA donor GGUF, without ever writing an intermediate grafted GGUF. Upstream has no such graft path.
-2. **GDN A/B controls grafted losslessly from native BF16** (`gguf_blocks.py`, with the new `extract_gdn_controls.py` and the asset `tools/convert/assets/gdn_controls_fp8_bf16.safetensors`): upstream's `gdn_control_source` dequantizes the `ssm_alpha/ssm_beta` of a quantized release and rounds to BF16 (one lossy round-trip); this fork instead reads the official `Qwen3.8-27B-FP8` native BF16 `in_proj_a/in_proj_b` (already in grouped head order) straight into `a_projection/b_projection`, and never re-`untile`s them (which would misalign the heads). The environment variable `NINFER_GDN_CONTROLS_FP8` controls it: by default it reads the committed asset; it may be set to a full FP8 directory; setting it to `off` restores the upstream dequant behavior exactly (zero regression); and if the asset is missing it falls back to the original path. A one-time head-order self-check raises if the source and the release are not the same model.
+2. **GDN A/B controls grafted losslessly from native BF16** (`gguf_blocks.py`, with the new `extract_gdn_controls.py` and the asset `tools/convert/assets/gdn_controls_bf16.safetensors`): upstream's `gdn_control_source` dequantizes the `ssm_alpha/ssm_beta` of a quantized release and rounds to BF16 (one lossy round-trip); this fork instead reads the official `Qwen3.8-27B-FP8` native BF16 `in_proj_a/in_proj_b` (already in grouped head order) straight into `a_projection/b_projection`, and never re-`untile`s them (which would misalign the heads). The environment variable `NINFER_GDN_CONTROLS_BF16` controls it: by default it reads the committed asset; it may be set to a full FP8 directory; setting it to `off` restores the upstream dequant behavior exactly (zero regression); and if the asset is missing it falls back to the original path. A one-time head-order self-check raises if the source and the release are not the same model.
 3. All other conversion capabilities (ternary, vision/mmproj, DFlash2, GGUF native block import, etc.) are inherited from upstream.
 
 ```bash
@@ -128,8 +128,8 @@ python tools/convert/convert_qsa27b.py --base-model <Qwen3.8-27B dir> \
   --dflash2 <dflash2 dir> --out <out.ninfer> --device cpu
 
 # To reproduce the upstream dequant behavior exactly:
-#   Windows:  set NINFER_GDN_CONTROLS_FP8=off
-#   or point at the whole FP8 tree as the source:  set NINFER_GDN_CONTROLS_FP8=<Qwen3.8-27B-FP8 dir>
+#   Windows:  set NINFER_GDN_CONTROLS_BF16=off
+#   or point at the whole FP8 tree as the source:  set NINFER_GDN_CONTROLS_BF16=<Qwen3.8-27B-FP8 dir>
 ```
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.

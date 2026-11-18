@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -157,8 +158,9 @@ def sources(gguf: GGUFFile) -> dict[str, LogicalSource]:
 # below applies the SAME -1.0 un-fold and BF16 cast as sources(), so an asset graft is
 # bit-identical to a donor-GGUF graft.
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-INDEXER_ASSET_NAME = "indexer_tensors_fp32.safetensors"
+INDEXER_ASSET_NAME = "indexer_tensors.safetensors"
 INDEXER_ASSET_ENV = "NINFER_QSA_INDEXER_ASSET"
+_indexer_warned: list = [False]
 
 
 def indexer_asset_path() -> Path | None:
@@ -171,7 +173,20 @@ def indexer_asset_path() -> Path | None:
             raise ValueError(f"{INDEXER_ASSET_ENV}: {path} is not an indexer asset file")
         return path
     default = _ASSETS_DIR / INDEXER_ASSET_NAME
-    return default if default.is_file() else None
+    if default.is_file():
+        return default
+    if not _indexer_warned[0]:
+        # *.safetensors is gitignored, so a fresh checkout has the manifest but no payload.
+        # The graft then needs a donor GGUF, which is correct but must be visible up front.
+        print(
+            f"warning: {INDEXER_ASSET_ENV} is unset and the QSA indexer asset is missing "
+            f"({default}); the graft will read the 80 indexer tensors from a donor GGUF "
+            "(pass --donor / --source indexer=<GGUF>, or build the asset with "
+            "tools/convert/extract_indexer_tensors.py <DONOR.gguf>).",
+            file=sys.stderr,
+        )
+        _indexer_warned[0] = True
+    return None
 
 
 def has_indexer_asset() -> bool:
@@ -197,7 +212,10 @@ def sources_from_asset(path: Path | None = None) -> dict[str, LogicalSource]:
         for layer in qsa_layers():
             for role in ROLES:
                 name = gguf_tensor(layer, role)
-                words = handle.get_tensor(name).detach().to("cpu").numpy().astype(np.float32)
+                # Stored as F32 for the three norms and BF16 for the two projections (the
+                # converter casts those to BF16 anyway); go through F32 so either dtype works.
+                words = (handle.get_tensor(name).detach().to("cpu").to(torch.float32)
+                         .numpy().astype(np.float32))
                 if tuple(words.shape) != tuple(_SHAPES[role]):
                     raise ValueError(
                         f"{name}: asset shape {tuple(words.shape)} != expected {_SHAPES[role]}")
