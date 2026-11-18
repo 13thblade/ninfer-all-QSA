@@ -1,6 +1,12 @@
 #include "models/qwen3_5/program/prefix/qsa_continuation.h"
 
+#include "core/dtype.h"
+#include "ops/kv_cache/d256_profile.h"
+
+#include <algorithm>
+#include <cstring>
 #include <new>
+#include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -18,6 +24,62 @@ std::byte* allocate_pages(std::size_t bytes, std::size_t page_bytes) {
 
 void QsaContinuationStore::AlignedDeleter::operator()(std::byte* p) const noexcept {
     ::operator delete(p, std::align_val_t(page_bytes));
+}
+
+std::uint32_t qsa_kv_bytes_per_head_token(ninfer::KvCacheStorage storage) {
+    // Same four planes the engine sizes its streamed host copy with (program_impl.cpp:772-807):
+    // key codes, value codes, key scale, value scale. A zero leading extent means no scale plane.
+    const auto p = ninfer::ops::d256_kv_cache_profile(storage);
+    std::uint32_t bytes = 0;
+    bytes += static_cast<std::uint32_t>(p.key_leading_extent) *
+             static_cast<std::uint32_t>(ninfer::dtype_size(p.key_code_dtype));
+    bytes += static_cast<std::uint32_t>(p.value_leading_extent) *
+             static_cast<std::uint32_t>(ninfer::dtype_size(p.value_code_dtype));
+    bytes += static_cast<std::uint32_t>(p.scale_leading_extent) *
+             static_cast<std::uint32_t>(ninfer::dtype_size(p.key_scale_dtype));
+    bytes += static_cast<std::uint32_t>(p.value_scale_leading_extent) *
+             static_cast<std::uint32_t>(ninfer::dtype_size(p.value_scale_dtype));
+    return bytes;
+}
+
+std::uint64_t qsa_image_bytes(std::uint32_t position, const QsaImageGeometry& g) {
+    if (position == 0) { return 0; }
+    const std::uint64_t used = (std::uint64_t(position) + g.page_tokens - 1) / g.page_tokens;
+    const std::uint64_t blocks = std::uint64_t(position) / g.compress_ratio;
+    // One layer's KV: all 4 planes of every head over `used` whole pages.
+    const std::uint64_t kv_per_layer =
+        std::uint64_t(used) * g.page_tokens * g.kv_heads * g.kv_bytes_per_head_token;
+    const std::uint64_t pooled_per_layer =
+        std::uint64_t(g.indexer_head_dim) * 4 * blocks;
+    const std::uint64_t tail_per_layer =
+        std::uint64_t(g.indexer_head_dim) * (g.compress_ratio - 1) * 4;
+    const std::uint64_t axes_per_layer = 3ULL * 3 * 4;
+    const std::uint64_t per_layer = kv_per_layer + pooled_per_layer + tail_per_layer + axes_per_layer;
+    return per_layer * g.full_layers + g.recurrent_bytes + g.mtp_bytes;
+}
+
+void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
+                    std::size_t page_bytes, bool save) {
+    std::uint64_t total = 0;
+    for (const ImageRegion& region : regions) { total += region.bytes; }
+    if (page_bytes == 0 ||
+        pages.size() < (total + page_bytes - 1) / page_bytes) {
+        throw std::invalid_argument("qsa image: the pages do not hold the image");
+    }
+    std::uint64_t at = 0;
+    for (const ImageRegion& region : regions) {
+        std::size_t left = region.bytes;
+        auto* cursor = const_cast<std::byte*>(region.data);
+        while (left > 0) {
+            const std::size_t in_page = std::min<std::size_t>(left, page_bytes - at % page_bytes);
+            std::byte* host = pages[at / page_bytes] + at % page_bytes;
+            if (save) { std::memcpy(host, cursor, in_page); }
+            else { std::memcpy(cursor, host, in_page); }
+            cursor += in_page;
+            left -= in_page;
+            at += in_page;
+        }
+    }
 }
 
 std::uint64_t QsaContinuationStore::page_rounded(std::uint64_t bytes, std::size_t page_bytes) {

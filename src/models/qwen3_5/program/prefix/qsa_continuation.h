@@ -12,6 +12,7 @@
 // Nothing here changes admission yet: S1 only records and logs.
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "ninfer/kv_cache_storage.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -90,6 +91,53 @@ inline void qsa_reuse_trace(std::uint32_t lane, std::uint32_t live, std::uint32_
                  lane, live, anchored, store, chosen, scanned, max_held);
     std::fflush(stderr);
 }
+
+// ---- The image layout (S3) -------------------------------------------------------------------
+// This fork's image_regions(position), independent of StateImage (which S6 removes). The layout
+// is a fixed byte order; the store (S2) only keeps opaque pages of image_bytes(position) length.
+//   per full-attention layer, in layer order:
+//     [text KV]     `used` host pages per K/V plane (used = ceil(position / page_tokens))
+//     [QSA pooled]  indexer_head_dim * 4 * blocks  (blocks = position / compress_ratio)
+//     [QSA tail]    indexer_head_dim * (compress_ratio - 1) * 4
+//     [QSA axes]    3 * 3 * 4                       <- this fork adds the tail M-RoPE axes
+//   then the recurrent state (ssm, conv, tail, history) and, when enabled, the MTP block.
+// All numbers come from the config of the model that owns the store, so the geometry is explicit.
+
+struct QsaImageGeometry {
+    std::uint32_t page_tokens        = 128; // kPagedKVPageSize: positions per host KV page
+    std::uint32_t kv_heads           = 4;   // num_key_value_heads of the full-attention layers
+    std::uint32_t full_layers        = 16;  // number of streamed full-attention layers
+    // Bytes of all KV planes (K, V, K-scale, V-scale) for one head and one token. Never hardcode
+    // this: it depends on --kv-dtype. Set it from qsa_kv_bytes_per_head_token(storage) below so
+    // bf16 / int8 / rk4v4 / fp8 / nvfp4 / bf16p are all handled by the upstream profile.
+    std::uint32_t kv_bytes_per_head_token = 0;
+    std::uint32_t indexer_head_dim   = 128;
+    std::uint32_t compress_ratio     = 4;   // indexer_compress_ratio
+    std::uint64_t recurrent_bytes    = 0;   // total ssm+conv+tail+history across all layers
+    std::uint64_t mtp_bytes          = 0;   // MTP KV + tail + pending, zero when disabled
+};
+
+// Bytes of the four KV planes for one head and one token, from the upstream D256 profile of
+// `storage` (the same table the engine uses to size its streamed host planes). Covers bf16, int8,
+// fp8, rk4v4/rk8v4, nvfp4, k8v4 and bf16p. `head_dim` is the D256 profile's head dimension.
+[[nodiscard]] std::uint32_t qsa_kv_bytes_per_head_token(ninfer::KvCacheStorage storage);
+
+// Exact image bytes at `position` (no page rounding - the store rounds). Upstream image_bytes is
+// the sum of image_regions' bytes; this is its geometry-only form so it can be checked host-side.
+[[nodiscard]] std::uint64_t qsa_image_bytes(std::uint32_t position, const QsaImageGeometry& g);
+
+// One ordered region of an image: `bytes` consecutive bytes from `data`. S4 fills `data` from the
+// lane's authoritative host planes; save copies regions -> pages, load pages -> regions.
+struct ImageRegion {
+    const std::byte* data = nullptr; // save source / load destination (load casts away const)
+    std::size_t bytes     = 0;
+};
+
+// Copies between the ordered regions and 8 MiB pages in image byte order. Upstream copy_image
+// (:7468) sliced per page; here both ends are host memory (streamed tier is host-authoritative),
+// so a plain memcpy per slice suffices and no CUDA stream is involved.
+void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
+                    std::size_t page_bytes, bool save);
 
 // ---- The image store (S2) --------------------------------------------------------------------
 // Upstream qwen4_exp_core.cpp:743-767, 1446-1527 translated to a host-only, GPU-free component.
