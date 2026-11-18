@@ -1771,6 +1771,8 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
     if (sequence.kv->backend) {
         backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
     }
+    // --qwen38-27b-qsa: the lane's held prefix follows the frontier it just committed.
+    qsa_note_lane_frontier(sequence, main_tokens);
     if (hybrid_) { hybrid_publish_blocks(sequence); }
 }
 
@@ -1786,6 +1788,9 @@ void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_t
     if (sequence.kv->backend) {
         backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
     }
+    // --qwen38-27b-qsa: a stop-string cut or a tail drop takes the held prefix with it, so the
+    // lane's record ends where the visible text does.
+    qsa_note_lane_frontier(sequence, main_tokens);
 }
 
 void ProgramImpl::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {

@@ -1563,5 +1563,47 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+// ---- QSA streamed-tier lane records -----------------------------------------------------------
+// The prefix each lane's authoritative KV covers, kept the way upstream keeps a slot's fed/anchor
+// pair: `held` follows the KV frontier, `anchor` is the prompt the lane's last turn closed at. Both
+// are advanced only where the frontier actually moves (commit/trim), never derived from another
+// cache's catalog, and the media identity comes from the sequence's own prompt.
+
+void ProgramImpl::qsa_begin_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                        const SequenceState& sequence) {
+    if (!qsa_indexer_state.has_value() || lane >= max_concurrency) { return; }
+    if (qsa_lane_prefix.size() != max_concurrency) { qsa_lane_prefix.resize(max_concurrency); }
+    LanePrefixRecord& record = qsa_lane_prefix[lane];
+    record.clear();
+    record.epoch = lane_epochs[lane];
+    // The media identity of everything this lane will write: the prompt's own cumulative keys,
+    // never the next prompt's.
+    if (!prompt.vision_items.empty()) { record.media = prompt.block_extras; }
+    record.anchor.tokens     = prompt.token_ids;
+    record.anchor.position   = static_cast<std::uint32_t>(prompt.token_ids.size());
+    record.anchor.vision_key = qsa_media_key_at(record.media, record.anchor.position);
+    // The held prefix starts at whatever the KV already covers: a resume begins at its reused
+    // frontier, not at zero.
+    qsa_set_prefix_frontier(record, sequence.ledger, sequence.text_kv_valid);
+}
+
+void ProgramImpl::qsa_note_lane_frontier(const SequenceState& sequence, std::uint32_t frontier) {
+    if (!qsa_indexer_state.has_value() || sequence.lane >= max_concurrency) { return; }
+    if (qsa_lane_prefix.size() != max_concurrency) { qsa_lane_prefix.resize(max_concurrency); }
+    LanePrefixRecord& record = qsa_lane_prefix[sequence.lane];
+    if (record.epoch != lane_epochs[sequence.lane]) {
+        // The lane changed tenants: nothing the record holds belongs to this sequence, and its
+        // media identity is unknown, so the prefix keys as text-only.
+        record.clear();
+        record.epoch = lane_epochs[sequence.lane];
+    }
+    qsa_set_prefix_frontier(record, sequence.ledger, frontier);
+}
+
+void ProgramImpl::qsa_clear_lane_prefix(std::uint32_t lane) noexcept {
+    if (lane >= qsa_lane_prefix.size()) { return; }
+    qsa_lane_prefix[lane].clear();
+}
+
 
 } // namespace ninfer::models::qwen3_5::detail

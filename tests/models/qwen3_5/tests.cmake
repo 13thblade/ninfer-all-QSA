@@ -264,3 +264,9 @@ ninfer_add_test(ninfer_qwen3_5_qsa_stream_fallback_test
 ninfer_add_test(ninfer_qsa_continuation_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_continuation_store.cpp"
   LIBRARIES ninfer_model_runtime)
+
+# One lane's held/anchor record: the frontier follows writes and cuts, and the media identity is
+# the sequence's own (CPU only).
+ninfer_add_test(ninfer_qwen3_5_qsa_lane_prefix_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_lane_prefix.cpp"
+  LIBRARIES ninfer_model_runtime)

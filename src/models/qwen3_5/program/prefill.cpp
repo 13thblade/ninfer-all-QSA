@@ -787,6 +787,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
         }
 
+        // --qwen38-27b-qsa: this lane's record starts with the prompt it was admitted with -- the
+        // media identity of everything it will write, the closure point a later turn continues
+        // from, and the KV the resume already put there.
+        qsa_begin_lane_prefix(lane, staged.prompt, sequence);
+
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
     } catch (...) {

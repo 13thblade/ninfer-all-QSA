@@ -282,45 +282,49 @@ std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<con
 } // namespace
 
 void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
-    // S1: purely observational. Under QSA with tracing on, report the largest `live` prefix any
-    // lane currently holds that continues this prompt. The authoritative media check is the same
-    // `prefix_matches` used by matched_prefix_tokens; HeldPrefix/vision_key is the compact form the
-    // store (S2+) will key on. anchored/store stay zero until their snapshots exist (S4+).
+    // R1: reads the lanes' own records (advanced where the KV frontier moves), not the checkpoint
+    // catalog -- the hybrid cache never fills a catalogued continuation, so a diagnostic built on
+    // one could only ever report zero. The three-way choice is upstream's: the longest of the
+    // stored image, the turn closure (a lane's last prompt) and the endpoint (a lane's live
+    // prefix). The store lands in R4; it is reported so the log has its final shape.
     if (!qsa_indexer_state.has_value() || !qsa_reuse_trace_enabled()) { return; }
-    std::uint32_t best_live   = 0;
-    std::uint32_t best_lane   = 0;
-    std::uint32_t scanned     = 0;
-    std::uint32_t max_held    = 0;
-    const auto& prompt_tokens = prompt.token_ids;
-    // A finished request's sequence moves from Active to Catalogued but keeps its ledger and KV,
-    // so its held prefix is still available. In the --no-prefix-reuse path the engine never walks
-    // these (reuse_search is off), which is exactly why this diagnostic derives them itself.
-    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        const ContinuationSlotRole role = continuation_slots[index].role;
-        if (role != ContinuationSlotRole::Active && role != ContinuationSlotRole::Catalogued) {
+    const std::span<const TokenId> prompt_tokens(prompt.token_ids);
+    std::uint32_t best_live     = 0;
+    std::uint32_t best_anchored = 0;
+    std::uint32_t best_lane     = 0;
+    std::uint32_t scanned       = 0;
+    std::uint32_t max_held      = 0;
+    for (std::size_t lane = 0; lane < qsa_lane_prefix.size(); ++lane) {
+        const LanePrefixRecord& record = qsa_lane_prefix[lane];
+        if (record.epoch == 0 || record.epoch != lane_epochs[lane] || record.held.empty()) {
             continue;
         }
         ++scanned;
-        const SequenceState& sequence = continuation_states[index];
-        if (!sequence.kv || sequence.text_kv_valid == 0) { continue; }
-        const std::size_t held =
-            std::min<std::size_t>(sequence.text_kv_valid, sequence.ledger.size());
-        max_held = std::max(max_held, static_cast<std::uint32_t>(held));
-        HeldPrefix prefix;
-        prefix.tokens.assign(sequence.ledger.begin(), sequence.ledger.begin() + held);
-        prefix.position   = static_cast<std::uint32_t>(prefix.tokens.size());
-        prefix.vision_key = qsa_vision_key_at(prompt, prefix.position);
+        max_held = std::max(max_held, record.held.position);
+        // Each side is keyed at its own length: the lane's media identity describes the tokens it
+        // wrote, the prompt's the same-length prefix of the incoming prompt. Comparing them is
+        // what upstream's media check does unit by unit.
         const std::uint32_t live =
-            qsa_prefix_reuse(prefix, prompt_tokens, prefix.vision_key);
-        // The compact key gates cheaply; the full identity is authoritative (media, token types,
-        // rewrite frontiers, adapter key), matching matched_prefix_tokens.
-        if (live > best_live &&
-            prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, live)) {
-            best_live = live;
-            best_lane = sequence.lane;
+            qsa_prefix_reuse(record.held, prompt_tokens,
+                             qsa_vision_key_at(prompt, record.held.position));
+        const std::uint32_t anchored =
+            record.anchor.empty()
+                ? 0U
+                : qsa_prefix_reuse(record.anchor, prompt_tokens,
+                                   qsa_vision_key_at(prompt, record.anchor.position));
+        if (std::max(live, anchored) > std::max(best_live, best_anchored)) {
+            best_live     = live;
+            best_anchored = anchored;
+            best_lane     = static_cast<std::uint32_t>(lane);
         }
     }
-    qsa_reuse_trace(best_lane, best_live, 0, 0, "root", scanned, max_held);
+    const std::uint32_t store = 0;
+    const char* chosen        = store > std::max(best_live, best_anchored)
+                                    ? "store"
+                                    : (best_anchored > best_live
+                                           ? "turn_closure"
+                                           : (best_live > 0 ? "endpoint" : "root"));
+    qsa_reuse_trace(best_lane, best_live, best_anchored, store, chosen, scanned, max_held);
 }
 
 std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,

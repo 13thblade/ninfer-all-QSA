@@ -1653,6 +1653,9 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
         qsa_stream_state->staged_layer = -1;
         qsa_stream_state->staged_end   = 0;
     }
+    // The lane's KV is about to be released, so nothing it held can be resumed from this lane;
+    // without a store (R4) that means the record goes with it.
+    qsa_clear_lane_prefix(lane);
     if (!hybrid_) { return; }
     HybridLaneState& state = hybrid_lanes_[lane];
     try {

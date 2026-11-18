@@ -27,6 +27,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "models/qwen3_5/program/prefix/qsa_continuation.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/output_budget.h"
@@ -1096,6 +1097,16 @@ public:
     [[nodiscard]] bool qsa_cache_carries_indexer_state() const noexcept {
         return context_cache.enabled && context_cache.mode == ContextCacheMode::Hybrid;
     }
+    // --qwen38-27b-qsa (streamed tier): what each lane's authoritative KV covers, the pair a
+    // three-way resume compares against (upstream's slot.fed / slot.anchor). Advanced where the KV
+    // frontier advances (commit/trim), started when a sequence takes the lane, cleared when the
+    // lane's tenure ends. `epoch` is lane_epochs[lane], so the next tenant can never read a stale
+    // record. Empty and untouched when the model carries no QSA indexer state.
+    std::vector<detail::LanePrefixRecord> qsa_lane_prefix;
+    void qsa_begin_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                               const SequenceState& sequence);
+    void qsa_note_lane_frontier(const SequenceState& sequence, std::uint32_t frontier);
+    void qsa_clear_lane_prefix(std::uint32_t lane) noexcept;
     // The lowest lane with no active continuation: the one admission would take next.
     // `kNoQsaLaneOwner` when every lane is taken.
     [[nodiscard]] std::uint32_t lowest_free_lane() const noexcept {

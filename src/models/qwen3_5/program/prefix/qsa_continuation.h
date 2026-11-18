@@ -45,6 +45,25 @@ struct HeldPrefix {
     }
 };
 
+// One lane's record of what its authoritative (pinned host) KV covers. Upstream keeps the same
+// pair on a slot: `fed` (every token written, prompt and generation) and `anchor` (the prefix its
+// last prompt closed at, taken when the prompt is fully in). `media` is the sequence's own
+// cumulative Vision key per 64-token block, copied from the prompt that fed this lane, so a
+// prefix is described by the media it was written with and never by the next prompt's.
+struct LanePrefixRecord {
+    HeldPrefix held;
+    HeldPrefix anchor;
+    std::vector<std::uint64_t> media;
+    std::uint64_t epoch = 0; // the lane epoch this record belongs to; 0 when it holds nothing
+
+    void clear() noexcept {
+        held.clear();
+        anchor.clear();
+        media.clear();
+        epoch = 0;
+    }
+};
+
 [[nodiscard]] inline bool qsa_reuse_trace_enabled() noexcept {
     return std::getenv("NINFER_DEBUG_REUSE") != nullptr;
 }
@@ -68,20 +87,49 @@ qsa_prefix_reuse(const HeldPrefix& held, std::span<const TokenId> prompt_tokens,
     return static_cast<std::uint32_t>(held.tokens.size());
 }
 
+// The cumulative Vision key a token prefix carries at `position`, from the per-block keys of the
+// sequence that owns it. Zero for a text-only sequence (empty `media`). The key of the block
+// containing `position` covers the media items up to that block's end, which is the identity of
+// the prefix; positions past the last keyed block carry the last key.
+[[nodiscard]] inline std::uint64_t qsa_media_key_at(std::span<const std::uint64_t> media,
+                                                    std::size_t position) {
+    if (position == 0 || media.empty()) { return 0; }
+    constexpr std::size_t kBlock = 64;
+    const std::size_t block      = (position - 1) / kBlock;
+    return block < media.size() ? media[block] : media.back();
+}
+
 // The cumulative Vision key a prompt carries at `position` tokens. With no Vision items this is
 // zero, matching a text-only HeldPrefix. `block_extras` holds one cumulative key per full
-// 64-token block (frontend/prepared_prompt.h:166); the key of the block containing `position`
-// covers the media items up to that block's end, which is the identity of the prefix.
+// 64-token block (frontend/prepared_prompt.h:166).
 [[nodiscard]] inline std::uint64_t qsa_vision_key_at(const PreparedPromptData& prompt,
                                                      std::size_t position) {
     if (position == 0 || prompt.block_extras.empty() || prompt.vision_items.empty()) { return 0; }
-    constexpr std::size_t kBlock = 64;
-    const std::size_t block      = (position - 1) / kBlock;
-    return block < prompt.block_extras.size() ? prompt.block_extras[block] : prompt.block_extras.back();
+    return qsa_media_key_at(prompt.block_extras, position);
+}
+
+// Moves `record.held` to `frontier` tokens of the lane's ledger: appends what a step wrote,
+// truncates what a stop-string cut or a tail drop removed, and re-derives the media key. Upstream
+// keeps `slot.fed` in step with the executor the same way; the ledger is the sequence's own token
+// history, so this never reads another structure's idea of the frontier.
+inline void qsa_set_prefix_frontier(LanePrefixRecord& record, std::span<const TokenId> ledger,
+                                    std::uint32_t frontier) {
+    if (frontier > ledger.size()) { frontier = static_cast<std::uint32_t>(ledger.size()); }
+    std::vector<TokenId>& tokens = record.held.tokens;
+    if (frontier < tokens.size()) {
+        tokens.resize(frontier);
+    } else if (frontier > tokens.size()) {
+        const std::size_t from = tokens.size();
+        tokens.insert(tokens.end(), ledger.begin() + static_cast<std::ptrdiff_t>(from),
+                      ledger.begin() + static_cast<std::ptrdiff_t>(frontier));
+    }
+    record.held.position   = static_cast<std::uint32_t>(tokens.size());
+    record.held.vision_key = qsa_media_key_at(record.media, record.held.position);
 }
 
 // One observability line per admission, gated by NINFER_DEBUG_REUSE. `chosen` names the resume
-// path; S1 always records "root" because the store does not exist yet.
+// path the three-way comparison would take: the longest of store (an image), turn closure (the
+// lane's anchor) and endpoint (the lane's live prefix); "root" when none matches.
 inline void qsa_reuse_trace(std::uint32_t lane, std::uint32_t live, std::uint32_t anchored,
                             std::uint32_t store, const char* chosen, std::uint32_t scanned = 0,
                             std::uint32_t max_held = 0) {
