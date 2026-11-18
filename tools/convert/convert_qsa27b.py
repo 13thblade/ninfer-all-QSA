@@ -120,7 +120,12 @@ def preflight(gguf_path: Path, donor_path: Path | None, *, check: bool) -> tuple
     return already, mtp
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The converter's command line.
+
+    Kept separate from :func:`main` so the option defaults -- notably that the
+    indexed proposal head is packed by default -- stay testable without a model.
+    """
     p = argparse.ArgumentParser(
         description="Pack a Qwen3.8-27B GGUF into a .ninfer artifact, grafting the "
                     "QSA indexer from a donor when the GGUF does not carry one")
@@ -151,6 +156,11 @@ def main() -> int:
                    help="run the preflight, print the chosen recipe and stop")
     p.add_argument("--skip-preflight", action="store_true",
                    help="skip the shape/tensor-set gate (the QSA detection still runs)")
+
+    return p
+
+def main() -> int:
+    p = build_parser()
     args = p.parse_args()
 
     if not args.gguf.is_file():

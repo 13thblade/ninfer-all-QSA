@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
-from tools.convert import gguf_blocks, qsa_gguf
+from tools.convert import convert_qsa27b, gguf_blocks, qsa_gguf
 from tools.convert.model import Model
 from tools.convert.ternary import HIDDEN, LAYERS, full_attention
 
@@ -185,3 +185,13 @@ def test_artifact_config_matches_the_engine_qsa_constants():
 def test_qsa_recipe_is_registered():
     assert "qwen3_8_27b_qsa_gguf" in gguf_blocks.RECIPES
     assert callable(gguf_blocks.RECIPES["qwen3_8_27b_qsa_gguf"])
+
+
+def test_proposal_head_is_packed_by_default():
+    """cbe7d8b57: the indexed proposal head is packed unless --no-proposal is given."""
+    parser = convert_qsa27b.build_parser()
+    required = ["--base-model", "base", "--gguf", "model.gguf", "--out", "out.ninfer"]
+    assert parser.parse_args(required).proposal is True
+    assert parser.parse_args(required + ["--no-proposal"]).proposal is False
+    # --proposal stays accepted as an explicit opt-in (scripts written before cbe7d8b57).
+    assert parser.parse_args(required + ["--proposal"]).proposal is True

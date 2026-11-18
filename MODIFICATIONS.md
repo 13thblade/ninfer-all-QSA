@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `40d913db` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 20 files added, 77 modified; no upstream file deleted |
+| Scope | 20 files added, 84 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -207,6 +207,22 @@ offered under the same Apache-2.0 license.
   `--qsa-top-blocks` and the Qwen3.8-27B reading of `--kv-resident`;
   `docs/maintainer/qwen4-exp-model.md` records where the sparse branch sits in the
   Qwen4 experimental model.
+
+
+### Not carried here
+
+The branch `experiment/qsa-hybrid-streamed` holds a separate line of work:
+keeping a conversation's resume state on the lane that produced it, with
+snapshot ownership marks, live-lane prefix pages, block-level Host slabs for the
+streamed tier, and an admission that prefers the owning lane. It is **not** part
+of `master`: its recoverability rules are decided in four places that can
+disagree, the streamed Host copy and the Host slab keep the same blocks twice,
+and a device-only resume there needs either a QSA plane rewind or a resume
+frontier on a pool-group boundary.
+
+`master` keeps the upstream-shaped strategy: one authoritative copy of the KV,
+the state restored from its Host replica when there is one, and no cross-lane
+state movement.
 
 ## Known limits
 
