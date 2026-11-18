@@ -1757,18 +1757,12 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             "--use-original-prefix-caching and --use-alt-prefix-caching select different prefix "
             "caching systems");
     }
-    // The streamed tier's QSA continuation store is not wired yet: the hybrid prefix cache's Host
-    // layout describes the dense Device pages, which under --kv-resident are bookkeeping
-    // placeholders carrying no KV, so a block copied from them would restore nothing. Until the
-    // store takes over, a QSA request on the streamed tier runs root-only -- exactly the
-    // --no-prefix-reuse engine shape -- and says so, rather than caching empty pages.
-    if (options.qwen38_27b_qsa && options.kv_resident_positions.has_value() &&
-        options.allow_prefix_reuse) {
-        std::fprintf(stderr,
-                     "qwen3_5: hybrid prefix cache disabled on the streamed tier "
-                     "(qsa store pending); running root-only\n");
-        options.allow_prefix_reuse = false;
-    }
+    // The streamed tier keeps its own store: a lane's KV lives in pinned host planes and the GDN
+    // state plus the continuation hidden in the sequence's StateImage, so an image carries both
+    // halves. The hybrid cache stays off this tier -- its Host layout describes Device pages that
+    // under --kv-resident are bookkeeping placeholders carrying no KV.
+    const bool qsa_streamed =
+        options.qwen38_27b_qsa && options.kv_resident_positions.has_value();
     // The hybrid prefix cache is the default. What only the checkpoint catalog serves selects the
     // catalog instead: one of its options, several devices, disabled prefix reuse (the hybrid
     // cache cannot be off) or a graft (a direct graft lives in a catalog shared-prefix slot).
@@ -1776,14 +1770,16 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
     // rejects the others below.
     const char* catalog_option = legacy_cache_flag;
     if (catalog_option == nullptr && options.devices.size() > 1) { catalog_option = "--devices"; }
-    if (catalog_option == nullptr && !options.allow_prefix_reuse) {
+    if (catalog_option == nullptr && !options.allow_prefix_reuse && !qsa_streamed) {
         catalog_option = "--no-prefix-reuse";
     }
     if (catalog_option == nullptr && !options.grafts.empty()) { catalog_option = "--graft"; }
     options.context_cache.mode =
-        hybrid_cache_selected || (!original_cache_selected && catalog_option == nullptr)
-            ? ContextCacheMode::Hybrid
-            : ContextCacheMode::Legacy;
+        qsa_streamed
+            ? ContextCacheMode::Qsa
+            : (hybrid_cache_selected || (!original_cache_selected && catalog_option == nullptr)
+                   ? ContextCacheMode::Hybrid
+                   : ContextCacheMode::Legacy);
     // QSA runs on the hybrid prefix cache only: a QSA session's KV lives in the streamed store and
     // its prefix entries carry the sparse indexer's state, which the checkpoint catalog has no
     // candidate to rebuild. Refuse the combination rather than cache nothing and answer slowly.

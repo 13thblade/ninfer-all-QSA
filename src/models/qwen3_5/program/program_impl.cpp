@@ -898,6 +898,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         for (std::size_t i = 0; i < kv_pool.plane_count() && i < 4; ++i) {
             stream.staging_bytes += kv_pool.plane(i).bytes();
         }
+        // The host tier the images live in. It is the same budget the hybrid cache would have
+        // taken; a zero or absent one keeps the streamed tier root-only, exactly as before.
+        if (context_cache.host_cache_budget_bytes.has_value() &&
+            *context_cache.host_cache_budget_bytes != 0) {
+            qsa_store_ =
+                std::make_unique<QsaContinuationStore>(*context_cache.host_cache_budget_bytes);
+        }
     }
     bind_steering(plan, steering_source, backings);
     if (plan.persistent.score_hidden) {

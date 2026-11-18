@@ -123,6 +123,9 @@ struct DiagnosticObserver {
 enum class ContextCacheMode : std::uint8_t {
     Legacy,
     Hybrid,
+    // The QSA streamed tier's own store: a token-exact prefix served from a lane's pinned host
+    // KV or from an image that carries the GDN state and the continuation hidden beside it.
+    Qsa,
 };
 
 // Hybrid-mode tuning. Every field is optional: Engine construction derives the unset ones from

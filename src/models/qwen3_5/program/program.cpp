@@ -679,6 +679,33 @@ bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexc
 
 bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix_cache(); }
 
+bool Program::qsa_prefix_cache() const noexcept { return impl_->qsa_prefix_cache(); }
+
+QsaAdmissionQuote Program::qsa_quote(const PreparedPrompt& prompt, const RequestBasePlan& base,
+                                     runtime::LaneId destination) {
+    return impl_->qsa_quote(PreparedPromptAccess::view(prompt), base, destination);
+}
+
+runtime::ContextTransactionReserveStatus
+Program::qsa_reserve_materialization(QsaAdmissionQuote&& quote, PreparedPrompt&& prompt,
+                                    runtime::CancellationFlagView cancellation) {
+    return impl_->qsa_reserve_materialization(
+        std::move(quote), PreparedPromptAccess::view(prompt),
+        [&prompt]() { return PreparedPromptAccess::take(std::move(prompt)); }, cancellation);
+}
+
+void Program::qsa_retire(SequenceHandle sequence) noexcept {
+    impl_->qsa_retire_handle(sequence);
+}
+
+void Program::qsa_forget(SequenceHandle sequence) noexcept {
+    impl_->qsa_forget_handle(sequence);
+}
+
+std::optional<StartResult> Program::take_qsa_published() noexcept {
+    return impl_->take_qsa_published();
+}
+
 HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt,
                                            const RequestBasePlan& base,
                                            runtime::LaneId destination) {

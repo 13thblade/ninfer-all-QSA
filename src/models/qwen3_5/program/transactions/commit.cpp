@@ -700,6 +700,10 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         return out;
     }
     if (!request.publish_continuation) {
+        // The streamed tier retires the lane's prefix into its image store before the lane (and
+        // the sequence's StateImage slot with it) goes away: the anchor image serves a later
+        // turn, the endpoint image a regenerate of this one.
+        if (qsa_store_) { qsa_retire(state); }
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
         out.timings     = request.timings;

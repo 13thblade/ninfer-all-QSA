@@ -12,6 +12,7 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
+#include "runtime/engine/context_cache/qsa_resource_manager.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/deepseek_v41_core.h"
@@ -448,6 +449,10 @@ public:
     using HybridGenerationCore =
         runtime::EngineCore<runtime::ModelInstance,
                             runtime::HybridResourceManager<runtime::ModelInstance::ModelContract>>;
+    // The QSA streamed tier: the same core surface, driven by the streamed-tier store.
+    using QsaGenerationCore =
+        runtime::EngineCore<runtime::ModelInstance,
+                            runtime::QsaResourceManager<runtime::ModelInstance::ModelContract>>;
     using ScoringCore = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: its own model family and core, which serves generation and scoring.
     using Qwen4ExpCore = runtime::Qwen4ExpCore;
@@ -457,7 +462,8 @@ public:
     using FlintCore = runtime::FlintCore;
     using DeepSeekV41Core = runtime::DeepSeekV41Core;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
+                              std::unique_ptr<HybridGenerationCore>,
+                              std::unique_ptr<QsaGenerationCore>, std::unique_ptr<ScoringCore>,
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
                               std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
@@ -561,6 +567,10 @@ public:
                    options.context_cache.mode == ContextCacheMode::Hybrid) {
             core = std::make_unique<HybridGenerationCore>(*active, device, options,
                                                           std::move(constructed.context_cost));
+        } else if (options.context_cache.enabled &&
+                   options.context_cache.mode == ContextCacheMode::Qsa) {
+            core = std::make_unique<QsaGenerationCore>(*active, device, options,
+                                                       std::move(constructed.context_cost));
         } else {
             auto generation = std::make_unique<GenerationCore>(
                 *active, device, options, std::move(constructed.context_cost));

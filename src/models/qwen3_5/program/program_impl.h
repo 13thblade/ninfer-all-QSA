@@ -352,6 +352,25 @@ struct HybridQuoteImpl {
     std::uint64_t destination_epoch    = 0;
 };
 
+// What a QSA admission carries from its quote to its reserve: the plan fields the prefill state
+// needs, and the three-way choice the quote settled on.
+struct QsaQuoteImpl {
+    runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
+    bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    bool drafting                             = true;
+    std::uint32_t text_kv_page_entitlement    = 0;
+    std::uint32_t backend_kv_page_entitlement = 0;
+    std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
+    runtime::PrefillWork root_rebuild_work;
+    std::uint32_t root_rebuild_tail_begin = 0;
+    std::uint32_t destination             = 0;
+    std::uint64_t destination_epoch       = 0;
+};
+
 // A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
 // on: a frontier inside a block needs that block complete, and an MTP backend trails the text
 // frontier by one token, so even a page-aligned frontier waits for its last block's backend page.
@@ -882,6 +901,33 @@ public:
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
 
+    // ---- QSA streamed-tier reuse (ContextCacheMode::Qsa) --------------------------------------
+    // The resume is a token-exact prefix: a lane's live prefix or anchor (both on its pinned host
+    // KV), or a stored image. Everything a resume needs beside the KV -- the GDN conv/recurrent
+    // state and the continuation hidden -- rides in the image's StateImage part, so a store
+    // restore lands the same state a lane holds.
+    [[nodiscard]] bool qsa_prefix_cache() const noexcept { return qsa_store_ != nullptr; }
+    [[nodiscard]] QsaAdmissionQuote qsa_quote(const PreparedPromptData& prompt,
+                                              const RequestBasePlan& base,
+                                              runtime::LaneId destination);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    qsa_reserve_materialization(QsaAdmissionQuote&& quote, const PreparedPromptData& prompt,
+                                const std::function<PreparedPromptData()>& take_prompt,
+                                runtime::CancellationFlagView cancellation);
+    void qsa_retire(SequenceState& sequence) noexcept;
+    void qsa_forget(SequenceState& sequence) noexcept;
+    void qsa_retire_handle(SequenceHandle sequence) noexcept;
+    void qsa_forget_handle(SequenceHandle sequence) noexcept;
+    // The sequence a QSA reservation started: the reservation is synchronous, so the engine's
+    // progress step publishes it from here instead of driving a Legacy materialization.
+    [[nodiscard]] std::optional<StartResult> take_qsa_published() noexcept {
+        return std::exchange(qsa_pending_published_, std::nullopt);
+    }
+    // The image a lane's record and StateImage slot occupy: the StateImage host image (conv,
+    // recurrent, continuation hidden, and any draft state) page-rounded, then the plane chunks.
+    [[nodiscard]] std::uint64_t qsa_state_image_bytes() const;
+    [[nodiscard]] std::uint64_t qsa_plane_image_bytes(std::uint32_t lane) const;
+
     [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base,
                                                     runtime::LaneId destination);
@@ -1103,6 +1149,11 @@ public:
     // lane's tenure ends. `epoch` is lane_epochs[lane], so the next tenant can never read a stale
     // record. Empty and untouched when the model carries no QSA indexer state.
     std::vector<detail::LanePrefixRecord> qsa_lane_prefix;
+    // The images a lane's prefix survives in after the lane is released: the StateImage part
+    // (GDN conv/recurrent, continuation hidden, draft state) followed by the lane's KV planes.
+    // Absent unless --host-cache-mib gave the streamed tier a host budget.
+    std::unique_ptr<detail::QsaContinuationStore> qsa_store_;
+    std::optional<StartResult> qsa_pending_published_;
     void qsa_begin_lane_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
                                const SequenceState& sequence);
     void qsa_note_lane_frontier(const SequenceState& sequence, std::uint32_t frontier);

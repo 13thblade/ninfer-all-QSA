@@ -168,6 +168,7 @@ struct RequestBasePlanImpl;
 struct PressurePlanningSessionImpl;
 
 struct HybridQuoteImpl;
+struct QsaQuoteImpl;
 
 class ProgramImpl;
 
@@ -250,6 +251,24 @@ struct HybridAdmissionQuote {
     runtime::LaneId destination{};
     runtime::RequestPlanSummary summary;
     std::shared_ptr<detail::HybridQuoteImpl> impl;
+};
+
+// QSA streamed-tier admission (ContextCacheMode::Qsa). The resume comes from one of three
+// sources, whichever covers the most of the prompt: a lane's live prefix (its pinned host KV),
+// a lane's anchor (the prompt that lane's last turn closed at), or a stored image. `whole` marks
+// a resume that covers the entire prompt (a regenerate), which only an anchor or an image can
+// offer: both carry the continuation hidden the first sample needs.
+struct QsaAdmissionQuote {
+    runtime::Readiness readiness = runtime::Readiness::TemporarilyBlocked;
+    runtime::LaneId destination{};
+    runtime::RequestPlanSummary summary;
+    std::uint32_t reuse     = 0;
+    std::uint32_t lane      = 0; // the lane a live/anchor resume comes from
+    std::size_t image       = 0; // the stored image a store resume comes from
+    bool from_store         = false;
+    bool whole              = false;
+    std::uint32_t path_kind = 0; // 0 endpoint, 1 turn closure, 2 stored image
+    std::shared_ptr<detail::QsaQuoteImpl> impl;
 };
 
 // Outcome of saving or restoring the hybrid prefix cache's Host tier.
@@ -1251,13 +1270,28 @@ public:
     // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
     // transaction the Engine drives for Legacy materialization: quote, reserve, then
     // progress_context_transaction publishes the started sequence.
-    [[nodiscard]] bool hybrid_prefix_cache() const noexcept;
-    [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPrompt& prompt,
+    [[nodiscard]] bool hybrid_prefix_cache() const noexcept;    [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPrompt& prompt,
                                                     const RequestBasePlan& base,
                                                     runtime::LaneId destination);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPrompt&& prompt,
                                    runtime::CancellationFlagView cancellation);
+    // QSA streamed-tier reuse (ContextCacheMode::Qsa): the same quote/reserve shape as the hybrid
+    // cache, but the resume is a token-exact prefix served from a lane's pinned host KV or from a
+    // stored image, and the image carries the GDN state and the continuation hidden beside it.
+    [[nodiscard]] bool qsa_prefix_cache() const noexcept;
+    [[nodiscard]] QsaAdmissionQuote qsa_quote(const PreparedPrompt& prompt,
+                                              const RequestBasePlan& base,
+                                              runtime::LaneId destination);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    qsa_reserve_materialization(QsaAdmissionQuote&& quote, PreparedPrompt&& prompt,
+                                runtime::CancellationFlagView cancellation);
+    // Terminal settlement: an endpoint image (every token written) and an anchor image (the prompt
+    // the turn closed at), both with the GDN state and the continuation hidden they were taken at.
+    void qsa_retire(SequenceHandle sequence) noexcept;
+    void qsa_forget(SequenceHandle sequence) noexcept;
+    [[nodiscard]] std::optional<StartResult> take_qsa_published() noexcept;
+
     // Evicts cached Device blocks until the pools can give the requested pages. Returns the
     // number of cached blocks released.
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,

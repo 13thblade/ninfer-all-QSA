@@ -74,11 +74,11 @@ void qsa_copy_plane_chunks(std::span<const ImageChunk> chunks, std::span<std::by
 }
 
 void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
-                    std::size_t page_bytes, bool save) {
+                    std::size_t page_bytes, bool save, std::size_t page_offset) {
     std::uint64_t total = 0;
     for (const ImageRegion& region : regions) { total += region.bytes; }
-    if (page_bytes == 0 ||
-        pages.size() < (total + page_bytes - 1) / page_bytes) {
+    if (page_bytes == 0 || page_offset > pages.size() ||
+        pages.size() - page_offset < (total + page_bytes - 1) / page_bytes) {
         throw std::invalid_argument("qsa image: the pages do not hold the image");
     }
     std::uint64_t at = 0;
@@ -87,7 +87,7 @@ void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* c
         auto* cursor = const_cast<std::byte*>(region.data);
         while (left > 0) {
             const std::size_t in_page = std::min<std::size_t>(left, page_bytes - at % page_bytes);
-            std::byte* host = pages[at / page_bytes] + at % page_bytes;
+            std::byte* host = pages[page_offset + at / page_bytes] + at % page_bytes;
             if (save) { std::memcpy(host, cursor, in_page); }
             else { std::memcpy(cursor, host, in_page); }
             cursor += in_page;

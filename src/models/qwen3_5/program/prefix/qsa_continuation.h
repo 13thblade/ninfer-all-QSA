@@ -183,9 +183,10 @@ struct ImageRegion {
 
 // Copies between the ordered regions and 8 MiB pages in image byte order. Upstream copy_image
 // (:7468) sliced per page; here both ends are host memory (streamed tier is host-authoritative),
-// so a plain memcpy per slice suffices and no CUDA stream is involved.
+// so a plain memcpy per slice suffices and no CUDA stream is involved. `page_offset` starts the
+// image at that page, so one set of pages can hold a StateImage part first and the planes after it.
 void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
-                    std::size_t page_bytes, bool save);
+                    std::size_t page_bytes, bool save, std::size_t page_offset = 0);
 
 // One contiguous run of a lane's authoritative KV: a plane of one streamed layer. `data` is the
 // live pinned host plane (a `[leading, 128, heads, pages]` tensor) and `bytes` its whole extent.
