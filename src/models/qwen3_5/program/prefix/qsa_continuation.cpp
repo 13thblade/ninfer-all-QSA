@@ -1,0 +1,167 @@
+#include "models/qwen3_5/program/prefix/qsa_continuation.h"
+
+#include <new>
+
+namespace ninfer::models::qwen3_5::detail {
+
+namespace {
+
+// page_bytes-aligned allocation. Each chunk is a run of whole pages, so every page slice
+// (base + i*page_bytes) keeps the page alignment. S2 uses aligned host memory (pageable) so the
+// store is testable without a GPU; S4 swaps the allocator for pinned memory without touching the
+// bookkeeping below.
+std::byte* allocate_pages(std::size_t bytes, std::size_t page_bytes) {
+    return static_cast<std::byte*>(::operator new(bytes, std::align_val_t(page_bytes)));
+}
+
+} // namespace
+
+void QsaContinuationStore::AlignedDeleter::operator()(std::byte* p) const noexcept {
+    ::operator delete(p, std::align_val_t(page_bytes));
+}
+
+std::uint64_t QsaContinuationStore::page_rounded(std::uint64_t bytes, std::size_t page_bytes) {
+    if (page_bytes == 0) { return bytes; }
+    return (bytes + page_bytes - 1) / page_bytes * page_bytes;
+}
+
+QsaContinuationStore::QsaContinuationStore(std::uint64_t host_budget, std::size_t page_bytes)
+    : host_budget_(host_budget), page_bytes_(page_bytes == 0 ? kHostPageBytes : page_bytes) {}
+
+QsaContinuationStore::~QsaContinuationStore() {
+    // Release the page slices before the owning aligned chunks (members die after the body).
+    stored_.clear();
+    free_pages_.clear();
+    chunks_.clear();
+}
+
+void QsaContinuationStore::pin_pages(std::size_t count) {
+    if (count == 0) { return; }
+    const std::size_t bytes = count * page_bytes_;
+    std::byte* base         = allocate_pages(bytes, page_bytes_);
+    Chunk chunk{std::unique_ptr<std::byte[], AlignedDeleter>(
+        base, AlignedDeleter{page_bytes_})};
+    for (std::size_t i = count; i-- > 0;) { free_pages_.push_back(base + i * page_bytes_); }
+    chunks_.push_back(std::move(chunk));
+}
+
+std::vector<std::byte*> QsaContinuationStore::take_pages(std::uint64_t bytes) {
+    const std::size_t count =
+        static_cast<std::size_t>(page_rounded(bytes, page_bytes_) / page_bytes_);
+    if (count == 0) { return {}; }
+    if (free_pages_.size() < count) {
+        // Upstream take_pages pins more when the free list falls short; it never exceeds the
+        // budget because the caller already made room.
+        if (host_used_ + static_cast<std::uint64_t>(count - free_pages_.size()) * page_bytes_ >
+            host_budget_) {
+            return {};
+        }
+        pin_pages(count - free_pages_.size());
+    }
+    std::vector<std::byte*> out(free_pages_.end() - std::ptrdiff_t(count), free_pages_.end());
+    free_pages_.resize(free_pages_.size() - count);
+    host_used_ += static_cast<std::uint64_t>(count) * page_bytes_;
+    return out;
+}
+
+void QsaContinuationStore::give_back(StoredImage& image) noexcept {
+    const std::uint64_t released = static_cast<std::uint64_t>(image.pages.size()) * page_bytes_;
+    host_used_ -= released > host_used_ ? host_used_ : released;
+    free_pages_.insert(free_pages_.end(), image.pages.begin(), image.pages.end());
+    image.pages.clear();
+}
+
+void QsaContinuationStore::drop_dead() noexcept {
+    std::erase_if(stored_, [](const StoredImage& image) { return image.pages.empty(); });
+}
+
+bool QsaContinuationStore::make_host_room(std::uint64_t bytes) {
+    if (bytes > host_budget_) { return false; }
+    while (host_used_ + bytes > host_budget_) {
+        std::optional<std::size_t> oldest;
+        for (std::size_t i = 0; i < stored_.size(); ++i) {
+            if (!stored_[i].pages.empty() &&
+                (!oldest || stored_[i].last_used < stored_[*oldest].last_used)) {
+                oldest = i;
+            }
+        }
+        if (!oldest) { return false; }
+        // No disk tier in this host-only configuration: dropping the oldest is the eviction.
+        give_back(stored_[*oldest]);
+        drop_dead();
+    }
+    drop_dead();
+    return true;
+}
+
+std::optional<std::size_t>
+QsaContinuationStore::stored_index(const HeldPrefix& key) const {
+    for (std::size_t i = 0; i < stored_.size(); ++i) {
+        if (stored_[i].key.tokens == key.tokens &&
+            stored_[i].key.vision_key == key.vision_key) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::pair<std::size_t, std::uint32_t>
+QsaContinuationStore::find_stored(std::span<const TokenId> prompt_tokens,
+                                  std::uint64_t prompt_vision_key) const {
+    std::pair<std::size_t, std::uint32_t> best{0, 0};
+    for (std::size_t i = 0; i < stored_.size(); ++i) {
+        if (stored_[i].pages.empty()) { continue; }
+        const StoredImage& image = stored_[i];
+        // Same token-prefix rule as upstream find_stored (:1336), with the stored image's own
+        // media key checked against the prompt's (upstream compares stored.media to prompt.media).
+        if (image.key.vision_key != prompt_vision_key) { continue; }
+        HeldPrefix prefix{image.key.tokens, image.key.vision_key,
+                          static_cast<std::uint32_t>(image.key.tokens.size())};
+        const std::uint32_t length =
+            qsa_prefix_reuse(prefix, prompt_tokens, prompt_vision_key);
+        if (length > best.second) { best = {i, length}; }
+    }
+    return best;
+}
+
+bool QsaContinuationStore::store_image(const HeldPrefix& key, std::uint64_t image_bytes,
+                                       std::uint32_t path_kind) {
+    if (key.tokens.size() < kMinStoredTokens || host_budget_ == 0) { return false; }
+    if (const auto known = stored_index(key)) {
+        stored_[*known].last_used = ++use_clock_;
+        return false; // upstream: an already-stored prefix only refreshes last_used
+    }
+    if (image_bytes > host_budget_) { return false; }
+    if (!make_host_room(page_rounded(image_bytes, page_bytes_))) { return false; }
+    StoredImage image;
+    image.key       = key;
+    image.path_kind = path_kind;
+    image.bytes     = image_bytes;
+    image.pages     = take_pages(image_bytes);
+    if (image.pages.empty()) { return false; }
+    image.last_used = ++use_clock_;
+    stored_.push_back(std::move(image));
+    return true;
+}
+
+std::optional<std::size_t> QsaContinuationStore::restore_stored(const HeldPrefix& key) {
+    auto index = stored_index(key);
+    if (!index) { return std::nullopt; }
+    if (stored_[*index].pages.empty()) { return std::nullopt; } // no disk tier in S2
+    stored_[*index].last_used = ++use_clock_;
+    return index;
+}
+
+void QsaContinuationStore::drop_stored_prefixes(std::span<const TokenId> prompt_tokens) {
+    for (std::size_t i = stored_.size(); i-- > 0;) {
+        const std::vector<TokenId>& tokens = stored_[i].key.tokens;
+        if (tokens.size() > prompt_tokens.size() ||
+            !std::equal(tokens.begin(), tokens.end(), prompt_tokens.begin())) {
+            continue;
+        }
+        give_back(stored_[i]);
+        stored_.erase(stored_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+}
+
+} // namespace ninfer::models::qwen3_5::detail

@@ -35,4 +35,5 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_host_layout.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_persist.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix/hybrid_program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/qsa_continuation.cpp"
 )

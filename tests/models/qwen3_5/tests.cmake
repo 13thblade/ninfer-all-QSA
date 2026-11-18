@@ -264,3 +264,9 @@ ninfer_add_test(ninfer_qwen3_5_prefill_rope_axes_test
 ninfer_add_test(ninfer_qwen3_5_qsa_stream_fallback_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_stream_fallback.cpp"
   LIBRARIES ninfer_core)
+
+# The QSA continuation image store: host-only pages, budget/LRU, exact-key images and the
+# copied prefix_reuse semantics (CPU only).
+ninfer_add_test(ninfer_qsa_continuation_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_continuation_store.cpp"
+  LIBRARIES ninfer_model_runtime)
