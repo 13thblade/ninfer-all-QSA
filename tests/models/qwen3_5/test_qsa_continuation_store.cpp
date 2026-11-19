@@ -308,7 +308,7 @@ void test_three_way_choice() {
     retention.snapshot_drafter_follows = true;
 
     // The prompt grows past the lane's live state: the endpoint resumes 200.
-    auto choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, {});
+    auto choice = qsa_choose_reuse(record, kEpoch, retention, &store, prompt, {});
     expect(choice.tokens == 200 && choice.path_kind == 0 && !choice.from_store,
            "the live state wins when it is the longest");
     expect(choice.live == 200 && choice.anchored == 128,
@@ -317,7 +317,7 @@ void test_three_way_choice() {
     // A regenerate of the anchor's prompt: equal length, so only `whole` can resume it, and the
     // live state (200 > 127) is rejected outright.
     const std::vector<TokenId> same(prompt.begin(), prompt.begin() + 128);
-    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, same, {});
+    choice = qsa_choose_reuse(record, kEpoch, retention, &store, same, {});
     expect(choice.tokens == 128 && choice.path_kind == 1,
            "an equal-length prompt resumes at the lane's prompt-end snapshot");
     expect(choice.whole, "the snapshot covers the whole prompt");
@@ -327,27 +327,30 @@ void test_three_way_choice() {
     whole_key.tokens   = prompt;
     whole_key.position = static_cast<std::uint32_t>(prompt.size());
     expect(store.store_image(whole_key, 4096, 0, true), "store an endpoint image of the prompt");
-    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, {});
+    choice = qsa_choose_reuse(record, kEpoch, retention, &store, prompt, {});
     expect(choice.from_store && choice.tokens == 256 && choice.whole,
            "the stored image serves the whole prompt");
 
     // An anchor image (state only) never serves a store resume: it has no KV to land.
     expect(store.store_image(key_of(3, 300), 4096, 1, true), "an anchor image stores");
-    choice = qsa_choose_reuse(record, kEpoch + 1, retention, true, &store, prompt, {});
+    choice = qsa_choose_reuse(record, kEpoch + 1, retention, &store, prompt, {});
     expect(choice.tokens == 256 && choice.from_store,
            "a lane that changed tenants keeps only the endpoint image");
 
     // The same image read with a different media identity does not match.
     const std::vector<std::uint64_t> media{0xAAULL};
-    choice = qsa_choose_reuse(record, kEpoch, retention, true, &store, prompt, media);
+    choice = qsa_choose_reuse(record, kEpoch, retention, &store, prompt, media);
     expect(!choice.from_store, "a media mismatch rejects the stored image");
 
-    // An image carries no draft KV: a drafting request cannot resume from one.
-    choice = qsa_choose_reuse(record, kEpoch + 1, retention, false, &store, prompt, {});
-    expect(choice.tokens == 0, "a store resume is refused while a drafter runs");
+    // An endpoint image carries the MTP backend-KV (issue 2b), so a drafting request can now resume
+    // from it: there is no drafter-specific store refusal any more. The whole-prompt endpoint image
+    // (stored above) wins even though the lane changed tenants.
+    choice = qsa_choose_reuse(record, kEpoch + 1, retention, &store, prompt, {});
+    expect(choice.tokens == 256 && choice.from_store,
+           "a stored endpoint image serves a drafting resume (it carries the draft KV)");
 
     // A lane that retains nothing offers nothing.
-    choice = qsa_choose_reuse(record, kEpoch, {}, false, nullptr, prompt, {});
+    choice = qsa_choose_reuse(record, kEpoch, {}, nullptr, prompt, {});
     expect(choice.tokens == 0, "an empty lane and an absent store admit a root");
 }
 

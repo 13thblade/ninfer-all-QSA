@@ -288,7 +288,6 @@ void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
     // admission uses, and the best answer is reported -- per lane, because a live or anchor
     // resume can only come from the lane that owns the KV planes.
     if (!qsa_live_continuation() || !qsa_reuse_trace_enabled()) { return; }
-    const bool store_allowed = speculative_backend != SpeculativeBackend::Mtp;
     std::uint32_t scanned    = 0;
     std::uint32_t max_held   = 0;
     std::uint32_t best_lane  = 0;
@@ -307,7 +306,7 @@ void ProgramImpl::qsa_trace_admission(const PreparedPromptData& prompt) {
         max_held = std::max(max_held, record.held.position);
         const QsaReuseChoice choice =
             qsa_choose_reuse(record, lane_epochs[lane], qsa_retention_view(static_cast<std::uint32_t>(lane)),
-                             store_allowed, qsa_store_.get(), prompt.token_ids,
+                             qsa_store_.get(), prompt.token_ids,
                              prompt.block_extras);
         if (choice.tokens > best_tokens) {
             best_tokens = choice.tokens;

@@ -252,6 +252,16 @@ bool QsaContinuationStore::store_image(const HeldPrefix& key, std::uint64_t imag
     return true;
 }
 
+void QsaContinuationStore::set_mtp_metadata(std::size_t index, std::uint32_t mtp_kv_valid,
+                                            std::uint32_t backend_committed_frontier,
+                                            std::uint32_t backend_pages) {
+    if (index >= stored_.size()) { return; }
+    StoredImage& image = stored_[index];
+    image.mtp_kv_valid               = mtp_kv_valid;
+    image.backend_committed_frontier = backend_committed_frontier;
+    image.backend_pages              = backend_pages;
+}
+
 void QsaContinuationStore::write_payload(std::size_t index, std::span<const ImageChunk> chunks) {
     if (index >= stored_.size()) { throw std::out_of_range("qsa store: image index"); }
     StoredImage& image = stored_[index];

@@ -1192,6 +1192,13 @@ public:
         std::optional<StateImageHandle> snapshot;
         std::optional<KVAddressSpaceHandle> backend;
         std::uint32_t backend_pages   = 0;
+        // The draft-KV extent a store image must carry, mirroring the native qwen3_5 session
+        // snapshot (session_snapshot.cpp:582,586): the sequence's valid draft KV and the backend
+        // address space's committed frontier are distinct, with the invariant
+        // mtp_kv_valid <= backend_committed_frontier. Captured at turn end (qsa_finish_lane), read
+        // when the lane is evicted and the store image is written (qsa_write_lane_image).
+        std::uint32_t mtp_kv_valid               = 0;
+        std::uint32_t backend_committed_frontier = 0;
         bool snapshot_drafter_follows = false;
         // Whether the live state's frontier equals its prefix key. Stored at turn end (where the
         // sequence still knows both); read when the lane is evicted and the image is written.

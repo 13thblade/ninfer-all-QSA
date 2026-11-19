@@ -201,12 +201,11 @@ QsaAdmissionQuote ProgramImpl::qsa_quote(const PreparedPromptData& prompt,
     const LanePrefixRecord& record =
         qsa_lane_prefix.size() == max_concurrency ? qsa_lane_prefix[destination.value]
                                                   : LanePrefixRecord{};
-    // A store resume is refused while a drafter runs: an image carries no draft KV, and handing
-    // the drafter KV it never wrote is what upstream's `drafter_follows` bit forbids.
-    const bool store_allowed = speculative_backend != SpeculativeBackend::Mtp;
+    // An endpoint image now carries the MTP backend-KV (issue 2b), so a drafting request may
+    // resume from a stored image; the former drafter-specific store refusal is gone.
     const QsaReuseChoice choice =
         qsa_choose_reuse(record, lane_epochs[destination.value],
-                         qsa_retention_view(destination.value), store_allowed, qsa_store_.get(),
+                         qsa_retention_view(destination.value), qsa_store_.get(),
                          prompt.token_ids, prompt.block_extras);
     out.reuse      = choice.tokens;
     out.image      = choice.image;
@@ -287,6 +286,14 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
     std::optional<KVAddressSpaceHandle> backend_address;
     std::optional<KVAddressSpaceHandle> adopted_backend;
     std::uint32_t adopted_backend_pages = 0;
+    // A store resume re-injects the image's MTP backend-KV into the fresh backend space below. The
+    // region is read host-side from the image pages (page-split via qsa_copy_image) into this
+    // contiguous staging, then H2D'd page-by-page (mirrors session_snapshot's build_address). Empty
+    // for a non-store resume or an image stored without MTP.
+    std::vector<std::byte> mtp_staging;
+    std::uint32_t mtp_backend_pages     = 0;
+    std::uint32_t mtp_backend_committed = 0;
+    std::uint32_t mtp_loaded_kv_valid   = 0;
     bool continuation_bound             = false;
     const std::uint32_t continuation_index = active_continuations[lane];
     try {
@@ -380,9 +387,31 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                 throw std::runtime_error("QSA admission image has no KV part");
             }
             std::vector<ImageRegion> regions;
-            regions.reserve(chunks.size());
+            regions.reserve(chunks.size() + 1);
             for (const ImageChunk& chunk : chunks) {
                 regions.push_back(ImageRegion{chunk.data, chunk.bytes});
+            }
+            // The MTP backend-KV half (native qwen3_5 session-snapshot semantics): the image
+            // carries `stored.backend_pages` device pages packed at the pool's page stride, the
+            // committed frontier they cover, and the sequence's valid draft KV. Read them into the
+            // contiguous staging (qsa_copy_image page-splits across the store's 8 MiB pages), then
+            // H2D them into the fresh backend space below.
+            if (stored.backend_pages != 0) {
+                const HostKVPageLayout backend_layout =
+                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+                const std::uint64_t backend_bytes =
+                    std::uint64_t(stored.backend_pages) * backend_layout.page_stride;
+                if (stored.bytes < state_bytes + qsa_image_chunk_bytes(chunks) + backend_bytes) {
+                    throw std::runtime_error("QSA admission image has no MTP part");
+                }
+                if (stored.mtp_kv_valid > stored.backend_committed_frontier) {
+                    throw std::logic_error("QSA stored image has mtp_kv_valid ahead of its frontier");
+                }
+                mtp_staging.resize(std::size_t(backend_bytes));
+                regions.push_back(ImageRegion{mtp_staging.data(), std::size_t(backend_bytes)});
+                mtp_backend_pages     = stored.backend_pages;
+                mtp_backend_committed = stored.backend_committed_frontier;
+                mtp_loaded_kv_valid   = stored.mtp_kv_valid;
             }
             qsa_copy_image(regions, pages, QsaContinuationStore::kHostPageBytes, false,
                            state_bytes / QsaContinuationStore::kHostPageBytes);
@@ -414,6 +443,8 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                 adopted_backend_pages = retention.backend_pages;
                 retention.backend.reset();
                 retention.backend_pages = 0;
+                retention.mtp_kv_valid  = 0;
+                retention.backend_committed_frontier = 0;
                 bundle.backend          = *adopted_backend;
             } else {
                 // The lane's retained space covers a different extent than this prompt's (an
@@ -427,6 +458,8 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                 }
                 retention.backend.reset();
                 retention.backend_pages = 0;
+                retention.mtp_kv_valid  = 0;
+                retention.backend_committed_frontier = 0;
                 backend_address = backend_kv_addresses->create_inactive();
                 if (!backend_address) {
                     throw std::runtime_error("QSA admission has no backend KV address space");
@@ -437,12 +470,39 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                 bundle.backend = *backend_address;
             }
         }
+        // A store resume re-injects the image's MTP backend-KV into the fresh backend space, then
+        // publishes its committed frontier (native qwen3_5 build_address: ensure_mapped_to_tokens +
+        // copy_from_host + commit_frontier). The bridge below advances from this frontier exactly as
+        // a live resume. The staging is transient host memory, so the H2D is synchronized before the
+        // buffer goes out of scope.
+        if (from_store && mtp_backend_pages != 0 && backend_address) {
+            const HostKVPageLayout backend_layout =
+                plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+            backend_kv_addresses->ensure_mapped_to_tokens(*backend_address, mtp_backend_committed,
+                                                          compute_streams);
+            std::vector<DeviceKVPageHandle> destinations;
+            destinations.reserve(mtp_backend_pages);
+            for (std::uint32_t page = 0; page < mtp_backend_pages; ++page) {
+                destinations.push_back(backend_kv_addresses->physical_page(*backend_address, page));
+            }
+            backend_kv_pages->physical_pool().copy_from_host(
+                mtp_staging.data(), backend_layout,
+                std::span<const DeviceKVPageHandle>(destinations.data(), destinations.size()),
+                compute_streams);
+            backend_kv_addresses->commit_frontier(*backend_address, mtp_backend_committed);
+            device.synchronize();
+        }
         sequence.kv.emplace(bundle);
 
         const bool prepare_mtp = speculative_backend == SpeculativeBackend::Mtp;
         refresh_state_views(sequence);
         sequence.text_kv_valid = reuse;
-        sequence.mtp_kv_valid  = prepare_mtp && reuse != 0 ? reuse - 1U : 0U;
+        // A store resume restores the image's own draft-KV extent (native qwen3_5: session restore
+        // sets mtp_kv_valid from the snapshot, :1106); every other path seeds it at reuse-1 and
+        // lets the bridge advance it.
+        sequence.mtp_kv_valid  = from_store && mtp_backend_pages != 0
+                                     ? mtp_loaded_kv_valid
+                                     : (prepare_mtp && reuse != 0 ? reuse - 1U : 0U);
         sequence.dflash_context_frontier =
             is_masked_draft_backend(speculative_backend) ? reuse : 0U;
         // A prompt that ends exactly at the resume is sampled from the state's own continuation
@@ -715,6 +775,12 @@ bool ProgramImpl::qsa_finish_lane(SequenceState& sequence, RequestControl& reque
             backend_kv_addresses != nullptr && backend_kv_addresses->active(*sequence.kv->backend)) {
             retention.backend       = *sequence.kv->backend;
             retention.backend_pages = backend_kv_addresses->entitlement(*sequence.kv->backend);
+            // The draft-KV extent for a later store image (session_snapshot.cpp:582,586): the
+            // sequence's valid draft KV plus the address space's committed frontier, the latter
+            // deciding how many backend pages the image carries.
+            retention.backend_committed_frontier =
+                backend_kv_addresses->committed_frontier(*sequence.kv->backend);
+            retention.mtp_kv_valid = sequence.mtp_kv_valid;
             // Not deactivated: an inactive address space returns its pages to the pool.
             sequence.kv->backend.reset();
         }
@@ -777,9 +843,32 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
         if (state_bytes == 0 || plane_bytes == 0) { return; }
         std::vector<ImageChunk> chunks;
         qsa_collect_plane_chunks(*qsa_stream_state, lane, chunks);
-        const std::uint64_t payload = state_bytes + plane_bytes;
+
+        // MTP backend-KV: the lane's retained draft address space, captured the same way the native
+        // qwen3_5 session snapshot captures it (session_snapshot.cpp:547-588) -- pages keyed off the
+        // committed frontier, with the invariant mtp_kv_valid <= backend_committed_frontier. Only the
+        // host-side extent math runs here (it sizes the payload); the actual D2H into a transient
+        // staging buffer is issued inside the store block below, so the buffer outlives the copy.
+        const QsaLaneRetention& retention = qsa_lane_retention_[lane];
+        std::vector<std::byte> mtp_staging;
+        std::uint64_t backend_bytes = 0;
+        std::uint32_t mtp_pages     = 0;
+        std::uint32_t mtp_committed = 0;
+        std::uint32_t mtp_kv        = 0;
+        std::optional<HostKVPageLayout> backend_layout;
+        if (speculative_backend == SpeculativeBackend::Mtp && retention.backend &&
+            backend_kv_addresses != nullptr && backend_kv_addresses->active(*retention.backend) &&
+            retention.backend_committed_frontier != 0 && backend_kv_pages != nullptr) {
+            mtp_committed  = retention.backend_committed_frontier;
+            mtp_kv         = retention.mtp_kv_valid;
+            mtp_pages      = kv_pages_for_frontier(mtp_committed);
+            backend_layout = plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+            backend_bytes  = std::uint64_t(mtp_pages) * backend_layout->page_stride;
+        }
+
+        const std::uint64_t payload = state_bytes + plane_bytes + backend_bytes;
         std::vector<ImageRegion> regions;
-        regions.reserve(chunks.size());
+        regions.reserve(chunks.size() + (backend_bytes != 0 ? 1 : 0));
         for (const ImageChunk& chunk : chunks) {
             regions.push_back(ImageRegion{chunk.data, chunk.bytes});
         }
@@ -795,16 +884,34 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
                 const std::vector<std::byte*>& pages = qsa_store_->images()[*index].pages;
                 // The StateImage half first (now including the QSA indexer region, so a store
                 // resume restores pooled/tail/tail_axes, not just GDN + hidden), then the text-KV
-                // planes at their page offset.
+                // planes and the MTP staging at their page offset.
                 state_images->copy_to_host_segments(physical, pages,
                                                     QsaContinuationStore::kHostPageBytes,
                                                     compute_streams, /*include_qsa=*/true, nullptr,
                                                     lane);
+                // D2H the MTP backend-KV into the staging now (inside the store block, so the
+                // transient buffer is alive), then queue it as a region of the image.
+                if (backend_bytes != 0) {
+                    mtp_staging.resize(std::size_t(backend_bytes));
+                    std::vector<DeviceKVPageHandle> sources;
+                    sources.reserve(mtp_pages);
+                    for (std::uint32_t page = 0; page < mtp_pages; ++page) {
+                        sources.push_back(
+                            backend_kv_addresses->physical_page(*retention.backend, page));
+                    }
+                    backend_kv_pages->physical_pool().copy_to_host(
+                        std::span<const DeviceKVPageHandle>(sources.data(), sources.size()),
+                        mtp_staging.data(), *backend_layout, compute_streams);
+                    regions.push_back(ImageRegion{mtp_staging.data(), std::size_t(backend_bytes)});
+                }
+                // Wait for the StateImage D2H and the MTP D2H (into staging) before the host
+                // memcpy reads the staging buffer.
+                device.synchronize();
                 qsa_copy_image(regions, pages, QsaContinuationStore::kHostPageBytes, true,
                                state_bytes / QsaContinuationStore::kHostPageBytes);
-                // The StateImage D2H is queued on the device streams; the image is only visible
-                // to a later restore once it has landed.
-                device.synchronize();
+                if (backend_bytes != 0) {
+                    qsa_store_->set_mtp_metadata(*index, mtp_kv, mtp_committed, mtp_pages);
+                }
             }
         }
         if (qsa_reuse_trace_enabled()) {

@@ -232,6 +232,13 @@ struct StoredImage {
     // new token from this image instead of prefilling one. False when the sequence was cut behind
     // its frontier (a stop string), where the hidden sits ahead of the key.
     bool whole = true;
+    // MTP backend-KV carried by an endpoint image (native qwen3_5 session-snapshot semantics):
+    // `backend_pages` device pages packed at the pool's page stride cover `[0,
+    // backend_committed_frontier)`, and `mtp_kv_valid` is the sequence's valid draft KV (invariant
+    // mtp_kv_valid <= backend_committed_frontier). All zero for an image stored without MTP.
+    std::uint32_t mtp_kv_valid               = 0;
+    std::uint32_t backend_committed_frontier = 0;
+    std::uint32_t backend_pages              = 0;
 };
 
 class QsaContinuationStore {
@@ -271,6 +278,10 @@ public:
     // zero budget are ignored; a full store evicts before taking pages.
     bool store_image(const HeldPrefix& key, std::uint64_t image_bytes, std::uint32_t path_kind,
                      bool whole = true);
+    // Stamps the MTP backend-KV extent an endpoint image carries, set right after store_image once
+    // the pages are filled. All zero for an image stored without MTP.
+    void set_mtp_metadata(std::size_t index, std::uint32_t mtp_kv_valid,
+                          std::uint32_t backend_committed_frontier, std::uint32_t backend_pages);
     // Upstream restore_stored (:1551) returns the image index; the caller copies the payload via
     // load_image (S3). Restoring refreshes last_used.
     [[nodiscard]] std::optional<std::size_t> restore_stored(const HeldPrefix& key);
@@ -351,12 +362,11 @@ struct QsaReuseChoice {
 // another lane's prefix is not a candidate (upstream reads `slots[s]` for the slot it was given,
 // and so do we). A live prefix keeps the strict rule (its last written token is a sample a prior
 // turn was decoding); the snapshot and an image admit the whole prompt, which is what a regenerate
-// resumes at. `store_allowed` is false while a drafter runs: an image carries no draft KV, so a
-// store resume would hand the drafter KV it never wrote (upstream refuses the same way, through
-// its image's `drafter_follows` bit).
+// resumes at. An endpoint image carries the MTP backend-KV (issue 2b), so a drafting request may
+// resume from one just like a live or anchor state; there is no longer a drafter-specific refusal.
 [[nodiscard]] inline QsaReuseChoice
 qsa_choose_reuse(const LanePrefixRecord& record, std::uint64_t lane_epoch,
-                 const QsaLaneRetentionView& retention, bool store_allowed,
+                 const QsaLaneRetentionView& retention,
                  const QsaContinuationStore* store, std::span<const TokenId> prompt_tokens,
                  std::span<const std::uint64_t> prompt_media) {
     QsaReuseChoice best;
@@ -379,7 +389,7 @@ qsa_choose_reuse(const LanePrefixRecord& record, std::uint64_t lane_epoch,
             best.path_kind  = 1;
         }
     }
-    if (store_allowed && store != nullptr) {
+    if (store != nullptr) {
         const auto [image, stored] = store->find_stored(prompt_tokens, prompt_media, true);
         best.stored                = stored;
         if (stored > best.tokens) {
