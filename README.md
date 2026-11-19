@@ -2,7 +2,7 @@
 
 # 中文
 
-本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，QSA注意力窗口筛选反而带来额外开销，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调。
+本仓库为ninfer-all新增Qwen3.8-27B-QSA-GGUF的支持，该模型给Qwen3.8-27B嫁接了原属于Qwen4系列的QSA注意力，因此可以使用KV stream：由于QSA注意力每token默认只需看到2048个历史token（本fork中可用 --qsa-top-blocks 扩大），可以将KV缓存放在系统内存中，按需流式传输到VRAM中计算，极大缓解显存容量不足的问题。此外，由于prefill阶段通常为算力受限，即使是dense注意力仍可通过kv stream流式计算，QSA注意力窗口筛选反而带来额外开销，由于上游的QSA宽T内核性能尚未优化，以及扩大注意力窗口会大幅降低prefill速度，因此本fork的实现为prefill阶段使用dense注意力以保证最佳质量和性能，decode阶段才改用QSA稀疏注意力，且注意力窗口可调；需要验证稀疏 prefill 路径时可用 `--qsa-prefill` 把 prefill 也切到 QSA 分支。
 
 支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。注：引擎内核对 GDN A/B controls 张量仅支持 BF16 精度，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失，因此本仓库的格式转换器从Qwen官方原生精度中剪裁了对应的 BF16 张量并进行嫁接，张量文件见 release。QSA注意力的 indexer 张量也见release，上游对QSA indexer只有BF16内核的支持，转换器会自动将F32的indexer转换为BF16，因此本fork直接提供BF16的版本。
 
@@ -11,12 +11,13 @@
 
 ## 旗标
 
-三个旗标分别决定「是否启用 QSA」「每个 token 能看多远」「KV 放在哪里」。
+四个旗标分别决定「是否启用 QSA」「prefill 是否也走稀疏」「每个 token 能看多远」「KV 放在哪里」。
 
 | 旗标 | 作用 | 取值 | 默认 |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 仍对该层完整 KV 做 dense 因果注意力）。要求 artifact 自带 indexer；只能用单卡、不开张量并行，投机后端只能是模型自带的 MTP。并发解码支持到 `--max-concurrency 8`（每条序列各自持有索引器状态与流式 KV；并发 > 1 时关闭 CUDA graphs，decode 走非捕获路径）。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
-| `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 走 dense，不受它影响。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
+| `--qwen38-27b-qsa` | 打开 QSA 分支：decode/verify 时 16 个全注意力层改为每个 token 只对 indexer 选出的块做注意力（prefill 默认对该层完整 KV 做 dense 因果注意力，可用 `--qsa-prefill` 切到稀疏分支）。要求 artifact 自带 indexer；只能用单卡、不开张量并行，投机后端只能是模型自带的 MTP。并发解码支持到 `--max-concurrency 8`（每条序列各自持有索引器状态与流式 KV；并发 > 1 时关闭 CUDA graphs，decode 走非捕获路径）。不开则全程走原生 dense 全注意力。 | 布尔开关 | 关 |
+| `--qsa-prefill` | prefill 阶段也改走 QSA 稀疏分支。上游宽 T 的 QSA 内核尚未优化、扩大窗口会明显拖慢 prefill，因此默认 prefill 仍用 dense 因果注意力；该开关主要用于验证稀疏 prefill 路径或省算力。必须同时给 `--qwen38-27b-qsa`，单独出现会在启动时报错。环境变量 `NINFER_QSA_DENSE_PREFILL=0` 是同一开关的历史写法，显式旗标优先。 | 布尔开关 | 关 |
+| `--qsa-top-blocks N` | decode/verify 时每个 token 可见的历史块数，1 块 = 4 token；prefill 默认走 dense 不受它影响，开 `--qsa-prefill` 后稀疏 prefill 也按它取窗口。值越大越接近 dense。启动时固定，进程内不可变。 | 512~65536；`0` 表示用 artifact 原生值 | 512 块（2,048 token） |
 | `--kv-resident N\|all\|auto` | 每个稀疏注意力层、每条序列在显存中常驻多少位置；超出部分留在 pinned host 内存，按 4-token 块按需流式搬进显存。`0`/`all` 等于全驻留。 | 位置数、`all`、`auto` | `auto`：device KV（本模型即如此）为 `all`，也就是默认不流式 |
 
 `--kv-resident` 取非`0`/`all`时的自动下限是 `(qsa-top-blocks+T) × 4` 个token。开启MTP时，连续草稿的块选区高度重合，因此绝大部分情况下不必为每个草稿都预留一份注意力窗口；当注意力窗口并集偶发超出resident时，流式 resolve 保住 column 0 的选区与本次写入的块、丢弃草稿列的块，等价于当前verify轮次接受度为0。显式给更大的 `--kv-resident` 仍生效；当取值不小于上下文时流式关闭、整段历史全驻留。典型用法：
@@ -60,12 +61,13 @@ Planned work:
 
 ## Flags
 
-Three flags decide whether QSA runs, how far each token looks back, and where the KV lives.
+Four flags decide whether QSA runs, whether prefill joins it, how far each token looks back, and where the KV lives.
 
 | Flag | What it does | Values | Default |
 | --- | --- | --- | --- |
-| `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill still attends densely over the layer's complete KV). Needs the artifact's indexer, one device, no tensor parallelism, and either no speculative backend or the model's own MTP. Concurrent decode supports up to `--max-concurrency 8` (each sequence keeps its own indexer state and streamed KV; above one concurrency, CUDA graphs are off and decode runs uncaptured). Without it the model runs its native dense attention throughout. | boolean switch | off |
-| `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill runs dense and does not depend on it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
+| `--qwen38-27b-qsa` | Runs the QSA branch: in decode/verify the sixteen full-attention layers score only the blocks the artifact's indexer selects (prefill attends densely over the layer's complete KV unless `--qsa-prefill` moves it to the sparse branch). Needs the artifact's indexer, one device, no tensor parallelism, and either no speculative backend or the model's own MTP. Concurrent decode supports up to `--max-concurrency 8` (each sequence keeps its own indexer state and streamed KV; above one concurrency, CUDA graphs are off and decode runs uncaptured). Without it the model runs its native dense attention throughout. | boolean switch | off |
+| `--qsa-prefill` | Runs prefill on the QSA sparse branch too. Upstream's wide-T QSA kernel is not yet optimised and a wider window slows prefill sharply, so prefill stays dense by default; this switch exists to exercise the sparse prefill path or to save compute. Requires `--qwen38-27b-qsa` and aborts startup on its own. The legacy `NINFER_QSA_DENSE_PREFILL=0` spells the same switch, and the explicit flag wins. | boolean switch | off |
+| `--qsa-top-blocks N` | How many history blocks (four tokens each) each query may look back over during decode/verify; prefill ignores it while dense, and a sparse prefill takes its window from it. A wider window moves towards dense. Fixed at startup. | 512 to 65,536; `0` keeps the artifact's own value | 512 blocks (2,048 tokens) |
 | `--kv-resident N\|all\|auto` | How many positions of each sparse layer's KV a sequence keeps in device memory; past them the KV stays in pinned host memory and streams in by four-token block. `0`/`all` keeps everything resident. | positions, `all`, `auto` | `auto`: `all` when the KV sits on the device (this model), so nothing streams by default |
 
 When `--kv-resident` is a number other than `0`/`all`, the pool's automatic floor is `(qsa-top-blocks+T) × 4` tokens. With MTP on, consecutive drafts' block selections overlap heavily, so there is mostly no need to reserve one attention window per draft; when the union of the windows occasionally outgrows the resident pool, the streamed resolve keeps column 0's selection and the blocks the call wrote and drops the draft columns' blocks, equivalent to accepting nothing from that verification round. An explicit larger `--kv-resident` still takes effect; a value not below the context disables streaming and keeps the whole history resident. Typical use:
