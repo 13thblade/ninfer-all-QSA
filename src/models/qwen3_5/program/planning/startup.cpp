@@ -411,11 +411,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     if (plan.qsa && plan.context_cache.enabled &&
-        plan.context_cache.mode == ContextCacheMode::Hybrid) {
-        // The hybrid snapshot carries the QSA indexer state out of the shared device planes:
-        // every StateImage slot's host slab holds the pooled block keys, the live tail and the
-        // tail axes. The Legacy cache keeps the continuation live on the device, so its images
-        // carry no QSA region and cost nothing there.
+        (plan.context_cache.mode == ContextCacheMode::Hybrid ||
+         plan.context_cache.mode == ContextCacheMode::Qsa)) {
+        // The snapshot carries the QSA indexer state out of the shared device planes: every
+        // StateImage slot's host slab holds the pooled block keys, the live tail and the tail
+        // axes. Hybrid uses it for its host-tier snapshots; the QSA streamed tier uses the same
+        // region for its continuation-store image (qsa_write_lane_image captures it with
+        // include_qsa, the store resume lands it) so a cross-lane store resume restores the
+        // indexer, not just the text KV. The Legacy cache keeps the continuation live on the
+        // device, so its images carry no QSA region and cost nothing there.
         const auto& qsa = config.qsa.value();
         state_image_spec.qsa = qwen3_5::QsaStateSpec{
             .layers   = config.full_attention_layers,

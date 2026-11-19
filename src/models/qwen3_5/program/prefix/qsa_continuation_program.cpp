@@ -793,10 +793,13 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
             const std::optional<std::size_t> index = qsa_store_->stored_index(record.held);
             if (index) {
                 const std::vector<std::byte*>& pages = qsa_store_->images()[*index].pages;
-                // The StateImage half first, then the planes at their page offset.
+                // The StateImage half first (now including the QSA indexer region, so a store
+                // resume restores pooled/tail/tail_axes, not just GDN + hidden), then the text-KV
+                // planes at their page offset.
                 state_images->copy_to_host_segments(physical, pages,
                                                     QsaContinuationStore::kHostPageBytes,
-                                                    compute_streams, false, nullptr, lane);
+                                                    compute_streams, /*include_qsa=*/true, nullptr,
+                                                    lane);
                 qsa_copy_image(regions, pages, QsaContinuationStore::kHostPageBytes, true,
                                state_bytes / QsaContinuationStore::kHostPageBytes);
                 // The StateImage D2H is queued on the device streams; the image is only visible
