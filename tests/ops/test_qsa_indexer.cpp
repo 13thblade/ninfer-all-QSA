@@ -69,12 +69,15 @@ float pair_frequency(int i, const Yarn& yarn) {
 // Zero-centred RMSNorm then rotate-half. Pair i takes axis i % 3 of pos3 (the
 // engine's interleaved MRoPE), with the same per-axis linear interpolation as
 // rope.cuh's YaRN kernel. Three equal axes are exactly the scalar rotation.
+// `unit_offset` selects (1 + w) (the model's additive gamma) against a stored
+// multiplicative gamma with offset zero.
 std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w,
-                              const std::array<int, 3>& pos3, const Yarn& yarn) {
+                              const std::array<int, 3>& pos3, const Yarn& yarn,
+                              bool unit_offset = true) {
     double sum = 0;
     for (double v : x) sum += v * v;
     const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
-    for (int d = 0; d < kDim; ++d) x[d] = x[d] * scale * (1.0 + w[d]);
+    for (int d = 0; d < kDim; ++d) x[d] = x[d] * scale * ((unit_offset ? 1.0 : 0.0) + w[d]);
     const double attention = yarn.factor > 1.0 ? 0.1 * std::log(yarn.factor) + 1.0 : 1.0;
     const float threshold  = static_cast<float>(yarn.interpolation_threshold);
     const float inv_scale  = static_cast<float>(1.0 / yarn.interpolation_factor);
@@ -117,6 +120,7 @@ struct Sequence {
     // QSA-27B's index_k_pre_norm: applied to each raw key before the 4-token mean. Empty selects
     // Flash-Next's path, which pools the raw projection keys.
     std::vector<float> key_pre_norm;
+    bool unit_offset = true;
 };
 
 std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& yarn,
@@ -139,7 +143,7 @@ std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& ya
     const int first = block * 4;
     const auto pos3 = axes != nullptr ? (*axes)[static_cast<std::size_t>(first)]
                                       : std::array<int, 3>{first, first, first};
-    return norm_rope(mean, seq.key_norm, pos3, yarn);
+    return norm_rope(mean, seq.key_norm, pos3, yarn, seq.unit_offset);
 }
 
 int check_selection(const std::string& label, const Sequence& seq, const std::vector<std::vector<double>>& pooled,
@@ -160,7 +164,7 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
             std::vector<double> raw(kDim);
             for (int d = 0; d < kDim; ++d) raw[d] = seq.projection[
                 static_cast<std::size_t>(column < 0 ? position : column) * kProjection + h * kDim + d];
-            q[h] = norm_rope(raw, seq.query_norm, qpos3, yarn);
+            q[h] = norm_rope(raw, seq.query_norm, qpos3, yarn, seq.unit_offset);
         }
         for (int b = 0; b < blocks; ++b) {
             double s = 0;
@@ -206,7 +210,8 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
 }
 
 int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
-        const std::vector<std::array<int, 3>>* axes = nullptr, int top = kDefaultTop) {
+        const std::vector<std::array<int, 3>>* axes = nullptr, int top = kDefaultTop,
+        bool fp32_norm = false) {
     Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim),
                  pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
     fill_uniform(seq.projection, seed, -2.0f, 2.0f);
@@ -215,39 +220,53 @@ int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
     round_to_bf16(seq.projection);
     round_to_bf16(seq.query_norm);
     round_to_bf16(seq.key_norm);
+    seq.unit_offset = !fp32_norm;
+    if (fp32_norm) {
+        for (auto* v : {&seq.query_norm, &seq.key_norm})
+            for (auto& value : *v) value += 1.0f;
+    }
     // Only a non-empty key_pre_norm selects the QSA-27B path; the Flash-Next runs must leave it
     // empty so the oracle pools the raw keys, as the op does when the weight is null.
     if (pre_norm) {
         fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
-        round_to_bf16(seq.key_pre_norm);
+        if (!fp32_norm) round_to_bf16(seq.key_pre_norm);
     }
     std::vector<std::vector<double>> pooled(seq.length / 4);
     for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn, axes);
 
     const int capacity = 700;
-    GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
-        d_kpn(kDim * 2), d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
+    GuardedDeviceBuffer d_projection(seq.projection.size() * 2),
+        d_qn(kDim * (fp32_norm ? 4 : 2)), d_kn(kDim * (fp32_norm ? 4 : 2)),
+        d_kpn(kDim * (fp32_norm ? 4 : 2)),
+        d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
         d_selected(kProjection * 2 + static_cast<std::size_t>(top) * 64 * 4), d_counts(64 * 4),
         d_rope(static_cast<std::size_t>(3) * seq.length * 4), d_tail_axes(9 * 4);
     const auto bits = encode_bf16(seq.projection);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
     const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm),
                kpn = encode_bf16(seq.key_pre_norm);
-    d_qn.copy_from_host(qn.data(), qn.size() * sizeof(std::uint16_t));
-    d_kn.copy_from_host(kn.data(), kn.size() * sizeof(std::uint16_t));
-    if (!kpn.empty()) d_kpn.copy_from_host(kpn.data(), kpn.size() * sizeof(std::uint16_t));
+    d_qn.copy_from_host(fp32_norm ? static_cast<const void*>(seq.query_norm.data()) : qn.data(),
+                        fp32_norm ? d_qn.bytes() : qn.size() * sizeof(std::uint16_t));
+    d_kn.copy_from_host(fp32_norm ? static_cast<const void*>(seq.key_norm.data()) : kn.data(),
+                        fp32_norm ? d_kn.bytes() : kn.size() * sizeof(std::uint16_t));
+    if (!kpn.empty()) {
+        d_kpn.copy_from_host(fp32_norm ? static_cast<const void*>(seq.key_pre_norm.data()) : kpn.data(),
+                             fp32_norm ? d_kpn.bytes() : kpn.size() * sizeof(std::uint16_t));
+    }
     CUDA_CHECK(cudaMemset(d_pooled.data(), 0, d_pooled.bytes()));
     CUDA_CHECK(cudaMemset(d_tail.data(), 0, d_tail.bytes()));
     // tail_axes is persistent across calls: append writes it, the next append
     // reads it when a completed block starts inside the incomplete tail.
     CUDA_CHECK(cudaMemset(d_tail_axes.data(), 0, d_tail_axes.bytes()));
-    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim}),
-        t_kpn(d_kpn.data(), DType::BF16, {kDim});
+    const auto norm_dtype = fp32_norm ? DType::FP32 : DType::BF16;
+    Tensor t_qn(d_qn.data(), norm_dtype, {kDim}), t_kn(d_kn.data(), norm_dtype, {kDim}),
+        t_kpn(d_kpn.data(), norm_dtype, {kDim});
     Tensor t_pooled(d_pooled.data(), DType::FP32, {kDim, capacity});
     Tensor t_tail(d_tail.data(), DType::FP32, {kDim, 3});
     GuardedDeviceBuffer d_first(4);
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr};
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, pre_norm ? &t_kpn : nullptr,
+                                         seq.unit_offset};
     WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity, top));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -665,6 +684,10 @@ int main() {
     }
     int failures = run(8100u);
     failures += run(8300u, {}, true);
+    failures += run(8101u, {}, true);
+    // FP32 norm tensors read directly (query/key and the QSA-27B pre-norm), no BF16 rounding.
+    failures += run(8102u, {}, true, nullptr, kDefaultTop, true);
+    failures += run(8103u, {}, false, nullptr, kDefaultTop, true);
     // Scalar below 64 tokens (80 on an A100), narrow and wide SIMT tiles or the A100's tensor tile
     // above, by the device's SM count: each card meets the routes it selects.
     for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 63, 64, 79, 80, 127, 128, 129, 512}) {

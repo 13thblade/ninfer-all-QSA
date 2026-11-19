@@ -232,7 +232,9 @@ code; MTP stays ahead elsewhere.
 
 A [DSpine](maintainer/dspine.md) drafter is an artifact of its own, which `--spec dspine
 --draft-model PATH --draft-tokens N` loads beside the model it was trained for; startup refuses a
-model of another hidden width, vocabulary or layer count. Tencent's drafter for Qwen3.8-27B is
+model of another hidden width, vocabulary or layer count. A Qwen3.5-core model converted from a GGUF
+with a [condensed vocabulary](weight-conversion.md#a-condensed-vocabulary) refuses DFlash, DFlash2
+and DSpine, whose drafters predict the official token ids, and drafts with MTP or context lookup. Tencent's drafter for Qwen3.8-27B is
 published converted as
 [Qwen3.8-27B-DSpine-b16-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
 and `python -m tools.convert --model CHECKPOINT --recipe dspine_q8 --out drafter.ninfer` converts
@@ -366,7 +368,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--ngram-ram-mib N` | `disk`: budget for cached rows and their index (`0` disables); `ram-hot`: budget for the profile's resident rows and index | `0` for disk; `4096` for ram-hot |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01); DeepSeek-V4.1: without its Engram table (the IQ1_M release's perplexity on a 1,112-token WikiText slice rose from 3.07 to 9.68 on October 25) | off |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4\|bf16p` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; those nine are accepted on every build target; `bf16p` is opt-in BF16 packed losslessly into 23% fewer bytes, for Qwen3.5 and Qwen3.8-Flash-Next from sm_75, without `--tensor-attention positions` (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; for Gemma 4 the sliding-window blocks' K and V, with the full-attention blocks' one value plane in an unrotated coding (see [Gemma 4](gemma4.md#kv-cache-formats)); Flint keeps F16 only (`bf16`), DeepSeek-V4.1 BF16 only | `bf16` |
+| `--kv-dtype bf16\|fp16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4\|bf16p` | KV-cache storage. `fp16` is [native FP16 for Flash-Next and Edge0](qwen3-8-flash-next.md#native-fp16-kv), with FP32 K/V production and one FP16 rounding; for Gemma 4 and Flint it names the F16 cache that `bf16` selects; Qwen3.5-core models and DeepSeek-V4.1 refuse it. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; those nine are accepted on every build target; `bf16p` is opt-in BF16 packed losslessly into 23% fewer bytes, for Qwen3.5 and Qwen3.8-Flash-Next from sm_75, without `--tensor-attention positions` (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; for Gemma 4 the sliding-window blocks' K and V, with the full-attention blocks' one value plane in an unrotated coding (see [Gemma 4](gemma4.md#kv-cache-formats)); Flint keeps F16 only (`bf16` or `fp16`), DeepSeek-V4.1 the release's FP8/FP4 caches (`bf16` only) | `bf16` |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next, or Qwen3.8-27B with `--qwen38-27b-qsa`: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
 | `--qwen38-27b-qsa` | Qwen3.8-27B: run the QSA sparse attention branch of every full-attention layer, so each query attends only to the blocks the artifact's block indexer selects (2,048 historical tokens by default); needs the artifact's indexer, one device and no tensor parallelism; concurrent decode supports up to `--max-concurrency 8`, each sequence keeping its own indexer state and streamed KV (CUDA graphs are off above one concurrency); works with the model's own MTP drafts | off |
 | `--qsa-top-blocks N` | Qwen3.8-27B with `--qwen38-27b-qsa`: how many history blocks (four tokens each) each query may look back over, 1 to 65,536 (262,144 tokens at most); wider selections need a larger `--kv-resident` pool of blocks; the value is fixed at startup | the artifact's own 512 blocks (2,048 tokens) |
@@ -470,7 +472,7 @@ ninfer-serve --config configs/bonsai2-27b-dflash2.ini
 ninfer-serve --config configs/bonsai2-27b-dflash2.ini --max-context 131072 --port 9000
 ```
 
-The format is llama.cpp's preset format, which [`--models-preset`](serving.md#several-models-router)
+INI files use llama.cpp's preset format, which [`--models-preset`](serving.md#several-models-router)
 also reads:
 
 - Each line is `key = value`. The key is the option without its leading dashes, in any case. The
@@ -483,6 +485,17 @@ also reads:
   `cuda-backend` selects the portable package's CUDA backend. `version` is ignored.
 - A file has no `[section]` and no `config` key. `ninfer_bench` names its artifact with `weights`.
 - Relative paths start in the directory the program runs in, not in the file's directory.
+
+`--config` also accepts a flat JSON object with the same option names and string, number or boolean
+values. Nested objects, arrays, nulls and duplicate keys are rejected; use INI for repeated values.
+JSON files follow the same path and override rules:
+
+```json
+{"model":"models/model.ninfer","max-concurrency":2,"kv-dtype":"bf16","vision":true}
+```
+
+The [Basalt serving converter](basalt-conversion.md#serving-json) produces this format and a separate
+report for settings that need an explicit cross-engine choice.
 
 `--config` can repeat. The files apply in the order given and the command line applies last, at any
 position of `--config` on the command line. A later layer overrides an earlier one by these rules:
@@ -564,6 +577,13 @@ build target, and the tenth, `bf16p`, from sm_75 on: the Blackwell-only `mma.syn
 *weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
 them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
 [configuration calculator](config-calculator.html).
+
+Flash-Next and Edge0 also accept [`fp16`](qwen3-8-flash-next.md#native-fp16-kv) on every build
+target. K/V production stays FP32 until a single FP16 cache store; remaining activations retain
+their existing types. Its cache byte footprint equals BF16's, with finer fraction precision and
+a narrower finite range. BF16 stays the default. Gemma 4 and Flint keep F16 caches under either
+name. The Qwen3.5 Program's attention reads BF16 keys and values from BF16 projections and refuses
+`fp16`.
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,
 about 23% smaller than INT8 for about 0.082% perplexity, and the flattest decode curve of any

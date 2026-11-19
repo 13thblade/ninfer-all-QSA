@@ -42,6 +42,8 @@ constexpr int kDefaultTop = ops::kQsaTopBlocksDefault;
 const char* storage_name(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return "bf16";
+    case KvCacheStorage::Float16:
+        return "fp16";
     case KvCacheStorage::Int8Group64: return "int8";
     case KvCacheStorage::Fp8E4M3Row256: return "fp8";
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64: return "rk8v4";
@@ -184,7 +186,7 @@ struct Layer {
 struct Inputs {
     DeviceBuffer k, v, positions, first, selected, counts, q;
     explicit Inputs(int capacity, int top)
-        : k(std::size_t(capacity) * kKvHeads * kDim * 2), v(k.bytes),
+        : k(std::size_t(capacity) * kKvHeads * kDim * sizeof(float)), v(k.bytes),
           positions(std::size_t(capacity) * 4), first(4),
           selected(std::size_t(top) * ops::kKvStreamMaxTokens * 4),
           counts(std::size_t(ops::kKvStreamMaxTokens) * 4),
@@ -215,8 +217,13 @@ public:
         }
         std::vector<std::int32_t> positions(static_cast<std::size_t>(t));
         std::iota(positions.begin(), positions.end(), position_);
-        CUDA_CHECK(cudaMemcpyAsync(in_.k.p, kb.data(), kb.size() * 2, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(in_.v.p, vb.data(), vb.size() * 2, cudaMemcpyHostToDevice, stream));
+        const bool half = layer_.storage == KvCacheStorage::Float16;
+        CUDA_CHECK(cudaMemcpyAsync(in_.k.p, half ? static_cast<const void*>(k.data()) : kb.data(),
+                                   k.size() * (half ? sizeof(float) : 2), cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(in_.v.p, half ? static_cast<const void*>(v.data()) : vb.data(),
+                                   v.size() * (half ? sizeof(float) : 2), cudaMemcpyHostToDevice,
+                                   stream));
         CUDA_CHECK(cudaMemcpyAsync(in_.positions.p, positions.data(), positions.size() * 4,
                                    cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(in_.first.p, &position_, 4, cudaMemcpyHostToDevice, stream));
@@ -224,8 +231,9 @@ public:
     }
 
     void append_kernels(int t, const PagedKVLayerView& cache, cudaStream_t stream) {
-        const Tensor k(in_.k.p, DType::BF16, {kDim, kKvHeads, t});
-        const Tensor v(in_.v.p, DType::BF16, {kDim, kKvHeads, t});
+        const auto dtype = layer_.storage == KvCacheStorage::Float16 ? DType::FP32 : DType::BF16;
+        const Tensor k(in_.k.p, dtype, {kDim, kKvHeads, t});
+        const Tensor v(in_.v.p, dtype, {kDim, kKvHeads, t});
         const Tensor positions(in_.positions.p, DType::I32, {t});
         ops::kv_cache_append(k, v, positions, cache, stream);
     }
@@ -552,7 +560,8 @@ int main() {
     std::uint32_t seed = 7300;
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16}) {
+          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
+          KvCacheStorage::Float16}) {
         for (const Plan& plan : plans) { failures += run(storage, plan, seed++); }
     }
     failures += run_overflow_fallback(KvCacheStorage::BFloat16, seed++);

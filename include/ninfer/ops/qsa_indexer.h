@@ -25,8 +25,9 @@ namespace ninfer::ops {
  *
  * the min(top_blocks, blocks) best blocks, ties to the lower block index, where `top_blocks`
  * defaults to the artifact's 512 (kQsaTopBlocksDefault) and may be raised to kQsaTopBlocksMax.
- * groupnorm is the zero-centred
- * RMSNorm x / sqrt(mean x^2 + eps) * (1 + w) over 128 values; rope rotates the first 64 dims
+ * groupnorm is RMSNorm x / sqrt(mean x^2 + eps) * (offset + w) over 128 values, where offset is
+ * one for unit_offset and zero for stored multiplicative gamma (the fork's QSA-27B indexer runs
+ * the zero-centred 1 + w form, so its callers set unit_offset true); rope rotates the first 64 dims
  * rotate-half at angle fl32(fl32(position) * f_i), f_i = fl32(1e7^(-2i/64)), i < 32, and passes
  * dims 64..127 through. Whenever `yarn.active()` (a YaRN factor above one OR linear position
  * interpolation), f_i is the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 32, 1e7,
@@ -55,12 +56,17 @@ namespace ninfer::ops {
  * equal the oracle's up to blocks whose FP64 scores tie the top_blocks-th within 1e-5 relative.
  */
 struct QsaIndexerWeights {
-    const Tensor* query_norm = nullptr; // BF16 [128]
-    const Tensor* key_norm   = nullptr; // BF16 [128]
+    const Tensor* query_norm = nullptr; // BF16 or FP32 [128]
+    const Tensor* key_norm   = nullptr; // BF16 or FP32 [128]
     // QSA-27B runs a zero-centred RMSNorm on each raw indexer key before the
     // 4-token pooling (the fork's blk.N.indexer.k_norm.pre_weight). Flash-Next
-    // has no such norm, so nullptr selects its existing path unchanged.
+    // has no such norm, so nullptr selects its existing path unchanged. BF16 or
+    // FP32 [128], read directly like query_norm/key_norm.
     const Tensor* key_pre_norm = nullptr;
+    // RMSNorm uses (offset + w): offset is one for the model's additive gamma
+    // (the fork's zero-centred 1 + w form) and zero for a stored multiplicative
+    // gamma. Norm tensors may be BF16 or FP32 and are read directly.
+    bool unit_offset = true;
 };
 
 /**

@@ -137,6 +137,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
         return "bf16";
+    case ninfer::KvCacheStorage::Float16:
+        return "fp16";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
@@ -756,6 +758,7 @@ std::string format_server_start_json(
         {"lenient_image_detail", options.lenient_image_detail},
         {"max_request_bytes", options.max_request_bytes},
         {"media_cache_bytes", options.media_cache_bytes},
+        {"media_url_max_bytes", options.media_url_max_bytes},
         {"media_live_bytes", options.media_live_bytes},
         {"media_preprocess_threads", options.media_preprocess_threads},
         {"request_log_jsonl", options.request_log_jsonl},

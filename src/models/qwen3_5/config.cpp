@@ -18,6 +18,12 @@ using artifact::ArtifactError;
 using artifact::Json;
 using artifact::require_members;
 
+// The official Qwen3.5/3.8 vocabulary's rows. A condensed one (a GGUF pruned to fewer tokens and
+// numbered anew) has fewer: its drafts come from MTP or context lookup, because the DFlash, DFlash2
+// and DSpine drafters predict the official ids (DFlash2's candidate codebooks and DSpine's sender
+// table have these rows, and their sparse acceptance takes the official 248077 tokens).
+constexpr std::uint32_t kOfficialVocabularyRows = 248320;
+
 std::uint32_t integer(const Json& value, std::string_view label, bool positive = true) {
     const auto n = artifact::require_u64(value, label, positive);
     if (n > std::numeric_limits<std::uint32_t>::max()) {
@@ -215,12 +221,19 @@ VisionConfig vision(const Json& value) {
                     {"model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
                      "num_position_embeddings"},
-                    {}, "vision config");
+                    {"direct_format"}, "vision config");
     if (value.at("model_type") != "qwen3_5_vision" &&
         value.at("model_type") != "qwen3_5_moe_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;
+    if (value.contains("direct_format")) {
+        if (value.at("direct_format") == "fp32") {
+            out.direct_format = QType::FP32;
+        } else if (value.at("direct_format") != "bf16") {
+            throw ArtifactError("Vision direct_format must be bf16 or fp32");
+        }
+    }
     out.depth                   = dimension(value, "depth");
     out.hidden_size             = dimension(value, "hidden_size");
     out.intermediate_size       = dimension(value, "intermediate_size");
@@ -437,6 +450,18 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                                              : "Qwen3_5MTP")) {
                 throw ArtifactError("MTP architecture differs from target mathematics");
             }
+        }
+        if ((options.speculative == SpeculativeBackend::DFlash ||
+             options.speculative == SpeculativeBackend::DFlash2 ||
+             options.speculative == SpeculativeBackend::DSpine) &&
+            out.text.vocab_size != kOfficialVocabularyRows) {
+            throw ArtifactError("--spec " + std::string(options.speculative_component()) +
+                                " drafts over the official " +
+                                std::to_string(kOfficialVocabularyRows) +
+                                "-row vocabulary, and this model's has " +
+                                std::to_string(out.text.vocab_size) +
+                                " rows (a condensed vocabulary): draft with --spec mtp, with or "
+                                "without --lookup-ngram");
         }
         if (options.speculative == SpeculativeBackend::DFlash ||
             options.speculative == SpeculativeBackend::DFlash2) {

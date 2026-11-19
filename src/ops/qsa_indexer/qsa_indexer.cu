@@ -7,6 +7,7 @@
 // kernel argument (defaulting to the artifact's 512): the geometry and grids do not depend on it,
 // so a captured graph replays a raised budget as it stands.
 #include "ninfer/ops/qsa_indexer.h"
+#include "ops/common/direct_weight.cuh"
 #include "ninfer/ops/rope.h"
 
 #include "core/device_launch.h"
@@ -108,10 +109,10 @@ __device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int p
     *cosine *= rope.attention_factor;
 }
 
-// Zero-centred RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
+// RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
 // rotate-half rotation of its first 64 dims at `position`. `values` is the group's shared row.
 template <bool Yarn>
-__device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps,
+__device__ void norm_rope_row(float* values, DirectWeight weight, float eps, bool unit_offset,
                               const int* position3, int lane128, float* reduce,
                               const QsaRope& rope) {
     const float x = values[lane128];
@@ -124,7 +125,7 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     __syncthreads();
     const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
     const float normed =
-        x * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(weight[lane128]));
+        x * rsqrtf(total / kHeadDim + eps) * ((unit_offset ? 1.0f : 0.0f) + weight[lane128]);
     __syncthreads();
     values[lane128] = normed;
     __syncthreads();
@@ -145,12 +146,12 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
 }
 
 // Zero-centred RMSNorm of one raw indexer key, a 128-vector held one value per thread, before the
-// 4-token mean. `key_pre_norm` supplies the stored 1 + w weight of the QSA-27B adaptation; the
-// reduction is the same four-warp sum `norm_rope_row` uses.
+// 4-token mean. `key_pre_norm` supplies the stored 1 + w weight of the QSA-27B adaptation, read
+// directly as BF16 or FP32 like the query/key norms; the reduction is the same four-warp sum
+// `norm_rope_row` uses.
 template <bool PreNorm>
 __device__ __forceinline__ float pre_norm_key(float value, int d,
-                                              const __nv_bfloat16* __restrict__ key_pre_norm,
-                                              float eps, float* reduce) {
+                                              DirectWeight key_pre_norm, float eps, float* reduce) {
     if constexpr (!PreNorm) {
         return value;
     } else {
@@ -165,7 +166,7 @@ __device__ __forceinline__ float pre_norm_key(float value, int d,
         __syncthreads();
         const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
         const float normed =
-            value * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(key_pre_norm[d]));
+            value * rsqrtf(total / kHeadDim + eps) * (1.0f + key_pre_norm[d]);
         __syncthreads();
         return normed;
     }
@@ -179,8 +180,8 @@ __device__ __forceinline__ float pre_norm_key(float value, int d,
 template <bool Yarn, bool PreNorm>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                    int tokens, const __nv_bfloat16* __restrict__ key_norm,
-                    const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
+                    int tokens, DirectWeight key_norm,
+                    DirectWeight key_pre_norm, float eps, bool unit_offset,
                     const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
                     const int* __restrict__ rope_positions, int* __restrict__ tail_axes,
                     std::int32_t pos_tokens, std::int32_t axis_stride, const QsaRope rope) {
@@ -224,7 +225,7 @@ __global__ void __launch_bounds__(kHeadDim)
     }
     row[d] = sum * 0.25f;
     __syncthreads();
-    norm_rope_row<Yarn>(row, key_norm, eps, block_pos3, d, reduce, rope);
+    norm_rope_row<Yarn>(row, key_norm, eps, unit_offset, block_pos3, d, reduce, rope);
     pooled[static_cast<std::int64_t>(block) * kHeadDim + d] = row[d];
 }
 
@@ -234,7 +235,7 @@ __global__ void __launch_bounds__(kHeadDim)
 template <bool PreNorm>
 __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
                                 const int* __restrict__ first, int tokens,
-                                const __nv_bfloat16* __restrict__ key_pre_norm, float eps,
+                                DirectWeight key_pre_norm, float eps,
                                 float* __restrict__ tail,
                                 const int* __restrict__ rope_positions,
                                 int* __restrict__ tail_axes, std::int32_t axis_stride) {
@@ -273,7 +274,7 @@ __device__ __forceinline__ unsigned order_key(float value) {
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
-                     const __nv_bfloat16* query_norm, float eps, float* queries,
+                     DirectWeight query_norm, float eps, bool unit_offset, float* queries,
                      const int* __restrict__ rope_positions, std::int32_t axis_stride,
                      const QsaRope rope, int top_blocks) {
     __shared__ float row[kHeads * kHeadDim];
@@ -285,7 +286,8 @@ __global__ void __launch_bounds__(kThreads)
     __syncthreads();
     int pos3[3];
     call_positions(rope_positions, axis_stride, t, position, pos3);
-    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, pos3, lane, reduce[head], rope);
+    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, unit_offset, pos3, lane,
+                        reduce[head], rope);
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
 
@@ -591,7 +593,7 @@ __global__ void __launch_bounds__(kTileThreads, 1)
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                     const __nv_bfloat16* __restrict__ query_norm, float eps,
+                     DirectWeight query_norm, float eps, bool unit_offset,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
                      int capacity, const int* __restrict__ rope_positions,
                      std::int32_t axis_stride, const QsaRope rope, int top_blocks) {
@@ -621,7 +623,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         const float total = reduce[head][0] + reduce[head][1] + reduce[head][2] + reduce[head][3];
         const float normed =
-            x * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(query_norm[lane]));
+            x * rsqrtf(total / kHeadDim + eps) * ((unit_offset ? 1.0f : 0.0f) + query_norm[lane]);
         __syncthreads();
         row[lane] = normed;
         __syncthreads();
@@ -765,7 +767,8 @@ const int* require_position(const Tensor& first_position) {
 }
 
 void require_norm(const Tensor* norm, const char* message) {
-    require(norm != nullptr && norm->data != nullptr && norm->dtype == DType::BF16 &&
+    require(norm != nullptr && norm->data != nullptr &&
+                (norm->dtype == DType::BF16 || norm->dtype == DType::FP32) &&
                 norm->is_contiguous() && norm->ne[0] == kHeadDim && norm->ne[1] == 1,
             message);
 }
@@ -886,9 +889,9 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerPositions& positions) {
     require_projection(projection);
     const int* first = require_position(first_position);
-    require_norm(weights.key_norm, "key_norm must be BF16 [128]");
+    require_norm(weights.key_norm, "key_norm must be BF16 or FP32 [128]");
     if (weights.key_pre_norm != nullptr) {
-        require_norm(weights.key_pre_norm, "key_pre_norm must be BF16 [128]");
+        require_norm(weights.key_pre_norm, "key_pre_norm must be BF16 or FP32 [128]");
     }
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
@@ -898,17 +901,17 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     const QsaRope rope        = make_rope(yarn, positions.pair_axes);
     const std::int32_t tokens = projection.ne[1];
     const auto pos            = require_positions(positions, tokens);
-    const auto* key_pre_norm =
-        weights.key_pre_norm != nullptr
-            ? static_cast<const __nv_bfloat16*>(weights.key_pre_norm->data)
-            : nullptr;
+    // Read the QSA-27B pre-norm weight directly as BF16 or FP32, like the query/key norms.
+    const DirectWeight key_pre_norm = weights.key_pre_norm != nullptr
+                                          ? direct_weight(*weights.key_pre_norm)
+                                          : DirectWeight{nullptr, false};
     // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
     const auto launch_pool = [&](auto yarn_tag, auto pre_norm_tag) {
         constexpr bool kYarn    = decltype(yarn_tag)::value;
         constexpr bool kPreNorm = decltype(pre_norm_tag)::value;
         qsa_pool_kernel<kYarn, kPreNorm><<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
-            static_cast<const __nv_bfloat16*>(weights.key_norm->data), key_pre_norm, eps,
+            direct_weight(*weights.key_norm), key_pre_norm, eps, weights.unit_offset,
             static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
             pos.rope, pos.tail_axes, pos.pos_tokens, pos.axis_stride, rope);
         CUDA_CHECK(cudaGetLastError());
@@ -918,13 +921,13 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
         CUDA_CHECK(cudaGetLastError());
     };
     if (rope.active) {
-        if (key_pre_norm != nullptr) {
+        if (weights.key_pre_norm != nullptr) {
             launch_pool(std::true_type{}, std::true_type{});
         } else {
             launch_pool(std::true_type{}, std::false_type{});
         }
     } else {
-        if (key_pre_norm != nullptr) {
+        if (weights.key_pre_norm != nullptr) {
             launch_pool(std::false_type{}, std::true_type{});
         } else {
             launch_pool(std::false_type{}, std::false_type{});
@@ -953,7 +956,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     require_top_blocks(top_blocks);
     require_projection(projection);
     const int* first = require_position(first_position);
-    require_norm(weights.query_norm, "query_norm must be BF16 [128]");
+    require_norm(weights.query_norm, "query_norm must be BF16 or FP32 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
     const QsaRope rope = make_rope(yarn, positions.pair_axes);
@@ -979,7 +982,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 rope.active ? qsa_score_kernel<true> : qsa_score_kernel<false>;
             score_kernel<<<grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
-                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                direct_weight(*weights.query_norm), eps, weights.unit_offset,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
                 pos.rope, pos.axis_stride, rope, top_blocks);
         } else {
@@ -988,7 +991,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 rope.active ? qsa_query_kernel<true> : qsa_query_kernel<false>;
             query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
-                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                direct_weight(*weights.query_norm), eps, weights.unit_offset,
                 static_cast<float*>(queries.data), pos.rope, pos.axis_stride, rope, top_blocks);
             CUDA_CHECK(cudaGetLastError());
             const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;

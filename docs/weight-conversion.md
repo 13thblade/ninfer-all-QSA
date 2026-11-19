@@ -75,9 +75,10 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
-| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
+| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL or Q8_0 rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
+| `qwen3_8_flash_next_gguf_preserve` | [Native-source preservation](flash-next-native-dflash2.md): encoded expert grids, FP32 norm gamma and decay, Basalt HC8 rounding and BF16 prefill injection; explicit `--compat-bf16` for the source recipe's compatibility casts | `gguf`, `ngram` (GGUF or NVIDIA FP8 PLE safetensors), optional `vision` and `mtp` |
 | `edge0_pack`, `edge0_pack_q8`, `edge0_pack_q4` | Edge0-145B and Edge0-120B from an Edge0 release folder: the Flash-Next skeleton GGUF as `qwen3_8_flash_next_gguf` reads it, every latent expert row (NVFP4, Q3_K, IQ4_NL) and encoder and decoder row (Q8_0 or Q4_0: the release's choice, or the one the recipe names) byte for byte, the labels, the NVFP4 experts' FP32 multipliers or the reciprocals of the Q3_K builds' column scales; the FP8 n-gram table's codes in the artifact or in a table artifact of their own; the release's MTP block | `pack` (the release folder); `gguf`, `ngram`, `mtp` override its files |
-| `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
+| `gemma4_gguf` | Gemma 4 26B-A4B or the dense 31B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way, with `vision` the tower from the release's mmproj | `gguf`, `mtp`, `vision` (mmproj GGUF) |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
 
@@ -267,6 +268,64 @@ def configure(model, recipe, sources):
     recipe.assign("text/layers/*/gdn/output", format="q6_g64_fp16", method="grouped_absmax")
 ```
 
+#### A condensed vocabulary
+
+A GGUF can have its vocabulary condensed: pruned to fewer token rows and numbered anew, as
+[bsaleh03's ASCII-Condensed prune tools](https://github.com/bsaleh03/ASCII-Condensed-prune-tools)
+do. fakezeta's
+[Qwen3.8-27B-UD-Q3_K_XL-Condensed-P2](https://huggingface.co/fakezeta/Qwen3.8-27B-UD-Q3_K_XL-Condensed-P2)
+keeps 141,141 of the 248,320 rows (140,898 tokens and 243 unused rows) and moves `<|endoftext|>`
+from 248044 to 140865. `qwen3_8_27b_gguf` takes the token table's row count from the GGUF and
+holds the output head to it. The GGUF products multiply whole 128-row tiles, so the recipe appends
+zero rows to the token table and the head up to the next multiple of 128 (141,184 rows). A zero
+block has a zero scale, so these rows decode to zeros. The tokenizer's domain ends below them and
+below the GGUF's unused rows, so sampling, log probabilities and draft acceptance never reach them,
+as with the official model's 243 rows past its 248,077 tokens.
+
+The token ids in the frontend resources must change with the rows.
+`python -m tools.convert.condense_vocabulary` writes the `--model` directory from the GGUF and the
+original checkpoint's files:
+
+- `tokenizer.json` with the GGUF's tokens at their GGUF ids and the GGUF's merges, in the original
+  file's structure, and `tokenizer_config.json` with its added tokens at the new ids;
+- `config.json` and `generation_config.json`, with each `*_token_id` moved to the new id of the
+  same token text and `vocab_size` set to the padded row count;
+- copies of the chat template and the Vision processor configurations;
+- with `--ranking-out PATH`, the proposal head's token-frequency ranking at the new ids, for
+  `--proposal --ranking PATH`.
+
+The tool stops if the GGUF lacks an added token or a configured id. The recipe refuses a `--model`
+directory whose `vocab_size` is not the padded row count or whose tokenizer puts a token at a
+different id than the GGUF:
+
+```bash
+python3 -m tools.convert.condense_vocabulary \
+  --gguf /path/to/Qwen3.8-27B-UD-Q3_K_XL-Condensed-P2-mtpQ4.gguf \
+  --original /path/to/Qwen3.8-27B \
+  --out /path/to/Qwen3.8-27B-condensed \
+  --ranking-out /path/to/ranking.condensed.i64
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-condensed \
+  --recipe qwen3_8_27b_gguf \
+  --source gguf=/path/to/Qwen3.8-27B-UD-Q3_K_XL-Condensed-P2-mtpQ4.gguf \
+  --source vision=/path/to/mmproj-BF16.gguf \
+  --components text,vision,mtp \
+  --proposal --ranking /path/to/ranking.condensed.i64 \
+  --name qwen3.8-27b \
+  --out models/qwen3_8_27b_condensed.ninfer
+```
+
+Such a model drafts with MTP and context lookup only (`--spec mtp`, with or without
+`--lookup-ngram`). The DFlash, DFlash2 and DSpine drafters were trained to predict the official
+ids: DFlash2's candidate codebooks and DSpine's sender table have the official 248,320 rows, and
+the sparse draft acceptance of both takes the official 248,077 tokens. The recipe refuses the
+`dflash` and `dflash2` components with a condensed vocabulary, and the runtime refuses
+`--spec dflash`, `dflash2` and `dspine`.
+
+The Qwen3.8-Flash-Next and Edge0 recipes (`qwen3_8_flash_next_gguf`, `edge0_pack`) require the
+official 248,320 rows: their per-layer embedding reads n-gram table rows at hashes of the official
+token ids, so a condensed vocabulary would also need a table hashed over the new ids.
+
 ### Qwen3.8-Flash-Next GGUF releases
 
 `qwen3_8_flash_next_gguf` ([`qwen4_exp_gguf.py`](../tools/convert/qwen4_exp_gguf.py)) imports the
@@ -274,7 +333,8 @@ model shard of a Qwen3.8-Flash-Next GSQ-RCO release the same way: every matrix k
 the 512-expert banks stay expert-major (one expert is one contiguous byte range), and the exporter's
 conventions are undone by row gathers and exact small-tensor transforms. The release's second
 shard, the n-gram table, is the `ngram` component: the model always records the table's hash
-constants, row format and SHA-256, and `--components` decides where the rows go -- `text,ngram`
+constants, row format and SHA-256. Both IQ4_NL and Q8_0 (Q8PLE) table rows keep their
+stored bytes. `--components` decides where the rows go -- `text,ngram`
 (the default) into the model's artifact, `text` nowhere (the model reads a table artifact at run
 time), `ngram` into a table artifact without a model. The runtime reads only the rows each token
 addresses. `mtp` beside `text` adds the MTP block from one of Unsloth's MTP GGUFs

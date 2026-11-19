@@ -39,6 +39,10 @@ int launch_configuration_tests() {
         std::ofstream(path) << text;
         return path.string();
     };
+    const auto half = write("fp16.json", R"({"model":"model.ninfer","kv-dtype":"fp16"})");
+    failures +=
+        check(parse({"ninfer-serve", "--config", half}).kv_cache == ninfer::KvCacheStorage::Float16,
+              "flat serving JSON did not preserve native FP16 selection");
     const std::string base = write("base.ini", "model = from-file.ninfer\n"
                                                "host = 0.0.0.0\n"
                                                "port = 9000\n"
@@ -526,6 +530,9 @@ int main() {
 
     failures += check(!defaults.default_reasoning_effort,
                       "a reasoning effort is unexpectedly configured by default");
+    const ServeOptions fp16 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp16"});
+    failures += check(make_engine_options(fp16).kv_cache == ninfer::KvCacheStorage::Float16,
+                      "--kv-dtype fp16 did not reach the Engine as native FP16 KV");
     const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
     failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
                       "--kv-dtype fp8 did not select row-scaled E4M3 KV");
@@ -875,6 +882,37 @@ int main() {
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
+
+    // Media URLs are fetched only on request: --media-urls SIZE turns them on, 0 keeps them off.
+    failures += check(defaults.media_url_max_bytes == 0, "media URLs are not off by default");
+    for (const auto& [text, bytes] : std::vector<std::pair<std::string, std::size_t>>{
+             {"0", 0},
+             {"4096B", 4096},
+             {"512K", 512ULL << 10},
+             {"512kb", 512ULL << 10},
+             {"512KiB", 512ULL << 10},
+             {"20M", 20ULL << 20},
+             {"20MiB", 20ULL << 20},
+             {"1.5M", 3ULL << 19},
+             {"0.25G", 256ULL << 20},
+             {"256M", 256ULL << 20}}) {
+        const ServeOptions sized = parse({"ninfer-serve", "model.ninfer", "--media-urls", text});
+        if (sized.media_url_max_bytes != bytes) {
+            std::cerr << "--media-urls " << text << " gave " << sized.media_url_max_bytes << '\n';
+            ++failures;
+        }
+    }
+    for (const char* text : {"20", "M", "-1M", "+1M", "1.M", ".5M", "20X", "1 M", "0M",
+                             "0.0000001K", "1.1234567M", "257M", "1G", "99999999999999999999G"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--media-urls", text});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) {
+            std::cerr << "--media-urls accepted " << text << '\n';
+            ++failures;
+        }
+    }
 
     const ServeOptions logging = parse({"ninfer-serve", "model.ninfer", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
@@ -1523,6 +1561,7 @@ int main() {
                                         "--media-cache-mib",
                                         "--media-live-mib",
                                         "--media-preprocess-threads",
+                                        "--media-urls",
                                         "--min-p",
                                         "--mlp-a8-decode",
                                         "--mtp-attention-window",

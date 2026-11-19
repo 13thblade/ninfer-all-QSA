@@ -49,6 +49,14 @@ releases have no Q4_K experts.
 
 ## Convert
 
+For native GGUF text weights plus NVIDIA's original FP8 PLE source, use the
+[preservation and DFlash2 recipe](flash-next-native-dflash2.md). It builds Q8PLE directly,
+keeps the specified Basalt operand conventions and attaches DFlash2 without a `.basalt` input.
+
+For an existing Flash-Next `.basalt` pack, use the [Basalt converter](basalt-conversion.md).
+It preserves the pack's Q8PLE, dense overrides, experts, MTP and Vision components instead of
+assembling the published donor combination below.
+
 `--model` needs only the HF checkpoint's configuration and tokenizer files (`config.json`,
 `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`) from
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
@@ -507,7 +515,7 @@ both tables' rows.
 ### Another table of the same shape
 
 A model reads any n-gram table artifact of its hash constants, row count and row width, in any row
-format the runtime decodes (IQ4_NL, FP8 with an FP16 row scale, BF16): the table its `ngram`
+format the runtime decodes (IQ4_NL, Q8_0, FP8 with an FP16 row scale, BF16): the table its `ngram`
 component names, or another one. The engine checks the table's shape against the model's
 configuration, not its values; for another table it warns at startup with both tables' formats and
 digests. A table of the same shape with other values starts too and degrades the output, as a wrong
@@ -526,6 +534,27 @@ with INT8 KV and device experts, the GSQ-RCO Q2_0 release scores 2.542153 with i
 [its guide](edge0.md#with-flash-nexts-table). Q2_0's greedy answer to the sky prompt keeps its
 content and changes its wording with the FP8 table; it decodes at 87.6 and 87.5 tokens per second.
 
+### Q8PLE tables
+
+`qwen3_8_flash_next_gguf` accepts a GGUF containing Q8_0
+`per_layer_token_embd.weight` as `--source ngram=PATH`. Its five 32-value blocks per
+row stay byte-for-byte Q8_0: 170 bytes per row, including the five FP16 scales.
+The 320,001,536-row table occupies 54,400,261,120 payload bytes. Conversion records
+the SHA-256 of those bytes; it neither requantizes the table nor changes the text
+weights, drafter or KV settings. As with IQ4_NL, `--components ngram` writes a
+separate table and `--components text,ngram` embeds it in the model.
+
+```bash
+python3.11 -m tools.convert --model /models/flash-next-config \
+  --recipe qwen3_8_flash_next_gguf --components ngram \
+  --source ngram=/models/ple-q8.gguf --device cpu --out /models/ple-q8.ninfer
+```
+
+The runtime reads the stored signed codes and FP16 scales, rounding each decoded
+value once to the BF16 embedding. The existing disk, RAM and hot-row placements
+use the selected table's row size. Supplying an external Q8PLE table to a model
+converted against IQ4_NL retains the usual format/digest notice described above.
+
 ### Without the n-gram table
 
 The model was trained with its n-gram embedding, so the engine refuses a model whose table it
@@ -534,6 +563,52 @@ all-zero table gives), and warns at startup: this is a non-standard, experimenta
 practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66 to 5.01 over the
 fourteen windows of the comparison below; short factual answers survive, but nothing measured
 improves.
+
+### Native FP16 KV
+
+`--kv-dtype fp16` selects IEEE binary16 K/V storage for Flash-Next and Edge0. The default remains
+`bf16`; this option changes runtime cache precision, independent of the artifact's expert and
+n-gram formats. It also accepts the flat launch setting `"kv-dtype": "fp16"`.
+
+Key/value projections output FP32; key RMSNorm and RoPE stay FP32 until append rounds K and V
+once, nearest-even, into FP16. Sparse attention reads those half values directly with FP32
+accumulation, without a BF16 intermediate or the quantized formats' Hadamard rotation. Main and
+MTP layers, paged storage, host streaming and tensor-parallel KV-head shares use the same path.
+Queries, residual activations, the indexer, GDN state and a DFlash2 drafter's local cache keep their
+existing representations. This follows Basalt's cache-production boundary, rather than its entire
+engine's arithmetic; it does not promise identical generated answers.
+
+FP16 and BF16 both use two bytes per value. With 12 attention layers, two KV heads and 256 values
+per head, main K/V is 24,576 bytes per token: 6 GiB for one full 262,144-position context, before
+MTP and other state. Streaming changes where those bytes reside. FP16 keeps three more fraction
+bits but has a smaller exponent range: values can underflow or overflow where BF16 would remain
+finite. The option is a precision choice, rather than a compression or speed guarantee. Gemma 4
+and Flint keep their F16 caches under this name too; Qwen3.5-core models and DeepSeek-V4.1 refuse
+it.
+
+FP16 against BF16 on Flash-Next Q2_0 with host experts and the IQ4_NL table, on an RTX 3090
+(`ninfer-perplexity`, total NLL in nats). A recall text lists unique random five-digit rooms and
+codes, then the same lines in another order; its row is the NLL of the second list, each code up to
+half the text back:
+
+| text | scored tokens | BF16 | FP16 | FP16 against BF16 |
+|---|---:|---:|---:|---:|
+| WikiText, first 40 KB | 9,481 | 9,110.74 | 9,118.63 | +0.09% |
+| recall 32K, seed 1 | 16,350 | 9,856.67 | 9,831.75 | -0.25% |
+| recall 32K, seed 2 | 16,350 | 10,004.82 | 9,791.49 | -2.1% |
+| recall 64K, seed 1 | 32,745 | 19,888.54 | 20,088.04 | +1.0% |
+| recall 64K, seed 2 | 32,745 | 22,142.36 | 22,119.06 | -0.1% |
+| recall 128K, seed 1 | 65,505 | 53,286.61 | 57,751.11 | +8.4% |
+| recall 128K, seed 2 | 65,505 | 43,566.38 | 44,017.20 | +1.0% |
+
+Forty eight-way choice reads over each list (`/v1/systemone`) picked the right code 40 times of 40
+in both formats from 8K to 128K tokens, and a request took as long in one as in the other (19 and
+20 s at 8K, 31 at 32K, 48 at 64K, 83 and 84 at 128K, `ninfer-serve --max-context 131072`). Prefill
+runs at the same rate in both (587.6 against 588.5 tok/s over the 64K recall text, the KV streamed
+from pinned memory past 32,768 positions). With FP32 keys and values, a BF16 query and FP64
+attention over 1K to 256K synthetic keys, FP16 storage leaves a 2.4 to 3.1 times smaller output
+error than BF16 at every length; in the model the differences go both ways, with no trend in
+length, so BF16 stays the default.
 
 ### Streamed sparse-attention KV
 
@@ -951,7 +1026,10 @@ not.
   shared by the sequences: a step of another sequence than the last captures it again and updates
   the graph in place; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
-  `--no-cuda-graph` decodes eagerly everywhere.
+  Under WDDM (Windows, and WSL2) so do the passes of GGUF host experts with staged misses: there a
+  graph's copies queued after a layer's wait for the misses could hold back the service's copies
+  that end it, and the startup log says that graphs are off. `--no-cuda-graph` decodes eagerly
+  everywhere.
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run

@@ -229,7 +229,8 @@ __global__ void __launch_bounds__(Group * 32)
     using Pair    = std::conditional_t<std::is_same_v<Element, __half>, __half2, __nv_bfloat162>;
     // bf16p rows decode to the BF16 a bf16 cache holds: neither quantized nor rotated.
     constexpr bool kPacked    = Storage == KvCacheStorage::Bf16Packed;
-    constexpr bool kQuantized = Storage != KvCacheStorage::BFloat16 && !kPacked;
+    constexpr bool kQuantized =
+        Storage != KvCacheStorage::BFloat16 && Storage != KvCacheStorage::Float16 && !kPacked;
     constexpr int kThreads    = Group * 32;
     // NVFP4 and K8V4 store their values rotated as well as their keys.
     constexpr bool kRotatedValues =
@@ -322,8 +323,8 @@ __global__ void __launch_bounds__(Group * 32)
                 value_words[3]    = vw.w;
             }
         } else {
-            const auto* k_pages = static_cast<const __nv_bfloat16*>(planes.k);
-            const auto* v_pages = static_cast<const __nv_bfloat16*>(planes.v);
+            const auto* k_pages = static_cast<const Element*>(planes.k);
+            const auto* v_pages = static_cast<const Element*>(planes.v);
             for (int i = threadIdx.x; i < kTile * (kHeadDim / 2); i += kThreads) {
                 const int row = i / (kHeadDim / 2), pair = i % (kHeadDim / 2);
                 const int index = base + row;
@@ -594,6 +595,7 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
         }                                                                                          \
         return;
         NINFER_SPARSE_ATTENTION_CASE(BFloat16)
+        NINFER_SPARSE_ATTENTION_CASE(Float16)
         NINFER_SPARSE_ATTENTION_CASE(Int8Group64)
         NINFER_SPARSE_ATTENTION_CASE(Fp8E4M3Row256)
         NINFER_SPARSE_ATTENTION_CASE(RotatedInt8KeyInt4ValueGroup64)
