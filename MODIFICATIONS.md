@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `40d913db` |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 27 files added, 82 modified; no upstream file deleted |
+| Scope | 27 files added, 84 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -125,20 +125,34 @@ offered under the same Apache-2.0 license.
   `qsa_quote` settles the three-way choice (the lane's live prefix, its
   prompt-end snapshot, the store's longest image); `qsa_reserve` starts the
   sequence, adopts the lane's live state or snapshot when one continues the
-  prompt, or lands an image — its StateImage half through
-  `copy_from_host_segments`, its planes through `qsa_copy_image`; `qsa_retire`
-  writes an endpoint image before the lane is released and charges the real
-  StateImage geometry, so a store failure never fails the request that just
-  finished. Anchor capture runs where a prompt ends (`prefill.cpp`), and the
-  lane's record is advanced in `program_impl.cpp` where the KV frontier moves.
+  prompt, or lands an image — its StateImage half, which now carries the QSA
+  indexer region (so a store resume restores pooled/tail/tail_axes, not just GDN
+  and hidden), through `copy_from_host_segments`, its text-KV planes through
+  `qsa_copy_image`, and its MTP backend-KV pages through
+  `DeviceKVPagePool::copy_from_host` (restoring `mtp_kv_valid` and the committed
+  frontier, then letting the bridge advance it as a live resume does);
+  `qsa_retire` writes an endpoint image before the lane is released and charges
+  the real StateImage geometry, so a store failure never fails the request that
+  just finished. Anchor capture runs where a prompt ends (`prefill.cpp`) and also
+  saves the lane's indexer tail and tail-axes, so a same-lane turn-closure resume
+  restores them and the boundary block pools from the prompt's partial keys
+  instead of the endpoint's stale tail (the reuse point stays at the anchor so the
+  running GDN/hidden snapshot stays position-consistent). The lane's record is
+  advanced in `program_impl.cpp` where the KV frontier moves.
 - `program/prefix/hybrid_program.cpp` is upstream except for the pieces that are
   not reuse: the loud refusal to build the hybrid cache for the streamed tier,
   the two QSA StateImage gates (a snapshot's QSA state is only restorable from its
   Host replica), and `qsa_end_lane_tenure` / `qsa_clear_lane_prefix` in
   `hybrid_release_lane` (which therefore runs with or without a hybrid cache).
-  `hybrid_cache.*`, `hybrid_host_layout.*`, `hybrid_persist.*` and
+  `hybrid_host_layout.*`, `hybrid_persist.*` and
   `runtime/prefix_cache/prefix_index.*` are upstream verbatim again; the streamed
   tier no longer reuses blocks through the hybrid cache's Host slab.
+  `hybrid_cache.*` carries one fork change beyond upstream: the snapshot capture
+  and restore thread the owning sequence's `qsa_lane` through
+  `copy_to_host_segments` / `copy_from_host_segments`, so a device-resident QSA
+  snapshot is captured from, and landed into, the lane that actually ran it
+  instead of always lane 0 (which under concurrency would poison the shared
+  snapshot with the wrong lane's indexer).
 - `program/planning/request_plan.cpp` binds a request to a lane: it reports the
   three-way scan under `NINFER_DEBUG_REUSE`, keeps the Legacy catalog's lane
   ownership rule, and lets the streamed tier choose its lane in the resource
@@ -173,7 +187,10 @@ offered under the same Apache-2.0 license.
 
 - `--kv-resident N|all|auto` (`src/product/kv_resident_options.h`) sets how many
   positions of each sparse-attention layer's KV stay in device memory; past them
-  the layers stream from pinned host memory. `auto` follows the upstream preset
+  the layers stream from pinned host memory. `all` and the literal `0` both resolve
+  to the fully-resident sentinel (zero streamed positions); under
+  `--qwen38-27b-qsa` that selects the device-resident Hybrid path rather than the
+  streamed tier, while a positive `N` streams. `auto` follows the upstream preset
   (all with device experts, 32,768 with host or disk experts).
 - `src/ops/kv_stream/kv_stream.cu` and `include/ninfer/ops/kv_stream.h` move the
   authoritative KV to pinned host memory behind one shared staging layer and plan
@@ -205,9 +222,12 @@ offered under the same Apache-2.0 license.
   shared `src/product/qsa_top_blocks_options.h`. The count is in four-token
   blocks, 1 to 65,536; unset or `0` keeps the artifact's own 512 blocks, and the
   value is fixed at startup so a captured graph replays the grid it captured.
-- `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` when
-  `--qwen38-27b-qsa` runs with a numeric (or `all`) `--kv-resident`, and leaves
-  `--host-cache-mib` as the store's budget. It refuses `--qwen38-27b-qsa` with
+- `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
+  `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
+  resolved to the fully-resident sentinel) fall through to the shared
+  `ContextCacheMode::Hybrid` device-resident path, so a non-streamed QSA run keeps
+  the hybrid content-addressed block tree and its per-frontier snapshots.
+  `--host-cache-mib` is the store's budget. It refuses `--qwen38-27b-qsa` with
   `--use-original-prefix-caching`, because the checkpoint catalog has no
   candidate that could rebuild a QSA session.
 - `src/serve/operational_log.cpp` logs the effective history window with the
@@ -322,9 +342,15 @@ them restores nothing. The streamed tier resumes through its own store instead
 
 ## Known limits
 
-- A store resume is refused while MTP drafts run: an image carries no draft KV,
-  so the admission waits (`Aborted`) rather than restoring a state the drafter
-  did not follow. A live or anchor resume, and every root, is unaffected.
+- A store resume now carries the MTP draft KV (the image's backend-KV region), so a
+  drafting request resumes from a stored endpoint image just as from a live or
+  anchor state; the earlier "store refused while MTP drafts run" guard is gone.
+- A turn-closure (anchor) resume under MTP rebuilds its draft KV from a fresh
+  backend plus the bridge, so the reused prompt prefix's draft KV is not carried
+  and that request's MTP accept rate is lower than a live resume's; output stays
+  correct (target verification). Reusing the retained draft KV here is a deliberate
+  non-optimization: the path is rare (a regenerate or a reply-dropping branch, not
+  a normal follow-up), and the fix would reopen the committed-frontier accounting.
 - `--host-cache-mib auto` has no streamed-tier model yet: without an explicit
   budget the store stays absent and the tier admits roots only. The default
   budget is 8 GiB; `--host-cache-mib 0` disables the store.
@@ -416,7 +442,7 @@ tools/convert (5)
 - `tools/convert/qsa_gguf.py`
 - `tools/convert/qsa_graft_recipe.py`
 
-### Modified (82)
+### Modified (84)
 
 Root (1)
 
@@ -502,8 +528,10 @@ src/models/qwen3_5/program/planning (3)
 - `src/models/qwen3_5/program/planning/startup.cpp`
 - `src/models/qwen3_5/program/planning/startup.h`
 
-src/models/qwen3_5/program/prefix (1)
+src/models/qwen3_5/program/prefix (3)
 
+- `src/models/qwen3_5/program/prefix/hybrid_cache.cpp`
+- `src/models/qwen3_5/program/prefix/hybrid_cache.h`
 - `src/models/qwen3_5/program/prefix/hybrid_program.cpp`
 
 src/models/qwen3_5/program/speculative (2)
