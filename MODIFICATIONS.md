@@ -13,10 +13,10 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Upstream commit | `40d913db` |
+| Upstream commit | `87c35b6d4` (merged through 20 November 2026) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 27 files added, 84 modified; no upstream file deleted |
+| Scope | 28 files added, 87 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -32,6 +32,12 @@ offered under the same Apache-2.0 license.
   through a pre-key RMSNorm (`key_pre_norm`), interleaved three-axis (t/h/w)
   M-RoPE positions with YaRN and position interpolation, and per-lane indexer
   state so one program can score several sequences.
+- The indexer's three norm weights (`query_norm`, `key_norm` and the fork's
+  `key_pre_norm`) are read through upstream's `DirectWeight`, so they arrive as
+  BF16 or FP32 exactly as the artifact stores them; the two projections stay
+  BF16. `unit_offset` in `QsaIndexerWeights` distinguishes a multiplicative gamma
+  from the zero-centred `1 + w` form, and all three readers honour it —
+  `norm_rope_row`, `pre_norm_key` and `qsa_score_kernel` alike.
 - `src/ops/sparse_attention/sparse_attention.cu` selects and attends with the
   model's 24-over-4 geometry. The selection budget is a call argument
   (`include/ninfer/ops/qsa_budget.h` holds the shared cap and geometry), and the
@@ -222,6 +228,11 @@ offered under the same Apache-2.0 license.
   shared `src/product/qsa_top_blocks_options.h`. The count is in four-token
   blocks, 1 to 65,536; unset or `0` keeps the artifact's own 512 blocks, and the
   value is fixed at startup so a captured graph replays the grid it captured.
+- `--qsa-prefill` (`ninfer-serve` only) sends prefill through the sparse branch
+  as well; it is refused without `--qwen38-27b-qsa`, and
+  `resolved_qsa_prefill()` (`program/planning/startup.cpp`) resolves it ahead of
+  the legacy `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the
+  default because upstream's wide-T QSA kernel is not yet optimised.
 - `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
   `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
   resolved to the fully-resident sentinel) fall through to the shared
@@ -243,10 +254,14 @@ offered under the same Apache-2.0 license.
 - `qsa_gguf.py` implements the `qwen3_8_27b_qsa_gguf` recipe registered in
   `gguf_blocks.py`; it teaches the converter the 80 extra `blk.N.indexer.*`
   tensors, and `convert_qsa27b.py` is the one-shot wrapper that writes a single
-  `.ninfer` artifact. The converter un-folds the norms' `1 + w` offset and casts the
-  donor's F32 indexer tensors to BF16, the kernels' format, and its parser
-  (`build_parser`) pins the default that packs the indexed proposal head, with an
-  explicit opt-out.
+  `.ninfer` artifact. The converter un-folds the norms' `1 + w` offset and casts
+  the donor's F32 indexer projections to BF16; the three indexer norms follow
+  `text_config.fp32_direct`, which keeps them FP32 — a straight passthrough of the
+  GGUF's own F32 values, 24 KiB for the whole model — instead of rounding them.
+  Every other direct norm and the GDN convolution stay BF16, because the fused
+  `gdn_norm_gating_proj`, `gdn_input_proj` and `rmsnorm_rope` kernels reject FP32
+  operands. Its parser (`build_parser`) pins the default that packs the indexed
+  proposal head, with an explicit opt-out.
 - `qsa_graft_recipe.py` grafts the indexer tensors and the native BF16 GDN
   controls onto an artifact converted from another quantization; the donor is
   optional, and `extract_indexer_tensors.py` / `extract_gdn_controls.py` write the
@@ -259,7 +274,9 @@ offered under the same Apache-2.0 license.
 - Operator: `tests/ops/test_qsa_indexer.cpp` covers the 24-over-4 select, the
   three-axis M-RoPE with YaRN and interpolation, and the selection budget;
   `test_sparse_attention.cpp` and `test_kv_stream.cpp` cover the attention and
-  streaming paths.
+  streaming paths. Its FP32 arms run both weight forms against the FP64 oracle —
+  a multiplicative gamma (`unit_offset=false`) and the zero-centred `1 + w` the
+  27B stores — so the combination the engine actually executes is covered.
 - Streamed tier: `tests/models/qwen3_5/test_qsa_lane_prefix.cpp` pins the lane
   record (frontier follows writes, a stop cut truncates, the media key is the
   record's own, a text-only prefix keys zero, the anchor catches a prompt that
@@ -299,6 +316,15 @@ offered under the same Apache-2.0 license.
   binaries aborted at load time with an unresolved `zlib.dll` import.
 - `src/models/qwen3_5/program_sources.cmake` adds the store, image and admission
   sources; `tests/models/qwen3_5/tests.cmake` registers their tests.
+- `.github/workflows/windows-release-cuda13.yml` builds the CUDA 13.4.3 Windows
+  release on hosted runners: it configures the five architectures, shards the
+  compile eight ways through `build-object-shard.py` (whose `windows` weight table
+  keeps the two-hour units apart), and replays the graph against a restored ccache
+  to link and package. Its dispatch inputs narrow a run to one `shard`, set the
+  compile `jobs` per shard (default 1) and `split_compile` (`off` disables it,
+  because CMake reads `0` as "use every core"), and it prints the runner's free
+  memory around the compile; `build-object-shard.py` retries a failed batch once,
+  which is what the 16 GiB runners need when `cicc` dies mid-batch.
 
 ### Benchmarks and diagnostics
 
@@ -319,26 +345,27 @@ offered under the same Apache-2.0 license.
 
 ### Documentation
 
-- `README.md` states the fork's attribution, the three flags, the streamed-KV
+- `README.md` states the fork's attribution, the four flags, the streamed-KV
   floor and the QSA prefill/decode measurements.
 - `docs/cli.md` and `docs/serving.md` list `--qwen38-27b-qsa`,
   `--qsa-top-blocks`, the Qwen3.8-27B reading of `--kv-resident` and the media
-  accounting ceiling; `docs/maintainer/qwen4-exp-model.md` records where the sparse
+  accounting ceiling; `docs/cli.md` also carries `--qsa-prefill` with its legacy
+  environment spelling; `docs/maintainer/qwen4-exp-model.md` records where the sparse
   branch sits in the Qwen4 experimental model, and that this fork makes its width
   runtime-selectable.
 
 ### Not carried here
 
-The branch `experiment/qsa-hybrid-streamed` holds a separate line of work:
-keeping a conversation's resume state inside the hybrid cache, with snapshot
-ownership marks, live-lane prefix pages and block-level Host slabs. That line is
-not part of this branch: the pieces it had put into `hybrid_cache.*`,
-`hybrid_host_layout.*`, `hybrid_persist.*` and `prefix_index.*` were reverted,
-because the streamed tier's block content lives in the pinned host planes while
-the hybrid cache's Host layout describes dense Device pages that under
-`--kv-resident` are bookkeeping placeholders carrying no KV, so a slab copied from
-them restores nothing. The streamed tier resumes through its own store instead
-(above), and the hybrid cache refuses to be built for it.
+An earlier experimental line of work — no longer on any branch, the streamed
+tier having overtaken it — kept a conversation's resume state inside the hybrid
+cache, with snapshot ownership marks, live-lane prefix pages and block-level Host
+slabs. That line is not part of this branch: the pieces it had put into
+`hybrid_cache.*`, `hybrid_host_layout.*`, `hybrid_persist.*` and `prefix_index.*`
+were reverted, because the streamed tier's block content lives in the pinned host
+planes while the hybrid cache's Host layout describes dense Device pages that
+under `--kv-resident` are bookkeeping placeholders carrying no KV, so a slab
+copied from them restores nothing. The streamed tier resumes through its own
+store instead (above), and the hybrid cache refuses to be built for it.
 
 ## Known limits
 
@@ -374,11 +401,15 @@ them restores nothing. The streamed tier resumes through its own store instead
 
 ## Files
 
-### Added (27)
+### Added (28)
 
 Root (1)
 
 - `MODIFICATIONS.md`
+
+.github/workflows (1)
+
+- `.github/workflows/windows-release-cuda13.yml`
 
 include/ninfer/ops (1)
 
@@ -442,11 +473,15 @@ tools/convert (5)
 - `tools/convert/qsa_gguf.py`
 - `tools/convert/qsa_graft_recipe.py`
 
-### Modified (84)
+### Modified (87)
 
 Root (1)
 
 - `README.md`
+
+.github/scripts (1)
+
+- `.github/scripts/build-object-shard.py`
 
 apps/cli (3)
 
@@ -495,8 +530,9 @@ src/models/qwen3_5 (4)
 - `src/models/qwen3_5/program_sources.cmake`
 - `src/models/qwen3_5/weights.h`
 
-src/models/qwen3_5/execution (4)
+src/models/qwen3_5/execution (5)
 
+- `src/models/qwen3_5/execution/attention.cpp`
 - `src/models/qwen3_5/execution/parameters.cpp`
 - `src/models/qwen3_5/execution/parameters.h`
 - `src/models/qwen3_5/execution/text.cpp`
@@ -625,7 +661,8 @@ tests/ops (3)
 - `tests/ops/test_qsa_indexer.cpp`
 - `tests/ops/test_sparse_attention.cpp`
 
-tools/convert (2)
+tools/convert (3)
 
 - `tools/convert/__main__.py`
 - `tools/convert/gguf_blocks.py`
+- `tools/convert/qwen3_5.py`
