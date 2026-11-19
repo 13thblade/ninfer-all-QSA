@@ -251,9 +251,11 @@ int main() {
                           parse({"ninfer-serve", "model.ninfer", "--kv-resident", "8192"})
                                   .kv_resident_positions == 8192U &&
                           parse({"ninfer-serve", "model.ninfer", "--kv-resident", "all"})
+                                  .kv_resident_positions == 0U &&
+                          parse({"ninfer-serve", "model.ninfer", "--kv-resident", "0"})
                                   .kv_resident_positions == 0U,
                       "server did not preserve --kv-resident");
-    for (const auto* value : {"0", "nan", "auto1"}) {
+    for (const auto* value : {"nan", "auto1"}) {
         bool rejected = false;
         try { (void)parse({"ninfer-serve", "model.ninfer", "--kv-resident", value}); }
         catch (const std::invalid_argument&) { rejected = true; }
@@ -290,6 +292,22 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected,
                           "server combined --qwen38-27b-qsa with --use-original-prefix-caching");
+    }
+    {
+        // QSA runs the streamed store only for an actual streaming window. `--kv-resident all`/`0`
+        // keep every position resident and run the shared hybrid prefix cache (device-resident);
+        // routing them into ContextCacheMode::Qsa left no streamed planes and aborted every
+        // request. A positive window is the only value that selects the store.
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
+                                 "--kv-resident", "all"})
+                              .context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                              parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
+                                    "--kv-resident", "0"})
+                                  .context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                              parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
+                                    "--kv-resident", "16384"})
+                                  .context_cache.mode == ninfer::ContextCacheMode::Qsa,
+                          "QSA --kv-resident all/0 must run hybrid, a positive window the store");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&

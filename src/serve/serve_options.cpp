@@ -1761,8 +1761,13 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
     // state plus the continuation hidden in the sequence's StateImage, so an image carries both
     // halves. The hybrid cache stays off this tier -- its Host layout describes Device pages that
     // under --kv-resident are bookkeeping placeholders carrying no KV.
+    // Only an actual streaming window (a positive --kv-resident) selects the QSA streamed store.
+    // "all"/"0" resolve to 0 = every position resident, and an unset/auto value resolves to 0 on
+    // the device-expert graft model: those run the shared hybrid prefix cache (device-resident),
+    // not the streamed tier. Keying this on has_value() wrongly routed "--kv-resident all" into
+    // ContextCacheMode::Qsa, whose admission then aborts every request (no streamed planes).
     const bool qsa_streamed =
-        options.qwen38_27b_qsa && options.kv_resident_positions.has_value();
+        options.qwen38_27b_qsa && options.kv_resident_positions.value_or(0U) > 0U;
     // The hybrid prefix cache is the default. What only the checkpoint catalog serves selects the
     // catalog instead: one of its options, several devices, disabled prefix reuse (the hybrid
     // cache cannot be off) or a graft (a direct graft lives in a catalog shared-prefix slot).

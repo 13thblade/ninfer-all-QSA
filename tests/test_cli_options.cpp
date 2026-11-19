@@ -305,9 +305,10 @@ int run_tests() {
         };
         failures += check(!resident({}) && resident({"--kv-resident", "4096"}) == 4096U &&
                               resident({"--kv-resident", "all"}) == 0U &&
+                              resident({"--kv-resident", "0"}) == 0U &&
                               !resident({"--kv-resident", "4096", "--kv-resident", "auto"}),
                           "CLI did not preserve --kv-resident");
-        for (const auto* value : {"0", "-1", "12x", "", "All"}) {
+        for (const auto* value : {"-1", "12x", "", "All"}) {
             failures += check(rejects([&] { (void)resident({"--kv-resident", value}); }),
                               "CLI accepted an invalid --kv-resident");
         }

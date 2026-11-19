@@ -31,17 +31,17 @@ bool parse_kv_resident_option(std::string_view option, std::optional<std::uint32
                               Value&& value) {
     if (option != "--kv-resident") { return false; }
     const std::string text(value());
-    if (text == "all") {
-        out = 0;
+    if (text == "all" || text == "0") {
+        out = 0; // "0" and "all" both mean: keep every position resident (no streaming)
     } else if (text == "auto") {
         out.reset();
     } else {
         std::uint32_t positions = 0;
         const auto [end, error] =
             std::from_chars(text.data(), text.data() + text.size(), positions);
-        if (error != std::errc{} || end != text.data() + text.size() || positions == 0) {
-            throw std::invalid_argument("--kv-resident takes a positive position count, all or "
-                                        "auto");
+        if (error != std::errc{} || end != text.data() + text.size()) {
+            throw std::invalid_argument("--kv-resident takes a position count (0 or all keep "
+                                        "every position resident), or auto");
         }
         out = positions;
     }
