@@ -150,10 +150,12 @@ public:
     // Copies a Device-resident snapshot (image and tail) to Host slabs, evicting nothing worth
     // more than it and never `keep` (the lane's newest superseded tap, §9.3). Returns false when
     // there is no Host tier or no slabs could be freed. The snapshot is pinned until the copy
-    // completes.
+    // completes. Under `--qwen38-27b-qsa` the StateImage carries the QSA indexer region; it is
+    // read out of the shared per-lane planes, so `qsa_lane` names the lane the snapshot was taken
+    // on -- its indexer state is what lands in the snapshot's Host replica.
     bool start_snapshot_host_write(runtime::prefix_cache::SnapshotRef snapshot,
                                    runtime::prefix_cache::SnapshotRef keep, cudaStream_t producer,
-                                   cudaStream_t transfer);
+                                   cudaStream_t transfer, std::uint32_t qsa_lane);
     // Copies every Device-only node of `nodes` to a Host slab in one batch, evicting anything but
     // `keep` (the lane's newest superseded tap, §9.3) and no retained snapshot with a GDSF
     // priority above `claim` (the lane's snapshots, PrefixCacheIndex::retained_priority). Nodes
@@ -182,7 +184,8 @@ public:
     void open_restore(cudaStream_t producer);
     void restore_block(runtime::prefix_cache::NodeRef node, HybridBlockPages destination);
     void restore_tail(runtime::prefix_cache::SnapshotRef snapshot, HybridBlockPages destination);
-    void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::int32_t device_slot);
+    void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::int32_t device_slot,
+                       std::uint32_t qsa_lane);
     // Enqueues the batch in the order a forward pass reads it: a prelude (the snapshot tail, every
     // backend page, and the image's continuation hidden and DFlash state), then each model layer's
     // KV planes or recurrent state, recording an event after the prelude and after every layer.
@@ -273,6 +276,9 @@ private:
         // The snapshot whose Host image lands in `image_slot`.
         std::optional<runtime::prefix_cache::SnapshotRef> image;
         std::int32_t image_slot = -1;
+        // The destination lane whose shared QSA indexer planes the image's QSA region lands into
+        // (0 when the model carries no QSA state). Set with `image` in restore_image.
+        std::uint32_t image_lane = 0;
         PageCopies copies;
         PageCopies tail_copies;
         cudaEvent_t prelude = nullptr;

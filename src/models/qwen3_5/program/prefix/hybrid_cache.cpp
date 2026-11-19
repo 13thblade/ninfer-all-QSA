@@ -356,7 +356,8 @@ void HybridPrefixCache::order_after(cudaStream_t producer, cudaStream_t consumer
 // ---- Host write-through ------------------------------------------------------------------------
 
 bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, SnapshotRef keep,
-                                                  cudaStream_t producer, cudaStream_t transfer) {
+                                                  cudaStream_t producer, cudaStream_t transfer,
+                                                  std::uint32_t qsa_lane) {
     if (!host_tier() || !index_->valid(snapshot) || !images_[snapshot.index].valid()) {
         return false;
     }
@@ -382,7 +383,8 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
         order_after(producer, transfer);
         state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
                                            segments, host_layout_.slab_bytes,
-                                           on_every_rank(transfer));
+                                           on_every_rank(transfer), /*include_qsa=*/true,
+                                           /*qsa_stream=*/nullptr, qsa_lane);
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
             write_scratch_.clear();
@@ -558,7 +560,8 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
     add_copies(restore_.tail_copies, destination, view.host_slabs[host_layout_.image_slabs]);
 }
 
-void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_slot) {
+void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_slot,
+                                      std::uint32_t qsa_lane) {
     if (!restore_.open || restore_.submitted || restore_.image) {
         throw std::logic_error("hybrid restore is not open");
     }
@@ -570,6 +573,7 @@ void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_
     }
     restore_.image      = snapshot;
     restore_.image_slot = device_slot;
+    restore_.image_lane = qsa_lane;
 }
 
 void HybridPrefixCache::submit_restore() {
@@ -606,7 +610,7 @@ void HybridPrefixCache::submit_restore() {
         state_pool_->copy_from_host_segments(
             segments, host_layout_.slab_bytes, restore_.image_slot,
             qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest},
-            on_every_rank(restore_stream_));
+            on_every_rank(restore_stream_), /*qsa_stream=*/nullptr, restore_.image_lane);
     }
     restore_.prelude = record();
     // Then each layer's own state, in forward order, so a pass can start on the first layers
