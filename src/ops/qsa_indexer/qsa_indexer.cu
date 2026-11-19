@@ -146,12 +146,13 @@ __device__ void norm_rope_row(float* values, DirectWeight weight, float eps, boo
 }
 
 // Zero-centred RMSNorm of one raw indexer key, a 128-vector held one value per thread, before the
-// 4-token mean. `key_pre_norm` supplies the stored 1 + w weight of the QSA-27B adaptation, read
-// directly as BF16 or FP32 like the query/key norms; the reduction is the same four-warp sum
-// `norm_rope_row` uses.
+// 4-token mean. `key_pre_norm` supplies the QSA-27B adaptation's weight, read directly as BF16 or
+// FP32 like the query/key norms, and follows `unit_offset` exactly as `norm_rope_row` does; the
+// reduction is the same four-warp sum `norm_rope_row` uses.
 template <bool PreNorm>
 __device__ __forceinline__ float pre_norm_key(float value, int d,
-                                              DirectWeight key_pre_norm, float eps, float* reduce) {
+                                              DirectWeight key_pre_norm, float eps,
+                                              bool unit_offset, float* reduce) {
     if constexpr (!PreNorm) {
         return value;
     } else {
@@ -166,7 +167,8 @@ __device__ __forceinline__ float pre_norm_key(float value, int d,
         __syncthreads();
         const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
         const float normed =
-            value * rsqrtf(total / kHeadDim + eps) * (1.0f + key_pre_norm[d]);
+            value * rsqrtf(total / kHeadDim + eps) *
+            ((unit_offset ? 1.0f : 0.0f) + key_pre_norm[d]);
         __syncthreads();
         return normed;
     }
@@ -220,7 +222,7 @@ __global__ void __launch_bounds__(kHeadDim)
             float value = __bfloat162float(
                 projection[static_cast<std::int64_t>(position - first_position) * kProjection +
                            kHeads * kHeadDim + d]);
-            sum += pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+            sum += pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, unit_offset, reduce);
         }
     }
     row[d] = sum * 0.25f;
@@ -235,7 +237,7 @@ __global__ void __launch_bounds__(kHeadDim)
 template <bool PreNorm>
 __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
                                 const int* __restrict__ first, int tokens,
-                                DirectWeight key_pre_norm, float eps,
+                                DirectWeight key_pre_norm, float eps, bool unit_offset,
                                 float* __restrict__ tail,
                                 const int* __restrict__ rope_positions,
                                 int* __restrict__ tail_axes, std::int32_t axis_stride) {
@@ -248,7 +250,7 @@ __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
         float value = __bfloat162float(
             projection[static_cast<std::int64_t>(position - first_position) * kProjection +
                        kHeads * kHeadDim + d]);
-        value = pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, reduce);
+        value = pre_norm_key<PreNorm>(value, d, key_pre_norm, eps, unit_offset, reduce);
         tail[(position % kBlock) * kHeadDim + d] = value;
         // Keep the tail slots' 3-axis positions for the next call's pooling of
         // a block that starts inside this incomplete block.
@@ -917,7 +919,8 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
         CUDA_CHECK(cudaGetLastError());
         qsa_tail_kernel<kPreNorm><<<1, kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projection.data), first, tokens, key_pre_norm, eps,
-            static_cast<float*>(tail.data), pos.rope, pos.tail_axes, pos.axis_stride);
+            weights.unit_offset, static_cast<float*>(tail.data), pos.rope, pos.tail_axes,
+            pos.axis_stride);
         CUDA_CHECK(cudaGetLastError());
     };
     if (rope.active) {

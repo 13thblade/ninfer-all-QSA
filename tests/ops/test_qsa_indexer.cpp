@@ -135,7 +135,11 @@ std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& ya
             double sum = 0;
             for (double v : key) sum += v * v;
             const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
-            for (int d = 0; d < kDim; ++d) key[d] = key[d] * scale * (1.0 + seq.key_pre_norm[d]);
+            // key_pre_norm follows unit_offset like the query/key norms: (1 + w) for the
+            // zero-centred QSA-27B form, (0 + w) when the artifact stores a multiplicative gamma.
+            const double offset = seq.unit_offset ? 1.0 : 0.0;
+            for (int d = 0; d < kDim; ++d)
+                key[d] = key[d] * scale * (offset + seq.key_pre_norm[d]);
         }
         for (int d = 0; d < kDim; ++d) mean[d] += key[d];
     }
@@ -232,7 +236,12 @@ int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
     // empty so the oracle pools the raw keys, as the op does when the weight is null.
     if (pre_norm) {
         fill_uniform(seq.key_pre_norm, seed + 3, -0.5f, 0.5f);
-        if (!fp32_norm) round_to_bf16(seq.key_pre_norm);
+        if (!fp32_norm) {
+            round_to_bf16(seq.key_pre_norm);
+        } else if (!fp32_zero_centred) {
+            // A multiplicative-gamma artifact stores w + 1, the same fold the query/key norms take.
+            for (auto& value : seq.key_pre_norm) value += 1.0f;
+        }
     }
     std::vector<std::vector<double>> pooled(seq.length / 4);
     for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn, axes);
