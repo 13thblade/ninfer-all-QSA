@@ -154,19 +154,24 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
     if mtp and not has_mtp(target):
         raise ValueError(f"{target.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
 
+    # Same rule as the official recipe, resolved in one place: fp32_direct keeps the three
+    # indexer norms in FP32 (the donor's own values, un-folded in F32) and the two
+    # projections stay BF16.
+    indexer_dtype = qsa_gguf.indexer_direct_format(config)
+
     # Indexer source: prefer the committed asset; fall back to a donor GGUF (legacy path).
     if qsa_gguf.has_indexer_asset():
-        indexer_sources = qsa_gguf.sources_from_asset()
+        indexer_sources = qsa_gguf.sources_from_asset(dtype=indexer_dtype)
     else:
         donor = open_donor(sources)
         if donor.path.resolve() == target.path.resolve():
             raise ValueError(f"{donor.path}: the donor must not be the target file")
         check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
-        indexer_sources = qsa_gguf.sources(donor)
+        indexer_sources = qsa_gguf.sources(donor, dtype=indexer_dtype)
 
     # Register the indexer parameters and their artifact config before the stock
     # recipe body runs, exactly as qwen3_8_27b_qsa_gguf does.
-    qsa_gguf.register_parameters(model)
+    qsa_gguf.register_parameters(model, dtype=indexer_dtype)
     model.config.update(qsa_gguf.artifact_config())
     for layer in qsa_gguf.qsa_layers():
         for role in qsa_gguf.ROLES:

@@ -1023,8 +1023,7 @@ def qwen3_8_27b_qsa_gguf(model, recipe, sources):
     # fp32_direct keeps the QSA indexer's three norm weights as FP32 instead of rounding
     # them to BF16. Nothing else follows the switch -- see the note after the indexer
     # registration below for why.
-    fp32_direct = bool(config.get("fp32_direct", False))
-    indexer_dtype = "fp32" if fp32_direct else "bf16"
+    indexer_dtype = qsa_gguf.indexer_direct_format(config)
 
     # Recipe.assign resolves selectors against model.parameters, so register the
     # indexer logical parameters (and their config) before assigning anything.

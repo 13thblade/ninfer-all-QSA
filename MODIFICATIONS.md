@@ -267,6 +267,9 @@ offered under the same Apache-2.0 license.
   optional, and `extract_indexer_tensors.py` / `extract_gdn_controls.py` write the
   manifests under `tools/convert/assets/` that make a graft reproducible. A
   missing asset warns loudly instead of falling back to a machine-local path.
+  Both routes resolve the indexer norms' direct format through
+  `qsa_gguf.indexer_direct_format(config)`, so a graft carries the same FP32 norms
+  as an artifact converted straight from a QSA GGUF.
 - `scripts/verify_qsa_gguf.py` is the offline preflight for a downloaded QSA GGUF.
 
 ### Tests

@@ -46,11 +46,22 @@ COMPRESS_RATIO = 4
 #: Token budget. The engine selects ``INDEXER_BUDGET / COMPRESS_RATIO`` = 512 blocks.
 INDEXER_BUDGET = 2048
 
-# ninfer's qsa_pool_kernel reads BF16 norm weights and the engine's direct-parameter
-# loader accepts BF16 matrices.  The source GGUF stores F32; casting to BF16 here is
-# the same representation the Flash-Next QSA path uses.  Switch to "fp32" together
-# with the engine-side direct format when FP32 indexer weights are required.
+# The direct format of the indexer's three norm weights unless the target config asks for
+# FP32 (``fp32_direct``). The two projections are BF16 either way: the kernels read them
+# as BF16 and the engine binds them so.
 DIRECT_FORMAT = "bf16"
+
+
+def indexer_direct_format(config) -> str:
+    """The direct format for the indexer's three norms on this target.
+
+    ``fp32`` when the target config sets ``fp32_direct`` — the donor already stores these
+    as F32 and the ``1 + w`` un-fold happens in F32 either way, so nothing is rounded —
+    and ``bf16`` otherwise. Both converter routes (the official GGUF recipe and the graft)
+    resolve it here, so a grafted artifact matches one converted straight from a QSA GGUF.
+    """
+
+    return "fp32" if bool(config.get("fp32_direct", False)) else DIRECT_FORMAT
 
 QSA_HEADER = {
     "qwen35.attention.indexer.head_count": INDEXER_HEADS,
