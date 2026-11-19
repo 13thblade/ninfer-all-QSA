@@ -211,7 +211,7 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
 
 int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
         const std::vector<std::array<int, 3>>* axes = nullptr, int top = kDefaultTop,
-        bool fp32_norm = false) {
+        bool fp32_norm = false, bool fp32_zero_centred = false) {
     Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim),
                  pre_norm ? std::vector<float>(kDim) : std::vector<float>()};
     fill_uniform(seq.projection, seed, -2.0f, 2.0f);
@@ -220,8 +220,11 @@ int run(std::uint32_t seed, const Yarn& yarn = {}, bool pre_norm = false,
     round_to_bf16(seq.projection);
     round_to_bf16(seq.query_norm);
     round_to_bf16(seq.key_norm);
-    seq.unit_offset = !fp32_norm;
-    if (fp32_norm) {
+    // The QSA-27B artifact stores an FP32 norm in the zero-centred 1 + w form, so fp32_norm with
+    // fp32_zero_centred keeps `w` as generated and asks the op for (1 + w). Flash-Next's FP32
+    // runs store the multiplicative gamma instead, which is the `w + 1` form below at offset 0.
+    seq.unit_offset = fp32_norm ? fp32_zero_centred : true;
+    if (fp32_norm && !fp32_zero_centred) {
         for (auto* v : {&seq.query_norm, &seq.key_norm})
             for (auto& value : *v) value += 1.0f;
     }
@@ -688,6 +691,8 @@ int main() {
     // FP32 norm tensors read directly (query/key and the QSA-27B pre-norm), no BF16 rounding.
     failures += run(8102u, {}, true, nullptr, kDefaultTop, true);
     failures += run(8103u, {}, false, nullptr, kDefaultTop, true);
+    // The QSA-27B artifact's own combination: FP32 norms still in the zero-centred 1 + w form.
+    failures += run(8104u, {}, true, nullptr, kDefaultTop, true, true);
     // Scalar below 64 tokens (80 on an A100), narrow and wide SIMT tiles or the A100's tensor tile
     // above, by the device's SM count: each card meets the routes it selects.
     for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 63, 64, 79, 80, 127, 128, 129, 512}) {
