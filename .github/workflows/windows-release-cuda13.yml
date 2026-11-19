@@ -6,9 +6,13 @@
 # carries the same objects between jobs in the run's own artifacts instead, so it needs no
 # repository secrets.
 #
-# The compile is sharded the way native-release.yml shards it (build-object-shard.py, two jobs per
+# The compile is sharded the way native-release.yml shards it (build-object-shard.py, one job per
 # runner to stay inside 16 GB), then the package job replays the whole graph against the restored
 # ccache, links, and packages.
+#
+# A dispatch can narrow the matrix to one shard and lower the concurrency: --jobs times
+# --split-compile is the number of cicc processes competing for the runner's memory, and a
+# compiler crash at peak is reproduced fastest that way.
 name: Windows release (CUDA 13.4.3)
 
 on:
@@ -26,6 +30,18 @@ on:
         description: Release tag (empty names it win-cuda13.4-<commit>)
         type: string
         default: ''
+      shard:
+        description: Compile only this shard (0-7, empty compiles every shard)
+        type: string
+        default: ''
+      jobs:
+        description: Concurrent compile jobs per shard (a hosted runner has 16 GB)
+        type: string
+        default: '1'
+      split_compile:
+        description: nvcc --split-compile N per job, multiplying its cicc processes (off disables, 0 uses every core)
+        type: string
+        default: '2'
 
 permissions:
   contents: write
@@ -41,6 +57,29 @@ env:
   SHARD_COUNT: '8'
 
 jobs:
+  plan:
+    # A single-shard dispatch is how a compiler crash is reproduced without paying for all eight;
+    # the matrix has to be materialised before the shard jobs can fan out from it.
+    name: Plan the shard matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.matrix.outputs.shards }}
+    steps:
+      - id: matrix
+        env:
+          SHARD: ${{ inputs.shard }}
+          COUNT: ${{ env.SHARD_COUNT }}
+        run: |
+          if [[ -n "$SHARD" ]]; then
+            [[ "$SHARD" =~ ^[0-7]$ ]] || { echo "::error::shard must be 0-7, got '$SHARD'"; exit 1; }
+            echo "shards=[$SHARD]" >> "$GITHUB_OUTPUT"
+            echo "Compiling shard $SHARD only."
+          else
+            echo "shards=[$(seq -s, 0 $((COUNT - 1)))]" >> "$GITHUB_OUTPUT"
+            echo "Compiling every shard."
+          fi
+
   vcpkg:
     name: Build the vcpkg ports
     runs-on: windows-2022
@@ -90,13 +129,13 @@ jobs:
 
   objects:
     name: Compile shard ${{ matrix.shard }}
-    needs: vcpkg
+    needs: [plan, vcpkg]
     runs-on: windows-2022
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -142,7 +181,11 @@ jobs:
       - name: Configure
         env:
           ARCHS: ${{ inputs.archs }}
+          SPLIT_COMPILE: ${{ inputs.split_compile }}
         run: |
+          # CMake reads an empty value as "no --split-compile" and 0 as "use every core"; the input
+          # spells the former `off` so a dispatch cannot turn the flag into its opposite by accident.
+          $split = if ($env:SPLIT_COMPILE -eq 'off') { '' } else { $env:SPLIT_COMPILE }
           cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
             "-DNINFER_VCPKG_TREE=$pwd/vcpkg-tree/x64-windows" `
@@ -150,14 +193,24 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
-            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
+            "-DNINFER_NVCC_SPLIT_COMPILE=$split" -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      - name: Report the runner's memory
+        # A hosted runner has 16 GB; --jobs times --split-compile decides how many cicc processes
+        # compete for it, and a crash at peak is far easier to read next to this figure.
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          "Total {0:N0} MiB, free {1:N0} MiB before the compile" -f ($os.TotalVisibleMemorySize / 1KB), ($os.FreePhysicalMemory / 1KB)
       - name: Compile the shard
         timeout-minutes: 320
+        env:
+          COMPILE_JOBS: ${{ inputs.jobs }}
         run: |
-          python .github/scripts/build-object-shard.py --shard ${{ matrix.shard }} --count $env:SHARD_COUNT --jobs 2
+          python .github/scripts/build-object-shard.py --shard ${{ matrix.shard }} --count $env:SHARD_COUNT --jobs $env:COMPILE_JOBS
           if ($LASTEXITCODE -ne 0) { throw 'Shard compilation failed' }
+          $os = Get-CimInstance Win32_OperatingSystem
+          "Free {0:N0} MiB after the compile" -f ($os.FreePhysicalMemory / 1KB)
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -170,6 +223,9 @@ jobs:
   package:
     name: Link and package
     needs: objects
+    # A single-shard dispatch reproduces a compile; the other shards' objects are missing, so there
+    # is nothing complete to link.
+    if: inputs.shard == ''
     runs-on: windows-2022
     timeout-minutes: 350
     steps:
@@ -222,7 +278,11 @@ jobs:
       - name: Configure
         env:
           ARCHS: ${{ inputs.archs }}
+          # The link job restores the objects the shards built: its configure has to repeat the
+          # shards' CUDA options exactly, or every object is recompiled here.
+          SPLIT_COMPILE: ${{ inputs.split_compile }}
         run: |
+          $split = if ($env:SPLIT_COMPILE -eq 'off') { '' } else { $env:SPLIT_COMPILE }
           cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
             "-DNINFER_VCPKG_TREE=$pwd/vcpkg-tree/x64-windows" `
@@ -230,7 +290,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
-            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
+            "-DNINFER_NVCC_SPLIT_COMPILE=$split" -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       - name: Link the release products

@@ -43,6 +43,26 @@ def platform_weights(path=WEIGHTS):
     return json.loads(path.read_text())["windows" if os.name == "nt" else "linux"]
 
 
+def available_memory_mib():
+    """The runner's free physical memory, so a crash at peak can be read against it. None off Windows."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32),
+                    ("total_phys", ctypes.c_uint64), ("avail_phys", ctypes.c_uint64),
+                    ("total_page_file", ctypes.c_uint64), ("avail_page_file", ctypes.c_uint64),
+                    ("total_virtual", ctypes.c_uint64), ("avail_virtual", ctypes.c_uint64),
+                    ("avail_extended_virtual", ctypes.c_uint64)]
+
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(MemoryStatus)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return status.avail_phys // (1024 * 1024)
+
+
 RELEASE_TARGETS = ("ninfer", "ninfer-serve", "ninfer_bench")
 
 
@@ -102,8 +122,21 @@ def main():
         batches[-1].append(output)
         length += len(output) + 3
     for batch in batches:
-        subprocess.run(["cmake", "--build", str(args.build), "-j", str(args.jobs),
-                        "--target", *batch], check=True)
+        command = ["cmake", "--build", str(args.build), "-j", str(args.jobs), "--target", *batch]
+        # A device compiler that dies at peak memory (cicc's 0xC0000005 on 18 November) leaves no
+        # object and stops Ninja. Ninja keeps the objects the batch already produced, so the retry
+        # recompiles only what is outstanding and clears the transient case at a fraction of the cost.
+        for attempt in (1, 2):
+            completed = subprocess.run(command, check=False)
+            if completed.returncode == 0:
+                break
+            if attempt == 2:
+                raise SystemExit(
+                    f"The batch still fails after a retry (exit {completed.returncode}).")
+            free = available_memory_mib()
+            print(f"The batch failed with exit {completed.returncode}"
+                  + (f", free memory now {free} MiB" if free is not None else "")
+                  + "; retrying once.", flush=True)
     foreign = foreign_objects(args.build, objects)
     if foreign:
         raise SystemExit(f"The shard compiled {len(foreign)} objects of other shards, among them "
