@@ -14,6 +14,13 @@
 
 namespace ninfer::models::qwen3_5::loading {
 
+// Only the QSA indexer's three norms may read as FP32 (fp32_direct). Every other direct
+// norm stays BF16: the 27B's fused GDN ops (gdn_norm_gating_proj, gdn_input_proj) and the
+// fused rmsnorm_rope kernel are BF16-only and reject FP32 operands.
+inline QType indexer_norm_format(const TextConfig& config) {
+    return config.fp32_direct ? QType::FP32 : QType::BF16;
+}
+
 // QSA-27B binds its learned indexer on text full-attention layers only. The MTP
 // block shares the text config but carries no trained indexer (the QSA fork's
 // qwen35.cpp explicitly retains every MTP key), so its prefix must not bind one.
@@ -26,6 +33,9 @@ QsaIndexerWeights bind_qsa_indexer(Bindings& b, const TextConfig& config,
     const auto& q = *config.qsa;
     const std::string i = p + "attention/indexer/";
     const std::vector<std::string> input{p + "mixer_input"};
+    // The indexer op dispatches on the tensor dtype, so an fp32_direct artifact reads these
+    // three weights without a cast (upstream's DirectWeight path).
+    const QType norm_format = indexer_norm_format(config);
     QsaIndexerWeights out;
     out.query = b.parameter(i + "query",
                             {std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim,
@@ -33,9 +43,9 @@ QsaIndexerWeights bind_qsa_indexer(Bindings& b, const TextConfig& config,
                             input, QType::BF16);
     out.key = b.parameter(i + "key", {q.indexer_head_dim, config.hidden_size}, input,
                           QType::BF16);
-    out.query_norm   = b.direct(i + "query_norm", {q.indexer_head_dim});
-    out.key_norm     = b.direct(i + "key_norm", {q.indexer_head_dim});
-    out.key_pre_norm = b.direct(i + "key_pre_norm", {q.indexer_head_dim});
+    out.query_norm   = b.direct(i + "query_norm", {q.indexer_head_dim}, norm_format);
+    out.key_norm     = b.direct(i + "key_norm", {q.indexer_head_dim}, norm_format);
+    out.key_pre_norm = b.direct(i + "key_pre_norm", {q.indexer_head_dim}, norm_format);
     return out;
 }
 
@@ -49,8 +59,8 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std
     out.key        = b.parameter(p + "attention/key", {k, h}, {p + "mixer_input"});
     out.gate       = b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
     out.value      = b.parameter(p + "attention/value", {k, h}, {p + "mixer_input"});
-    out.query_norm = b.direct(p + "attention/query_norm", {a.head_dim});
-    out.key_norm   = b.direct(p + "attention/key_norm", {a.head_dim});
+    out.query_norm = b.direct(p + "attention/query_norm", {a.head_dim}, QType::BF16);
+    out.key_norm   = b.direct(p + "attention/key_norm", {a.head_dim}, QType::BF16);
     out.output     = b.parameter(p + "attention/output", {h, q}, {p + "attention/gated_output"});
     if (qsa_text_layer(config, p)) { out.qsa = bind_qsa_indexer(b, config, p); }
     return out;
@@ -82,9 +92,12 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     out.b_projection = b.parameter(p + "gdn/b_projection", {heads, h}, {p + "mixer_input"});
     out.a_log        = b.direct(p + "gdn/a_log", {heads}, QType::FP32);
     out.dt_bias      = b.direct(p + "gdn/dt_bias", {heads}, QType::FP32);
+    // GDN's fused norm+gating and depthwise-convolution ops are BF16-only
+    // (gdn_norm_gating_proj / gdn_input_proj reject FP32 operands), so these two stay BF16.
     out.convolution =
-        b.direct(p + "gdn/convolution", {g.linear_conv_kernel_dim, g.conv_channels()});
-    out.norm   = b.direct(p + "gdn/norm", {g.linear_value_head_dim});
+        b.direct(p + "gdn/convolution", {g.linear_conv_kernel_dim, g.conv_channels()},
+                 QType::BF16);
+    out.norm   = b.direct(p + "gdn/norm", {g.linear_value_head_dim}, QType::BF16);
     out.output = b.parameter(p + "gdn/output", {h, v}, {p + "gdn/gated_output"});
     return out;
 }
@@ -449,8 +462,9 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
                         MixerKind mixer, const DenseWeights* ffn,
                         const AttentionWeights* attention) {
     BlockWeights out;
-    out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
-    out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
+    // Block norms feed gdn_norm_gating_proj (a BF16-only fused op) on GDN layers.
+    out.input_norm          = b.direct(p + "input_norm", {config.hidden_size}, QType::BF16);
+    out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size}, QType::BF16);
     if (attention != nullptr) {
         out.mixer = *attention;
     } else if (mixer == MixerKind::FullAttention) {
@@ -778,7 +792,7 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                   std::move(head_inputs));
-    out.final_norm  = b.direct("text/final_norm", {config.hidden_size});
+    out.final_norm  = b.direct("text/final_norm", {config.hidden_size}, QType::BF16);
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         const std::string prefix = "text/layers/" + std::to_string(i) + "/";

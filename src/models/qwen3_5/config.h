@@ -94,6 +94,11 @@ struct TextConfig {
     std::uint32_t max_position_embeddings = 0;
     bool tie_word_embeddings              = false;
     float rms_norm_eps                    = 0;
+    // The QSA indexer's three norms are stored as FP32 instead of BF16. Every other direct
+    // norm stays BF16: the 27B's fused GDN ops (gdn_norm_gating_proj / gdn_input_proj, which
+    // consume input_norm, gdn/norm and the depthwise convolution) and the fused rmsnorm_rope
+    // kernel are BF16-only and reject FP32 operands.
+    bool fp32_direct                      = false;
     std::vector<MixerKind> layer_types;
     std::vector<std::uint32_t> compact_layer_indices;
     std::uint32_t full_attention_layers   = 0;

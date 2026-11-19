@@ -1020,15 +1020,28 @@ def qwen3_8_27b_qsa_gguf(model, recipe, sources):
     if mtp and not has_mtp(gguf):
         raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
 
+    # fp32_direct keeps the QSA indexer's three norm weights as FP32 instead of rounding
+    # them to BF16. Nothing else follows the switch -- see the note after the indexer
+    # registration below for why.
+    fp32_direct = bool(config.get("fp32_direct", False))
+    indexer_dtype = "fp32" if fp32_direct else "bf16"
+
     # Recipe.assign resolves selectors against model.parameters, so register the
     # indexer logical parameters (and their config) before assigning anything.
-    qsa_gguf.register_parameters(model)
+    qsa_gguf.register_parameters(model, dtype=indexer_dtype)
     model.config.update(qsa_gguf.artifact_config())
-    # The Recipe snapshotted its selections at construction, before these parameters
+    # The recipe snapshots selections at construction, before these parameters
     # existed; register each so its assign below can override the placeholder.
     for layer in qsa_gguf.qsa_layers():
         for role in qsa_gguf.ROLES:
             recipe.add_parameter(qsa_gguf.parameter_name(layer, role))
+
+    # Unlike qwen4_exp -- whose every direct norm can stay FP32 -- the 27B only keeps the QSA
+    # indexer's three norms in FP32 (register_parameters above, via indexer_dtype). The block
+    # input_norm/post_attention_norm feed gdn_norm_gating_proj, and gdn/norm + gdn/convolution
+    # feed gdn_norm_gating_proj / gdn_input_proj; all three fused ops are BF16-only and reject
+    # FP32 operands, so those stay BF16. Attention q/k norms likewise stay BF16 because the
+    # fused rmsnorm_rope kernel reads BF16 weights.
 
     _companions(model, recipe, sources)
     encoded, direct = text_sources(gguf, mtp=mtp)
@@ -1062,9 +1075,10 @@ def qwen3_8_27b_qsa_gguf(model, recipe, sources):
             )
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
 
-    # The indexer parameters are direct BF16; the fork stores them as F32 with the
-    # zero-centred norms folded as 1 + w (qsa_gguf.sources undoes the fold).
-    for name, source in qsa_gguf.sources(gguf).items():
+    # The indexer is direct (bf16, or fp32 with --fp32_direct); the fork stores the
+    # source GGUF as F32 with the zero-centred norms folded as 1 + w (qsa_gguf.sources
+    # undoes the fold and casts to the chosen direct format).
+    for name, source in qsa_gguf.sources(gguf, dtype=indexer_dtype).items():
         recipe.assign(
             name,
             format=model.parameters[name].direct_format,

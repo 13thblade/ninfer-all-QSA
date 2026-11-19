@@ -128,11 +128,13 @@ def check_header(gguf: GGUFFile) -> None:
             )
 
 
-def sources(gguf: GGUFFile) -> dict[str, LogicalSource]:
+def sources(gguf: GGUFFile, dtype: str = DIRECT_FORMAT) -> dict[str, LogicalSource]:
     """Read the 80 indexer tensors into logical sources, dropping the stored ``1 + w``.
 
     ``GGUFFile.read_direct`` returns F32/F16/BF16 words as float32 in row-major shape;
-    the QSA release stores every indexer tensor as F32.
+    the QSA release stores every indexer tensor as F32. Norm weights are cast to
+    ``dtype`` (bf16 or fp32); the two projection matrices stay BF16, matching the
+    engine's direct-format bindings.
     """
 
     out: dict[str, LogicalSource] = {}
@@ -142,8 +144,10 @@ def sources(gguf: GGUFFile) -> dict[str, LogicalSource]:
             words = gguf.read_direct(name).astype(np.float32)
             if role in _NORM_ROLES:
                 words = words - 1.0
+            target = dtype if role in _NORM_ROLES else "bf16"
+            torch_dtype = torch.float32 if target == "fp32" else torch.bfloat16
             out[parameter_name(layer, role)] = array_source(
-                torch.from_numpy(np.ascontiguousarray(words)).to(torch.bfloat16), name
+                torch.from_numpy(np.ascontiguousarray(words)).to(torch_dtype), name
             )
     return out
 
@@ -193,7 +197,8 @@ def has_indexer_asset() -> bool:
     return indexer_asset_path() is not None
 
 
-def sources_from_asset(path: Path | None = None) -> dict[str, LogicalSource]:
+def sources_from_asset(path: Path | None = None,
+                       dtype: str = DIRECT_FORMAT) -> dict[str, LogicalSource]:
     """Read the 80 indexer tensors from the asset, converting exactly as sources() does."""
     path = path or indexer_asset_path()
     if path is None:
@@ -221,20 +226,23 @@ def sources_from_asset(path: Path | None = None) -> dict[str, LogicalSource]:
                         f"{name}: asset shape {tuple(words.shape)} != expected {_SHAPES[role]}")
                 if role in _NORM_ROLES:
                     words = words - 1.0
+                target = dtype if role in _NORM_ROLES else "bf16"
+                torch_dtype = torch.float32 if target == "fp32" else torch.bfloat16
                 out[parameter_name(layer, role)] = array_source(
-                    torch.from_numpy(np.ascontiguousarray(words)).to(torch.bfloat16),
+                    torch.from_numpy(np.ascontiguousarray(words)).to(torch_dtype),
                     f"{name}[indexer-asset]",
                 )
     return out
 
 
-def register_parameters(model: Model) -> None:
+def register_parameters(model: Model, dtype: str = DIRECT_FORMAT) -> None:
     """Add the QSA logical parameters to a model built from the dense 27B geometry.
 
     The stock ``qwen3_5`` builder does not know about the indexer.  Registering the
     parameters here (with correctly shaped placeholder sources) lets the existing
     ``Recipe.assign`` / ``cast_direct`` pipeline write them into the artifact without
-    changing the builder used by every other recipe.
+    changing the builder used by every other recipe. ``dtype`` is the direct format
+    for the three norm weights (bf16 or fp32); the projections stay bf16.
     """
 
     for layer in qsa_layers():
@@ -247,13 +255,14 @@ def register_parameters(model: Model) -> None:
             placeholder = array_source(
                 torch.zeros(shape, dtype=torch.bfloat16), name + ":placeholder"
             )
+            fmt = dtype if role in _NORM_ROLES else "bf16"
             model.add(
                 Parameter(
                     name,
                     shape,
                     placeholder,
                     inputs=(prefix + "mixer_input",) if role in ("query", "key") else (),
-                    direct_format=DIRECT_FORMAT,
+                    direct_format=fmt,
                     residency="text",
                 )
             )

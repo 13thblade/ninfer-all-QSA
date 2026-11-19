@@ -117,7 +117,8 @@ TextConfig text(const Json& value, bool mtp) {
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
          "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
-         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget"},
+         "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio", "indexer_budget",
+         "fp32_direct"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
@@ -131,6 +132,12 @@ TextConfig text(const Json& value, bool mtp) {
         throw ArtifactError("tie_word_embeddings must be boolean");
     }
     out.tie_word_embeddings = value.at("tie_word_embeddings").get<bool>();
+    if (value.contains("fp32_direct")) {
+        if (!value.at("fp32_direct").is_boolean()) {
+            throw ArtifactError("fp32_direct must be boolean");
+        }
+        out.fp32_direct = value.at("fp32_direct").get<bool>();
+    }
     const auto& layers      = value.at("layer_types");
     if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
         throw ArtifactError("layer_types must cover every text block");

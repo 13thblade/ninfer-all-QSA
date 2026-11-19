@@ -54,6 +54,13 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         raise ValueError("text.tie_word_embeddings must be boolean")
     result["tie_word_embeddings"] = tied
     result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "text.rms_norm_eps")
+    # The QSA indexer's three norms may be stored as FP32 instead of BF16. Every other
+    # direct norm stays BF16 because the 27B's fused GDN ops and rmsnorm_rope are
+    # BF16-only; see gguf_blocks.qwen3_8_27b_qsa_gguf.
+    fp32_direct = raw.get("fp32_direct", False)
+    if type(fp32_direct) is not bool:
+        raise ValueError("text.fp32_direct must be boolean")
+    result["fp32_direct"] = fp32_direct
     layers = raw.get("layer_types")
     if layers is None:
         interval = _positive(

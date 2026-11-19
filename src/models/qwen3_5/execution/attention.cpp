@@ -108,9 +108,11 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream) {
     require_rope_axes(positions, rope);
-    // The fused Op rotates unscaled positions at the unscaled frequencies, so YaRN or position
-    // interpolation keeps the three separate calls.
-    if (!yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
+    // The fused kernel reads BF16 norm weights only. A fp32_direct artifact stores them in
+    // FP32, so fall back to the separate rmsnorm (which accepts either dtype) plus rope.
+    if (!yarn.active() && q_norm_weight.dtype == DType::BF16 &&
+        k_norm_weight.dtype == DType::BF16 &&
+        fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
         return;
