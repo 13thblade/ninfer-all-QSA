@@ -278,7 +278,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), fast_prefill_kernel(plan.fast_prefill_kernel),
-      draft_window(plan.draft_window), lookup_ngram(plan.lookup_ngram), mtp_policy(plan.mtp_policy),
+      qsa_prefill(plan.qsa_prefill), draft_window(plan.draft_window),
+      lookup_ngram(plan.lookup_ngram), mtp_policy(plan.mtp_policy),
       ngram_draft_window(plan.ngram_draft_window), ngram_min_match(plan.ngram_min_match),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), rope_yarn(plan.rope_yarn),
@@ -1353,7 +1354,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
+                 prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel, qsa_prefill,
                  mtp_attention_window, experts.get(), steering.get(),
                  qsa_indexer_state ? &*qsa_indexer_state : nullptr},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),

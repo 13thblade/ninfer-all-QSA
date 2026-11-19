@@ -332,6 +332,7 @@ void ProgramImpl::prepare_graphs() {
                                         stage_runtime.get(),
                                         rope_yarn,
                                         fast_prefill_kernel,
+                                        qsa_prefill,
                                         mtp_attention_window, experts.get(), steering.get(),
                                         with_qsa && qsa_indexer_state ? &*qsa_indexer_state : nullptr};
     };

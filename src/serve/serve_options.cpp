@@ -264,7 +264,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                of every full-attention layer; needs the\n"
            "                                artifact's block indexer, one device and no\n"
            "                                tensor parallelism; works with the model's own\n"
-           "                                MTP drafts\n" +
+           "                                MTP drafts\n"
+           "  --qsa-prefill                 Qwen3.8-27B with --qwen38-27b-qsa: run prefill\n"
+           "                                on the QSA sparse branch too (default: prefill\n"
+           "                                stays dense). Overrides NINFER_QSA_DENSE_PREFILL\n" +
            std::string(product::kQsaTopBlocksHelp) +
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
@@ -1263,6 +1266,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                                    [&](bool on) { options.qwen38_27b_qsa = on; })) {
             continue;
         }
+        if (product::switch_option(arg, "qsa-prefill",
+                                   [&](bool on) { options.qsa_prefill = on; })) {
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;
@@ -1793,6 +1800,11 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             {"qwen38-27b-qsa", "use-original-prefix-caching"},
             "--qwen38-27b-qsa runs the hybrid prefix cache and cannot be combined with "
             "--use-original-prefix-caching");
+    }
+    if (options.qsa_prefill && !options.qwen38_27b_qsa) {
+        throw product::OptionConflict(
+            {"qsa-prefill", "qwen38-27b-qsa"},
+            "--qsa-prefill requires --qwen38-27b-qsa (only that branch has a QSA prefill route)");
     }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so

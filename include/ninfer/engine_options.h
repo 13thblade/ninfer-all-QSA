@@ -543,6 +543,9 @@ struct EngineOptions {
     // and the indexer's training are untouched. A --kv-resident stream pool must then hold
     // that many more blocks, so a wider window can leave a context too large to stream.
     std::uint32_t qsa_top_blocks = 0;
+    // Qwen3.8-27B-QSA with qwen38_27b_qsa: run prefill on the QSA sparse branch too. False
+    // keeps prefill dense (QSA applies to decode only), which is the artifact's default.
+    bool qsa_prefill = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

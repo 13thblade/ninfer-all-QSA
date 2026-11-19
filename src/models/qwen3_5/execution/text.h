@@ -221,6 +221,9 @@ public:
     // Route prefill prompt attention through the fast INT8-KV prompt kernel.
     void set_fast_prefill_kernel(bool enabled) noexcept { fast_prefill_kernel_ = enabled; }
 
+    // --qsa-prefill: run prefill on the QSA sparse branch instead of dense attention.
+    void set_qsa_prefill(bool enabled) noexcept { qsa_prefill_ = enabled; }
+
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
     }
@@ -489,6 +492,9 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     bool fast_prefill_kernel_ = false;
+    // --qsa-prefill overrides the legacy NINFER_QSA_DENSE_PREFILL env read below; when unset
+    // (false) that env still decides. See TextContext::run_qsa's dense_prefill_opt.
+    bool qsa_prefill_ = false;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

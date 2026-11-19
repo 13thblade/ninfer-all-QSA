@@ -44,6 +44,8 @@ struct ExecutionCore {
     StageRuntime* stages = nullptr;
     ops::RopeYarn rope_yarn;
     bool fast_prefill_kernel = false;
+    // --qsa-prefill: let the QSA sparse branch run prefill too; false keeps prefill dense.
+    bool qsa_prefill = false;
     std::uint32_t mtp_attention_window = 0;
     NativeExpertRuntime* experts = nullptr;
     // Null without LoRA adapters or control vectors.

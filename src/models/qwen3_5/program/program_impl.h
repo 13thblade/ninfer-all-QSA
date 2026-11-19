@@ -1032,6 +1032,8 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const bool fast_prefill_kernel;
+    // --qsa-prefill: prefill takes the QSA sparse branch; false keeps it dense.
+    const bool qsa_prefill;
     const std::uint32_t draft_window;
     const std::uint32_t lookup_ngram;
     const MtpDraftPolicy mtp_policy;

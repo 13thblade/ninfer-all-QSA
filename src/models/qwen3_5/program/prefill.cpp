@@ -67,6 +67,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     // scores, appends and reads on.
     card.set_sequence_lanes(std::span<const std::uint32_t>(&lane, 1));
     card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
+    card.set_qsa_prefill(execution.qsa_prefill);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -1462,7 +1463,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
+             proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel, qsa_prefill,
              mtp_attention_window, experts.get(), steering.get(),
              qsa_indexer_state ? &*qsa_indexer_state : nullptr},
             text_kv_view(sequence),
@@ -2126,6 +2127,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
             card.set_qsa_kv_views(std::span<const qwen3_5::PagedKVCacheView>(qsa_views));
         }
         card.set_fast_prefill_kernel(fast_prefill_kernel);
+        card.set_qsa_prefill(qsa_prefill);
         card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);
         timing.pause();
         const execution::PrefillChunkResult result =

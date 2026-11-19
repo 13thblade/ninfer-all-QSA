@@ -804,6 +804,7 @@ std::string format_server_start_json(
         {"pending_timeout_ms", engine_options.pending_timeout_ms},
         {"prefill_chunk", engine_options.prefill_chunk},
         {"fast_prefill_kernel", engine_options.fast_prefill_kernel},
+        {"qsa_prefill", engine_options.qsa_prefill},
         {"log_stats_interval_ms", options.log_stats_interval_ms},
         {"kv_cache", kv_cache_name(engine_options.kv_cache)},
         {"vision", engine_options.enable_vision},

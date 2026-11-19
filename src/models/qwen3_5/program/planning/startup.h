@@ -148,6 +148,9 @@ struct SequencePlanningInputs {
     // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
     // (ops::qsa_indexer, ops::sparse_softmax_attention) instead of dense attention.
     bool qsa                               = false;
+    // --qsa-prefill: prefill runs the sparse branch too. Resolved from the flag, falling
+    // back to NINFER_QSA_DENSE_PREFILL=0; false keeps prefill dense.
+    bool qsa_prefill                       = false;
     // --kv-resident: positions of each QSA full-attention layer's KV kept on the
     // device; a longer context streams the rest from pinned host memory. Zero
     // keeps every layer fully resident. This is the resolved value: an unset
@@ -204,6 +207,7 @@ struct SequencePlanImpl {
     // --qwen38-27b-qsa: the full-attention layers run the artifact's QSA block indexer
     // instead of dense attention; its rank-0 pooled-key and tail state below.
     bool qsa                               = false;
+    bool qsa_prefill                       = false;
     std::uint32_t kv_resident_positions     = 0;
     // Derived stream geometry: device pool slots (4 tokens each), the widest
     // call that may resolve from the pool, total 4-token blocks and 64-token

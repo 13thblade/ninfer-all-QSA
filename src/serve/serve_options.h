@@ -91,6 +91,9 @@ struct ServeOptions {
     bool qwen38_27b_qsa              = false;
     // Qwen3.8-27B with --qwen38-27b-qsa: --qsa-top-blocks, the history a QSA query sees.
     std::uint32_t qsa_top_blocks = 0;
+    // --qwen38-27b-qsa: let prefill run the QSA sparse branch too (the default keeps prefill
+    // dense and applies QSA only to decode). Requires --qwen38-27b-qsa.
+    bool qsa_prefill = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;

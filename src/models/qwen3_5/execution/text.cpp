@@ -1790,7 +1790,10 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     const float scale =
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim)));
     qwen3_5::QsaStreamState* qsa_stream = qsa_indexer_->stream;
-    static const bool dense_prefill_opt = [] {
+    // --qsa-prefill forces sparse prefill; otherwise NINFER_QSA_DENSE_PREFILL=0 keeps its legacy
+    // meaning of "not dense". The default (no flag, no env) keeps prefill dense.
+    const bool dense_prefill_opt = [this] {
+        if (qsa_prefill_) { return false; }
         const char* setting = std::getenv("NINFER_QSA_DENSE_PREFILL");
         return setting == nullptr || std::strcmp(setting, "0") != 0;
     }();

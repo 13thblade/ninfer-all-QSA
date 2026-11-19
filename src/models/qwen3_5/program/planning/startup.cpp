@@ -47,6 +47,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1885,6 +1886,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
     impl->invariant_attention = inputs.invariant_attention;
     impl->qsa                 = inputs.qsa;
+    impl->qsa_prefill         = inputs.qsa_prefill;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -2247,6 +2249,16 @@ std::uint32_t vision_item_token_bound(std::uint32_t capacity, const models::Load
 
 // The rotation past the native window, as every family resolves it (rope_scaling.h); this family
 // takes YaRN and linear position interpolation alike, for its text and MTP layers.
+// --qsa-prefill resolves whether prefill takes the QSA sparse branch. The explicit flag wins;
+// without it the legacy NINFER_QSA_DENSE_PREFILL=0 keeps working (that spelling means "not dense",
+// i.e. sparse prefill). Anything else, including an unset variable, keeps the artifact default of
+// a dense prefill with QSA applied to decode only.
+bool resolved_qsa_prefill(const EngineOptions& options) noexcept {
+    if (options.qsa_prefill) { return true; }
+    const char* setting = std::getenv("NINFER_QSA_DENSE_PREFILL");
+    return setting != nullptr && std::string_view(setting) == "0";
+}
+
 ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
                                 const EngineOptions& options) {
     return runtime::resolve_rope_scaling(options,
@@ -2287,6 +2299,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .invariant_attention        = options.invariant_attention,
         .qsa                        = options.qwen38_27b_qsa,
+        .qsa_prefill                = resolved_qsa_prefill(options),
         .kv_resident_positions      = resolved_kv_resident_positions(options),
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
