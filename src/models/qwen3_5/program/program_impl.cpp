@@ -756,6 +756,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                     plan.persistent.qsa_tail_axes[lane_base + layer].bind(backing)});
             }
         }
+        // Y-lite (issue 2c): allocate the per-(lane, layer) anchor tail + tail_axes save buffer.
+        // The tail is [indexer_head_dim, compress_ratio-1] FP32 and the axes [3,3] I32, uniform
+        // across layers, so one flat (lane, layer)-strided buffer covers every lane. Null when the
+        // model has no tail (compress_ratio 1) or no full-attention layers.
+        {
+            const std::size_t tail_bytes =
+                static_cast<std::size_t>(state.indexer_head_dim) *
+                static_cast<std::size_t>(tail > 0 ? tail : 0) * sizeof(float);
+            const std::size_t axes_bytes = 3 * 3 * sizeof(std::int32_t);
+            qsa_anchor_tail_bytes   = tail_bytes;
+            qsa_anchor_axes_bytes   = axes_bytes;
+            qsa_anchor_layer_stride = tail_bytes + axes_bytes;
+            qsa_anchor_layers       = layers;
+            const std::size_t total =
+                static_cast<std::size_t>(max_concurrency) * layers * qsa_anchor_layer_stride;
+            if (total != 0) {
+                qsa_anchor_tail_save.emplace(total);
+                qsa_anchor_tail_save->fill(0);
+            }
+        }
         if (plan.persistent.qsa_index_records) {
             state.records        = plan.persistent.qsa_index_records->bind(backing);
             state.first_position = plan.persistent.qsa_first_position->bind(backing);

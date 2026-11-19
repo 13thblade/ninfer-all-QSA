@@ -144,7 +144,57 @@ void ProgramImpl::qsa_capture_anchor(SequenceState& sequence) noexcept {
             speculative_backend != SpeculativeBackend::Mtp ||
             (sequence.kv && sequence.kv->backend &&
              sequence.mtp_kv_valid + 1U >= sequence.text_kv_valid);
+        // Y-lite (issue 2c): the live indexer planes are exactly at the anchor here (generation has
+        // not advanced them). Save the boundary block's partial keys so a later same-lane anchor
+        // resume can restore them instead of pooling from the endpoint's stale tail.
+        qsa_save_anchor_tail(sequence.lane);
     } catch (...) {}
+}
+
+void ProgramImpl::qsa_save_anchor_tail(std::uint32_t lane) noexcept {
+    if (!qsa_anchor_tail_save.has_value() || !qsa_indexer_state.has_value() ||
+        lane >= max_concurrency || lane >= qsa_indexer_state->lane_states.size() ||
+        qsa_anchor_layers == 0) {
+        return;
+    }
+    const auto& layers = qsa_indexer_state->lane_states[lane].layers;
+    const std::size_t count =
+        std::min<std::size_t>(layers.size(), static_cast<std::size_t>(qsa_anchor_layers));
+    const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
+    std::byte* base           = static_cast<std::byte*>(qsa_anchor_tail_save->p);
+    for (std::size_t layer = 0; layer < count; ++layer) {
+        const QsaIndexerLayerState& ls = layers[layer];
+        if (ls.tail.data == nullptr || ls.tail_axes.data == nullptr) { continue; }
+        std::byte* slot = base + (static_cast<std::size_t>(lane) * qsa_anchor_layers + layer) *
+                                     qsa_anchor_layer_stride;
+        CUDA_CHECK(cudaMemcpyAsync(slot, ls.tail.data, qsa_anchor_tail_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(slot + qsa_anchor_tail_bytes, ls.tail_axes.data,
+                                   qsa_anchor_axes_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
+void ProgramImpl::qsa_restore_anchor_tail(std::uint32_t lane) noexcept {
+    if (!qsa_anchor_tail_save.has_value() || !qsa_indexer_state.has_value() ||
+        lane >= max_concurrency || lane >= qsa_indexer_state->lane_states.size() ||
+        qsa_anchor_layers == 0) {
+        return;
+    }
+    const auto& layers = qsa_indexer_state->lane_states[lane].layers;
+    const std::size_t count =
+        std::min<std::size_t>(layers.size(), static_cast<std::size_t>(qsa_anchor_layers));
+    const cudaStream_t stream = compute_streams[state_images->shard(0).rank];
+    const std::byte* base     = static_cast<const std::byte*>(qsa_anchor_tail_save->p);
+    for (std::size_t layer = 0; layer < count; ++layer) {
+        const QsaIndexerLayerState& ls = layers[layer];
+        if (ls.tail.data == nullptr || ls.tail_axes.data == nullptr) { continue; }
+        const std::byte* slot = base + (static_cast<std::size_t>(lane) * qsa_anchor_layers + layer) *
+                                           qsa_anchor_layer_stride;
+        CUDA_CHECK(cudaMemcpyAsync(ls.tail.data, slot, qsa_anchor_tail_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ls.tail_axes.data, slot + qsa_anchor_tail_bytes,
+                                   qsa_anchor_axes_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
 }
 
 // ---- quote -----------------------------------------------------------------------------------
@@ -355,6 +405,12 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
             }
             retention.live.reset();
             sequence.state = ActiveStateBinding{.read = *state, .write = *state};
+            // Y-lite (issue 2c): the lane's indexer tail was advanced to the endpoint by the prior
+            // turn's generation. Restore the anchor's saved partial keys so the suffix prefill pools
+            // the boundary block (`anchor / compress_ratio`) from the prompt's tail, not the stale
+            // endpoint tail. pooled[0, anchor/ratio) is the intact determined prefix; the suffix
+            // re-pools block anchor/ratio and beyond from this restored tail + its own projection.
+            qsa_restore_anchor_tail(lane);
             state_whole    = quote.whole;
         } else {
             // Some other conversation owns the lane: the image is the only source left, and it

@@ -940,6 +940,12 @@ public:
     // The snapshot a turn closure resumes from, taken where the prompt ended (upstream's
     // `executor.snapshot(s, slot.snapshot)` at qwen4_exp_core.cpp:2219).
     void qsa_capture_anchor(SequenceState& sequence) noexcept;
+    // Y-lite (issue 2c): save the lane's indexer tail + tail_axes at the anchor capture, and restore
+    // them on a same-lane anchor resume, so the boundary block pools from the prompt's partial keys
+    // instead of the endpoint's stale tail. No-ops when the save buffer is absent or the lane is
+    // out of range.
+    void qsa_save_anchor_tail(std::uint32_t lane) noexcept;
+    void qsa_restore_anchor_tail(std::uint32_t lane) noexcept;
     // Drops what a lane retains: called when a new tenure starts on it and the resume does not
     // consume the retained state, so a later conversation can never land a stale image.
     void qsa_drop_lane_retention(std::uint32_t lane, bool save_image = true) noexcept;
@@ -1133,6 +1139,17 @@ public:
     // --qwen38-27b-qsa: each lane's indexer pooled keys and tail, rank 0, one set per
     // concurrent sequence.
     std::optional<qwen3_5::QsaIndexerState> qsa_indexer_state;
+    // --qwen38-27b-qsa (issue 2c, Y-lite): the anchor's indexer tail + tail_axes, saved at the
+    // prompt-end capture (qsa_capture_anchor) and restored on a same-lane anchor resume, so the
+    // boundary block (`anchor / compress_ratio`) pools from the prompt's partial keys instead of
+    // the endpoint's stale tail. One flat device buffer, (lane, layer)-strided: each layer's slot
+    // holds `qsa_anchor_tail_bytes` of tail then `qsa_anchor_axes_bytes` of tail_axes. Allocated at
+    // startup next to qsa_indexer_state; unused (null) when the model carries no QSA indexer.
+    std::optional<DeviceBuffer> qsa_anchor_tail_save;
+    std::size_t qsa_anchor_layer_stride = 0;
+    std::size_t qsa_anchor_tail_bytes   = 0;
+    std::size_t qsa_anchor_axes_bytes   = 0;
+    std::uint32_t qsa_anchor_layers     = 0;
     // --kv-resident: the pinned host KV copies (owned here, one per lane and layer) and the
     // per-(lane, layer) pool / residency map views. Empty when streaming is off. Per-sequence
     // host attribution of a released lane's own blocks lives in the prefix index's per-
