@@ -44,15 +44,15 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--kv-capacity 1048576`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 0` 用于 24 GiB 卡确定性启动。以代码类真实任务进行测试。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--kv-capacity 1048576`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 0` 把显存整块交给引擎（预算在启动时分配完毕，余量 0 是预期结果）。四并发时显存预算为：权重 16.0 GiB、共享的 prefill staging 层 528 MiB、每 lane 一份的 MTP 池 2.06 GiB、indexer 分块键 2.15 GiB、`--kv-resident` 设备窗口 1.06 GiB。以代码类真实任务测试：每请求 32,940 token 的源码上下文，跨文件回答三个问题（答案全部正确）。
 
 | 并发 | 聚合 prefill (tok/s) | 聚合 decode (tok/s) | TTFT（最小–最大） | 每请求 prompt / 输出 |
 | --- | ---: | ---: | ---: | --- |
-| 单发（1 lane） | 1,744 | 103.8 | 18.81 s | 32,768 / 512 |
-| 双并发（2 lane） | 1,743 | 187.6 | 18.85–43.06 s | 各 32,768 / 512 |
-| 四并发（4 lane） | 1,747 | 369.3 | 18.78–91.68 s | 各 32,768 / 512 |
+| 单发（1 lane） | 1,490 | 97.3 | 22.2 s | 32,940 / 388 |
+| 双并发（2 lane） | 1,490 | 196.4 | 22.2–48.3 s | 32,940 / 267–388 |
+| 四并发（4 lane） | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
 
-聚合 decode = 各请求输出 token 之和 ÷ 最长 decode 耗时（decode 重叠）。
+聚合 prefill = 各请求 prompt token 之和 ÷ prefill 串行总耗时：prefill 共用一份 staging 层、逐 lane 串行，所以这个数在各并发下几乎不变（单请求 1.48–1.50k tok/s）。聚合 decode = 各请求自身 decode 速率之和：decode 在 lane 间重叠，单请求速率随之下降，四并发时每 lane 仍为 88.1–97.9 tok/s，MTP 接受率 69.5–80.7%。TTFT 的阶梯来自串行 prefill。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -100,15 +100,15 @@ ninfer-serve model.ninfer --max-context 262144 \
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--kv-capacity 1048576`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, and `--kv-headroom-mib 0` to boot the 24 GiB card deterministically. Measured on real code tasks.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--kv-capacity 1048576`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, and `--kv-headroom-mib 0` to hand the whole card to the engine (the budget is reserved at startup, so a 0 B remainder is the expected result). At four lanes the device budget is: 16.0 GiB of weights, a 528 MiB shared prefill staging layer, a 2.06 GiB MTP pool with one history per lane, 2.15 GiB of indexer block keys, and 1.06 GiB of `--kv-resident` device windows. Measured on real code tasks: every request reads a 32,940-token source context and answers the same three cross-file questions (all correct).
 
 | Concurrency | aggregate prefill (tok/s) | aggregate decode (tok/s) | TTFT (min–max) | prompt / output per request |
 | --- | ---: | ---: | ---: | --- |
-| single (1 lane) | 1,744 | 103.8 | 18.81 s | 32,768 / 512 |
-| 2 concurrent (2 lanes) | 1,743 | 187.6 | 18.85–43.06 s | 32,768 / 512 each |
-| 4 concurrent (4 lanes) | 1,747 | 369.3 | 18.78–91.68 s | 32,768 / 512 each |
+| single (1 lane) | 1,490 | 97.3 | 22.2 s | 32,940 / 388 |
+| 2 concurrent (2 lanes) | 1,490 | 196.4 | 22.2–48.3 s | 32,940 / 267–388 |
+| 4 concurrent (4 lanes) | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
 
-Aggregate decode = sum of output tokens / the longest decode interval (decodes overlap).
+Aggregate prefill = sum of prompt tokens / total serialized prefill time: prefill shares one staging layer and runs lane by lane, so the figure stays flat across concurrency (1.48–1.50k tok/s per request). Aggregate decode = the sum of each request's own decode rate: decodes overlap, so each lane's rate dips accordingly — at four lanes every lane still runs 88.1–97.9 tok/s at 69.5–80.7% MTP acceptance. The TTFT staircase is that serialized prefill.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 

@@ -76,12 +76,13 @@ offered under the same Apache-2.0 license.
   to the engine's eight concurrent lanes. Under streamed KV it lays out one
   indexer plane plus one tail-axis plane per (lane, layer), an MTP-only record
   plane and first-position word, one device stream pool and map per (lane,
-  layer), the shared staging layer, and the pinned host planes. The device text
-  and MTP page pools follow `--kv-capacity`, which already counts every lane's
-  share (the automatic window is the lane count times `--max-context`); sizing
-  them per lane on top of that reserved the budget twice and cost 8.25 GiB of
-  device KV at four lanes and a 1M-token capacity, so the MTP pool carries the
-  draft windows on top of the same page count.
+  layer), the shared staging layer, and the pinned host planes. Each pool
+  follows its own axis: the single text layer holds one lane's history
+  (`--max-context`, not the lane-count sum) because prefill is serialized and
+  stages one lane at a time; the MTP pool holds one dense history per lane plus
+  its draft window; the stream pools hold `--kv-resident` pages per (lane,
+  layer); the indexer planes hold `--max-context / compress_ratio` block keys
+  per (lane, layer), the qwen4_exp pooled-slots rule.
 - A prefix-append prefill keeps the prompt's `rope_delta` in `io_.rope_delta` and
   rotates its continuation at `token index + rope_delta`, so a cached media prompt
   resumes at the same absolute M-RoPE position as a cold prefill of the whole

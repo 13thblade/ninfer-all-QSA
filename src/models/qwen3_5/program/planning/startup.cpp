@@ -250,26 +250,37 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // history on every verification (dense, never streamed).
     //
     // Under stream that single device text layer has TWO jobs: it is the shared dense-prefill
-    // staging buffer (one full history), and it is the physical page pool every lane's text
-    // address space reserves its entitlement from. Those reserved pages are bookkeeping
-    // placeholders the sparse branch never reads (the pinned host copy is the authority), but
-    // admission and block publication still need distinct page ids for each live lane, so the
-    // pool must hold what every lane may hold TOGETHER -- which is exactly what `capacity`
-    // counts: --kv-capacity is the total across lanes, and the automatic window is the lane
-    // count times --max-context (4 lanes at a 262,144-token window resolve to 1,048,576 tokens).
-    // Sizing the pool as concurrency * capacity instead multiplied that budget by the lane count
-    // twice: 4 lanes at 1M tokens reserved 65,536 page groups of one int8 layer -- 8.25 GiB of
-    // device KV the sparse branch never reads, plus 2.06 GiB of MTP pool -- so four lanes could
-    // not start on a 24 GiB card at all, while a single lane still could. The staging copy
-    // addresses its first pages through the identity table and the draft windows are per lane
-    // already; both pools follow `capacity`.
+    // staging buffer, and it is the physical page pool every lane's text address space reserves
+    // its entitlement from. Those reserved pages are bookkeeping placeholders the sparse branch
+    // never reads (the pinned host copy is the authority), but admission and block publication
+    // still need distinct page ids for each live lane. One staging copy is enough because
+    // prefill is serialized: the pool holds ONE lane's history, ceil(--max-context / 64) pages,
+    // and a lane past that shares the host copy with the lane being staged rather than taking a
+    // second device history. Sizing this pool by --kv-capacity (the lane count times the
+    // window) reserved up to four device histories nobody reads; sizing it per lane as well
+    // multiplied that by the lane count twice.
+    //
+    // The MTP pool is the other way round: its KV is dense and never streamed, so every live
+    // lane keeps its complete history there, one --max-context history each. It gets the lane
+    // count times the logical pages, plus each lane's draft window. A shared pool here is not a
+    // saving: the second lane's prompt fills it and the third lane's admission fails with
+    // "context cache exhausted" while the text KV sits in host RAM. That per-lane term is what
+    // the old concurrency * capacity factor on the text pool was standing in for.
+    //
+    // The other streamed quantities, and the axis each follows:
+    //   device stream pool   ceil(--kv-resident / 4) pages per (lane, layer), floored at two
+    //                        history windows so a verification's union fits (impl->stream_slots)
+    //   indexer pooled keys  ceil(--max-context / compress_ratio) + 1 per (lane, layer), the
+    //                        qwen4_exp pooled_slots rule for the QSA indexer's block keys
+    //   stream identity/map  --max-context pages, shared by every lane (qwen4_exp's block table)
     const std::uint32_t stream_text_pages = logical_pages;
     const std::uint32_t text_page_groups =
         plan.stream_slots != 0 ? stream_text_pages : physical_pages;
     const std::uint32_t mtp_page_groups =
         plan.stream_slots != 0
             ? static_cast<std::uint32_t>(checked_i32(
-                  static_cast<std::uint64_t>(logical_pages) + mtp_extra_pages,
+                  static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages +
+                      mtp_extra_pages,
                   "MTP Paged KV physical pages exceed int32"))
             : mtp_physical_pages;
     PersistentLayout out;
