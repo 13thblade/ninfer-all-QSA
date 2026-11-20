@@ -37,7 +37,7 @@
 ninfer-serve model.ninfer --qwen38-27b-qsa --qsa-prefill
 
 # 2 倍注意力窗口（4,096 token），开启 MTP 草稿（ngram 关闭），并把 KV 的 16,384 个位置留在显存、其余流式传输
-ninfer-serve model.ninfer --max-context 262144 \
+ninfer-serve model.ninfer --max-context 262144 --kv-capacity 262144\
   --qwen38-27b-qsa --qsa-prefill --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
@@ -53,6 +53,8 @@ ninfer-serve model.ninfer --max-context 262144 \
 | 四并发（4 lane） | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
 
 聚合 prefill = 各请求 prompt token 之和 ÷ prefill 串行总耗时：prefill 共用一份 staging 层、逐 lane 串行，所以这个数在各并发下几乎不变（单请求 1.48–1.50k tok/s）。聚合 decode = 各请求自身 decode 速率之和：decode 在 lane 间重叠，单请求速率随之下降，四并发时每 lane 仍为 88.1–97.9 tok/s，MTP 接受率 69.5–80.7%。TTFT 的阶梯来自串行 prefill。
+
+去掉 `--qsa-prefill` 走 dense prefill 时，同一任务、同一配置实测：单请求 prefill 1.74k tok/s、TTFT 19.0 s；四并发聚合 prefill 1,743 tok/s、每请求 decode 95.2–97.3 tok/s（和 385.2）、MTP 接受率 78.7–80.7%、TTFT 19.5–88.3 s。也就是说稀疏 prefill 让 prefill 慢约 17%、TTFT 多约 3 s，decode 基本不变。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -93,7 +95,7 @@ When `--kv-resident` is a number other than `0`/`all`, the pool's automatic floo
 ninfer-serve model.ninfer --qwen38-27b-qsa --qsa-prefill
 
 # twice the attention window (4,096 tokens), MTP drafting on with ngram off, keeping 16,384 KV positions on the device and streaming the rest
-ninfer-serve model.ninfer --max-context 262144 \
+ninfer-serve model.ninfer --max-context 262144 --kv-capacity 262144\
   --qwen38-27b-qsa --qsa-prefill --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
@@ -109,6 +111,8 @@ One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27
 | 4 concurrent (4 lanes) | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
 
 Aggregate prefill = sum of prompt tokens / total serialized prefill time: prefill shares one staging layer and runs lane by lane, so the figure stays flat across concurrency (1.48–1.50k tok/s per request). Aggregate decode = the sum of each request's own decode rate: decodes overlap, so each lane's rate dips accordingly — at four lanes every lane still runs 88.1–97.9 tok/s at 69.5–80.7% MTP acceptance. The TTFT staircase is that serialized prefill.
+
+Dropping `--qsa-prefill` for a dense prefill, same task and same configuration: 1.74k tok/s per request, TTFT 19.0 s; at four lanes the aggregate prefill is 1,743 tok/s, each request decodes 95.2–97.3 tok/s (sum 385.2) at 78.7–80.7% MTP acceptance, with TTFT 19.5–88.3 s. The sparse prefill costs about 17% of prefill speed and three seconds of TTFT; decode is unchanged.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 
