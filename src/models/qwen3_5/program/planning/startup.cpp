@@ -250,32 +250,26 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // history on every verification (dense, never streamed).
     //
     // Under stream that single device text layer has TWO jobs: it is the shared dense-prefill
-    // staging buffer (one full history = logical_pages), and it is the physical page pool every
-    // lane's text address space reserves its entitlement from. Those reserved pages are
-    // bookkeeping placeholders the sparse branch never reads (the pinned host copy is the
-    // authority), but admission and block publication still need distinct page ids for each live
-    // lane: pinning the pool to logical_pages makes C near-full-history sessions look like C*L
-    // pages against an L-page pool, so a later turn is refused with a Paged KV pool reservation
-    // error even though host RAM already holds all C histories. Give the pool C*L page groups;
-    // the staging copy still addresses only its first L pages through the identity table, and
-    // every address space keeps its L-page cap.
-    //
-    // The MTP pool cannot stay at L either. MTP KV is dense and never streamed, so every live
-    // lane keeps its complete history there: C near-full-history lanes need C*L page groups, the
-    // same as the text pool. Pinned at L, the first lane's prompt filled the pool and every other
-    // lane's admission failed with "context cache exhausted: an idle Engine found no placement"
-    // (measured: pool 2,052 pages at --max-context 131072, first prompt 1,287 pages, the next
-    // needing 1,054 found 763). The draft windows are per lane already.
-    const std::uint32_t stream_text_pages = static_cast<std::uint32_t>(checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages,
-        "QSA streamed text KV page pool exceeds int32"));
+    // staging buffer (one full history), and it is the physical page pool every lane's text
+    // address space reserves its entitlement from. Those reserved pages are bookkeeping
+    // placeholders the sparse branch never reads (the pinned host copy is the authority), but
+    // admission and block publication still need distinct page ids for each live lane, so the
+    // pool must hold what every lane may hold TOGETHER -- which is exactly what `capacity`
+    // counts: --kv-capacity is the total across lanes, and the automatic window is the lane
+    // count times --max-context (4 lanes at a 262,144-token window resolve to 1,048,576 tokens).
+    // Sizing the pool as concurrency * capacity instead multiplied that budget by the lane count
+    // twice: 4 lanes at 1M tokens reserved 65,536 page groups of one int8 layer -- 8.25 GiB of
+    // device KV the sparse branch never reads, plus 2.06 GiB of MTP pool -- so four lanes could
+    // not start on a 24 GiB card at all, while a single lane still could. The staging copy
+    // addresses its first pages through the identity table and the draft windows are per lane
+    // already; both pools follow `capacity`.
+    const std::uint32_t stream_text_pages = logical_pages;
     const std::uint32_t text_page_groups =
         plan.stream_slots != 0 ? stream_text_pages : physical_pages;
     const std::uint32_t mtp_page_groups =
         plan.stream_slots != 0
             ? static_cast<std::uint32_t>(checked_i32(
-                  static_cast<std::uint64_t>(plan.max_concurrency) * logical_pages +
-                      mtp_extra_pages,
+                  static_cast<std::uint64_t>(logical_pages) + mtp_extra_pages,
                   "MTP Paged KV physical pages exceed int32"))
             : mtp_physical_pages;
     PersistentLayout out;

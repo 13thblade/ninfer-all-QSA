@@ -77,9 +77,11 @@ offered under the same Apache-2.0 license.
   indexer plane plus one tail-axis plane per (lane, layer), an MTP-only record
   plane and first-position word, one device stream pool and map per (lane,
   layer), the shared staging layer, and the pinned host planes. The device text
-  and MTP page pools get one full-history page group per lane, the MTP pool plus
-  its draft windows, because a verifier reads its complete history and never
-  streams.
+  and MTP page pools follow `--kv-capacity`, which already counts every lane's
+  share (the automatic window is the lane count times `--max-context`); sizing
+  them per lane on top of that reserved the budget twice and cost 8.25 GiB of
+  device KV at four lanes and a 1M-token capacity, so the MTP pool carries the
+  draft windows on top of the same page count.
 - A prefix-append prefill keeps the prompt's `rope_delta` in `io_.rope_delta` and
   rotates its continuation at `token index + rope_delta`, so a cached media prompt
   resumes at the same absolute M-RoPE position as a cold prefill of the whole
