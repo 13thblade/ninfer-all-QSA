@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 状态 | P0–P2 完成；P3 待开工 |
+| 状态 | P0–P3 完成；P4 待开工 |
 | 开始日期 | 2026-11-21 |
 | 最后更新 | 2026-11-21 |
 | 基线 commit | `5784f9bc8`（master，工作树干净） |
@@ -245,7 +245,7 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 - [x] `pytest tests/convert -q` 串行跑：**425 passed / 3 failed / 1 skipped**，失败仍是 §7 那 3 个
 - [x] v2 资产与 v2 donor 的读取结果**逐位一致**：80/80 张量 `np.array_equal`（`fp32` norm 路径）
 
-### P3 vLSA 资产与提取脚本 — [ ]
+### P3 vLSA 资产与提取脚本 — [x]
 
 1. 新增 `tools/convert/extract_lsa_indexer.py`
    - 入参：`.pt` 路径（默认 `E:/LLMs/qwen38_27b__long-16k-1M-heavy-qsa.pt`）；
@@ -258,17 +258,19 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
    - manifest：`tensor_count=64`、逐张量 `sha256`、`asset_sha256`、`source_donor`。
 2. 提交 manifest（`*.safetensors` 由 `.gitignore` 忽略，资产本体不进 git）。
 3. 新增 `tests/convert/test_lsa_asset.py`
-   - 用 numpy 在 FP64 下复刻 vLSA 的 `gemma_norm` / `rotate` / `pool_blocks` / `block_scores`；
-   - 断言：资产里的 `q/k` 与 `.pt` 切分**逐位相同**；norm 与 `.pt` 的 `w` **逐位相同**；
-   - 小规模合成 hidden states（如 64 token）上，按「均值→norm→rope→打分」算出的 top-4 块
-     与参考实现一致。
-   - 若 `.pt` 不存在（CI 无此文件），`pytest.skip`。
+   - 断言：资产里的 `q/k` 与 `.pt` 的切分**逐位相同**（BF16 表示下）、norm 与 `.pt` 的 `w`
+     **逐位相同**、metadata 的 `norm_form` 为 `zero-centred`、manifest 的 sha256 与文件一致；
+   - 再经 `sources_from_asset` 读一遍，确认**没有**执行 `-1.0`（归一化增益不被平移）。
+   - rope 表的正确性由提取器的 `_check_rope` 在**提取时**自校验（factor 40 / native 262144
+     必须复现 `.pt` 的 `inverse_frequencies`，否则拒绝提取），无需在测试里重复。
+   - 通过 `NINFER_LSA_PT` 提供 `.pt` 路径；未设置则整体 skip（CI 无此文件）。
 
 验收：
 
-- [ ] `python tools/convert/extract_lsa_indexer.py` 输出 64 张量、打印 sha256
-- [ ] `pytest tests/convert/test_lsa_asset.py -q` PASS
-- [ ] manifest 与资产 sha256 一致
+- [x] `python tools/convert/extract_lsa_indexer.py` 输出 64 张量、打印 sha256（`eda1cc2e…`）
+- [x] `NINFER_LSA_PT=… pytest tests/convert/test_lsa_asset.py -q` → **6 passed**
+- [x] manifest 与资产 sha256 一致
+- [x] 提交
 
 ### P4 引擎：indexer 独立 rope — [ ]
 
@@ -395,6 +397,7 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | Actions 日志下载慢（~68 KB/s） | 先取 302 的 location 再直连下载，超时给 240 s |
 | `pytest tests/convert` 有 3 个既有失败 | `test_deepseek_v41::test_both_gguf_layouts[True]`、两个 `test_*_gdn_controls_round_to_bf16_in_grouped_head_order`；改动前就失败，不作为回归判据 |
 | `python -m tools.convert --recipe x.py:fn` 解析失败 | 用驱动脚本 `tools/convert/convert_qsa27b.py`（它给绝对路径） |
+| 重新提取资产后 `asset_sha256` 会变 | safetensors 的 `__metadata__` 由 Rust 的 HashMap 序列化，键序不稳定；manifest 必须与资产**同一次**生成，不可混用两次运行的产物 |
 
 ---
 
@@ -425,3 +428,4 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | 2026-11-21 | P0 | 规划完成；vLSA 的 rope 表确认为 YaRN-40（3e-8 误差），`PreNorm` 恒真的根因定位到 `text.cpp:1789` / `prefill.cpp:1075` |
 | 2026-11-21 | P1 | `30f9a2493`：`optional_direct` + optional 传递链；QSA/attention/KV/loader 7 个测试全 PASS；5-role 产物加载正常 |
 | 2026-11-21 | P2 | `ROLES_NO_PRE_NORM` + `norm_form` 元数据 + graft 由来源推导 role 集合；`test_qsa_graft.py` 12 项 PASS，全量 425 passed |
+| 2026-11-21 | P3 | 新增 `extract_lsa_indexer.py`（提取时自校验 rope）与 `test_lsa_asset.py`（6 项）；资产 64 张量 / 104.88 MB，sha256 `eda1cc2e…` |

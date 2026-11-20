@@ -1,0 +1,620 @@
+{
+  "asset_bytes": 104880280,
+  "asset_sha256": "eda1cc2e55a138aa376e3f6ed8d9c06dc68057b08e66ce038356ec7b5d92e3b3",
+  "attention_scaling": 1.3688879013061523,
+  "donor_family": "vLSA (Prefrontal-AI/latent-sparse-attention)",
+  "git_note": "*.safetensors is gitignored; ship as a GitHub Release attachment verified against asset_sha256, or rebuild from the checkpoint",
+  "indexer_rope": {
+    "factor": 40.0,
+    "original_max_position_embeddings": 262144,
+    "rope_type": "yarn"
+  },
+  "inverse_frequencies": [
+    1.0,
+    0.6042963862419128,
+    0.36517414450645447,
+    0.22067339718341827,
+    0.1333521455526352,
+    0.08058421313762665,
+    0.04869675263762474,
+    0.02942727319896221,
+    0.017782794311642647,
+    0.010746078565716743,
+    0.006493816617876291,
+    0.003924189601093531,
+    0.0023713738191872835,
+    0.0014330126577988267,
+    0.0008659643353894353,
+    0.0004595220379997045,
+    0.00023914726625662297,
+    0.00012122607586206868,
+    5.918257375014946e-05,
+    2.7259005946689285e-05,
+    1.1333094334986527e-05,
+    3.7428108043968678e-06,
+    3.8498163235090033e-07,
+    2.3264303194991953e-07,
+    1.4058532826766168e-07,
+    8.495520376072818e-08,
+    5.133812308599772e-08,
+    3.1023443369804227e-08,
+    1.874735566786967e-08,
+    1.1328959104162095e-08,
+    6.8460490609822955e-09,
+    4.1370427084075345e-09
+  ],
+  "log_tau": {
+    "11": 0.2558287978172302,
+    "15": 0.6260773539543152,
+    "19": 0.5981675386428833,
+    "23": 0.5059100389480591,
+    "27": 0.5621554255485535,
+    "3": 0.48573026061058044,
+    "31": 0.7911587357521057,
+    "35": 0.7998868227005005,
+    "39": 0.8155576586723328,
+    "43": 0.8216030597686768,
+    "47": 0.7628800272941589,
+    "51": 0.7657588124275208,
+    "55": 0.6838574409484863,
+    "59": 0.6918786764144897,
+    "63": 0.77117520570755,
+    "7": 0.2144581526517868
+  },
+  "norm_form": "zero-centred",
+  "precision": "BF16 projections + F32 zero-centred norms (per-tensor dtype below)",
+  "roles": [
+    "query",
+    "key",
+    "query_norm",
+    "key_norm"
+  ],
+  "source_donor": "qwen38_27b__long-16k-1M-heavy-qsa.pt",
+  "tensor_count": 64,
+  "tensors": {
+    "blk.11.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f082ad598e261177a2a2e6ff8d935caf82f4d4553566be5cbaf0c9068acab889",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.11.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "8247bdff7d49df7d43e1d8b667225cb2b79ab653bbc934c7e21559504bdffefb",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.11.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "51f275a5bdc83ebf7465440a8ffffabcd14794680a66be14b7ba653112be039e",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.11.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "0a7c56118f96557a9c6396bae7fd2ad1b4f3a5c68b99874b461d6c8000a845cb",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.15.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "745e065d63b52f4944dd59b6e7b5354970875710dc1fdab4f19bd3a7a77c5790",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.15.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "69578f210aa6fd34baa82c5d1e4c43b8e1ec2c059776dac53d9e1fb4852521f8",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.15.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f1110e849c6590997d8688c2580fa8c83e16a0dfba7336709bfd69167c404f70",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.15.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "f72eda938f49aae27b226c4b90eb984a9ff8bf517fa93e08cb089bb241ef0e6b",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.19.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "0ac9c402106512925b082a1b224e037c30183fe19ec5a2f7f474e895eac7b9b1",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.19.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "ceb67e9acd1ac8648e965ee95d40885e27f2c2d475c49a4b01dcb6ad618b94f7",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.19.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f3c3fd5ce856a9278ada37e974ad5966f7f49628dd43cbd62437384d13718fbb",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.19.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "b8c381c881cb05eb9bbab48285bf27657e24053e9cba10cb50fb00825a392872",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.23.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5a2bd1b8c8451c32a2313f3cb56c51ece5653fff4473baa36694438de9c391aa",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.23.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "d2a5038535be3015c4a322e9ea22243de88a8b540f8e346abc27d0548d0e4308",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.23.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e0c59e6b2e4399f59a3faa6bb52840980608d346243013a99f345077e55a190f",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.23.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "ffcd6f404e8a9bacf8142821e41394d0fccff43e08cb51aaec9bbdad4fa55ba7",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.27.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "4bf98d58a1e7b85e44be06389b3aa5afbd532f90d61822fabfcf0514fe4a599f",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.27.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "56e0f664be342a13454223beaeadc0c068f042dfa5e85d4d2c69dde0e711cddf",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.27.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "bf2acf7b5cfed682181feebd7ce2064283facaf28008d68efb12fd7d5f895b23",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.27.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "8b0d50d01dbf809ef87c5cbf5548657195f441c398376c74e533fb089f6f5201",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.3.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "cba5c82f6efcc8d48aad984c85dd8029af2fa07f5c880c05f608fa0b6b8de1cf",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.3.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "0a63faf6c11b4c1482579398555b6e004529d9c2c5f08bf24a94ad4eeb0c14e1",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.3.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "0b714dcb1f42709c5a33a74771db161fcb1194044e4f331c079f0aa659640bed",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.3.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "f96802a2d560996972d5ea97b73df67fe9ee516bd051601ec5b5b329b9ba3b17",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.31.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "d910ddd88989e6e87861c55dfaabda6c6d852aa74566191e35952ff84c31c5b2",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.31.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "7c7199e372c8683b7aca10d87362cb6a955b39547592c3fed83ad34952b731f5",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.31.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e9e09a5615916b907006e13669f7b626ade776031464cb5ceee4c394a7725465",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.31.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "03d420d09e9956f91d1ad0e5da6174067226706cbe498898afcb775fb9a3c189",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.35.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "152fddd965051d2c36575f9a94d584f4a3ecc2986f9fa8de3eacac4e37ee092e",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.35.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "e1aadf16ce89c68de211fc12ec76f70c00fcc16109d8e1e5ceeaf585ff8d235c",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.35.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "f3d5c0bc2a64fcdc4c8afbc9214756c7810e89a962e3b7cb6b26c1d265308dd9",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.35.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "363ed1144875478076811fe094a70c0a897b3d83e077a083f21643681cd2dea1",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.39.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "88c693c70eecdd660bf9fe0ec0dd504c5f806afbae4f219f69d45d5f43431c17",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.39.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "23fc1bc207da78f66ab7194f000a577ddae1dafe58d36cfc927f724d502d5828",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.39.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5680408d733de2954c9c43cac8872e9b9a4f00dfdd4085fd7e24781d5611c38a",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.39.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "e50b55cad59f0edec6c8411d12fcb5012df47ec8421878e388b568034f399801",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.43.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "467ac593668832de19ea531dc3a052a974b74a00b1e35a5ad90933a99f7c9ee8",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.43.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "9930f405eaaedb4e4957e68992fa3ce1ae456a0f9ab04a77c2200e97306dbfd4",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.43.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "5a9c3616bc8fcd6849eb8c31e50bff352a184ebdf6cf6ad868a0bce64c23209a",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.43.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "6e15507ec027e0ac173a2bf744f28cc052f0af67acd124731ad9928f86e8f4cd",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.47.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "deaab9019ceef0e56f4c3ef53e36e9d03c215271c8577edc9db4a055cb054379",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.47.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "c237070a2abb9a403f6bd67d3204a6b4eecf1ce89205bd95ed2815d6bc143417",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.47.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "a19903f90e453fd685bea7881c3ec687f3f31e06a2ab497b74b184557e94e9cc",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.47.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "b072a32875ad84856e6f8b1cd74d52aadaa05fc78e34823cf7d48f0bd3a17526",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.51.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "30b7789c199ab58483e98df5a52568e312787ba7feef90c802cb50ada72a0538",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.51.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "bdb5033a5d638648c0600463e36908146460424da3497deaada3cf383b5b7ec9",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.51.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "445e426096227bd188f7e150e449a7b273192235b4432ba3e14e84a9868a3f03",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.51.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "0008884f1590f35d0ab16f7a216cb804c7fe4975e80202e07a85aef6d4e64ed0",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.55.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "8d41682044ba21d3542fb773437fc5455eda565f9b4e45ed595c73e01f3b2dcb",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.55.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "caeb942b022b5f720537e87a8752377462ce6de49104a880f3de210b154cd38d",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.55.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "6186d4b590a3b06faf8bd4ae7a76c1ac12d518cb7ddf27d34139870b676d6441",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.55.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "2053e28130bebcefc9df8e51ace2da8147328504a9d18d682035de97e4e39753",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.59.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "8e7772dbe1bf8ebf1d6d06be1bd0de58fe810f261d9759957726564143f86344",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.59.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "dd9eeda57b02377fbb0519d18608920065cf683ae61b8a1074ca274682ce3b86",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.59.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "706ddbbb2285f61435f84b18453f0a944a67a2dd65a24ec69d8a9f826bb03257",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.59.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "5dcdc653552f6baea50bb9dbd12dc11a1016230be69022c72eae05be621d18b0",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.63.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "333c8f315b731a2b7c0300930176e5b0c06822924ee78df4c9968fe6b6be04d2",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.63.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "c0ab480e0947a2acbcb12f64a0f10b848872e3be60deef724f49b5a51e8c84d3",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.63.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "969abddd323cfc105e5f6d1b3c4479e2c21e92c9d427c6441be0a87ff277f814",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.63.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "bdf3e21ae75aeface1b396646338dac261a62ec9d36bea694c16b961a49e7760",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.7.indexer.k_norm.weight": {
+      "dtype": "F32",
+      "sha256": "e8cd91bb358ec2acbc7c153ddd3c6b96b64ef8bdcf4b94ebdae39d4256003d42",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.7.indexer.k_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "f24a378accf2b674eaf9f7a45ebb4b6d67c727a1dcb37b12673ea342f6f11d47",
+      "shape": [
+        128,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    },
+    "blk.7.indexer.q_norm.weight": {
+      "dtype": "F32",
+      "sha256": "4147226354dbe477e150340bf25e0355dfb32908aee8be4b4848f4e588882d9d",
+      "shape": [
+        128
+      ],
+      "stored": "the checkpoint's zero-centred w, verbatim (gain 1 + w, no un-fold)"
+    },
+    "blk.7.indexer.q_proj.weight": {
+      "dtype": "BF16",
+      "sha256": "42534f4d2425c3da69e79965fd03412261441dacf4ba696af32a343854a51aea",
+      "shape": [
+        512,
+        5120
+      ],
+      "stored": "checkpoint F32 rounded to BF16 (the converter casts these anyway)"
+    }
+  }
+}
