@@ -45,7 +45,8 @@ QsaIndexerWeights bind_qsa_indexer(Bindings& b, const TextConfig& config,
                           QType::BF16);
     out.query_norm   = b.direct(i + "query_norm", {q.indexer_head_dim}, norm_format);
     out.key_norm     = b.direct(i + "key_norm", {q.indexer_head_dim}, norm_format);
-    out.key_pre_norm = b.direct(i + "key_pre_norm", {q.indexer_head_dim}, norm_format);
+    out.key_pre_norm =
+        b.optional_direct(i + "key_pre_norm", {q.indexer_head_dim}, norm_format);
     return out;
 }
 
@@ -150,7 +151,9 @@ QsaIndexerWeights bind_qsa_indexer_share(Bindings& b, const TextConfig& config,
                            QType::BF16, rank);
     out.query_norm   = bind_norm_replica(b, i + "query_norm", q.indexer_head_dim, rank);
     out.key_norm     = bind_norm_replica(b, i + "key_norm", q.indexer_head_dim, rank);
-    out.key_pre_norm = bind_norm_replica(b, i + "key_pre_norm", q.indexer_head_dim, rank);
+    if (b.has(i + "key_pre_norm")) {
+        out.key_pre_norm = bind_norm_replica(b, i + "key_pre_norm", q.indexer_head_dim, rank);
+    }
     return out;
 }
 
@@ -435,7 +438,8 @@ std::vector<WeightId> layer_weights(const BlockWeights& block) {
                                attention->output});
         if (attention->qsa) {
             const auto& q = *attention->qsa;
-            out.insert(out.end(), {q.query, q.key, q.query_norm, q.key_norm, q.key_pre_norm});
+            out.insert(out.end(), {q.query, q.key, q.query_norm, q.key_norm});
+            if (q.key_pre_norm) { out.push_back(*q.key_pre_norm); }
         }
     } else {
         const auto& gdn = std::get<GdnWeights>(block.mixer);

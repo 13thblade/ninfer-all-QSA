@@ -1786,7 +1786,8 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
     const std::size_t pitch         = static_cast<std::size_t>(query_rows + key_rows) * kElement;
     const std::size_t query_bytes   = static_cast<std::size_t>(query_rows) * kElement;
     const std::size_t key_bytes     = static_cast<std::size_t>(key_rows) * kElement;
-    const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, &qsa.key_pre_norm};
+    const Tensor* pre_norm = qsa.key_pre_norm ? &*qsa.key_pre_norm : nullptr;
+    const ops::QsaIndexerWeights weights{&qsa.query_norm, &qsa.key_norm, pre_norm};
     const float scale =
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim)));
     qwen3_5::QsaStreamState* qsa_stream = qsa_indexer_->stream;

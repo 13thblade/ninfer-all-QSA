@@ -730,6 +730,16 @@ WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format,
     return parameter(std::move(name), std::move(shape), {}, format, residency);
 }
 
+std::optional<WeightId> Bindings::optional_direct(std::string name, artifact::Shape shape,
+                                                  QType format,
+                                                  artifact::Residency residency) {
+    // Absent is a valid state, not an error: the QSA-27B adaptation of a donor whose indexer
+    // has no per-token key norm (Prefrontal-AI's LSA distillation) simply carries no
+    // key_pre_norm, and nothing is added to `weights` for it.
+    if (!binder.contains(name)) { return std::nullopt; }
+    return parameter(std::move(name), std::move(shape), {}, format, residency);
+}
+
 void Bindings::evict(WeightId id, std::uint32_t rank) {
     const auto& parameter = at(id);
     if (parameter.reference.residency != artifact::Residency::Device) {

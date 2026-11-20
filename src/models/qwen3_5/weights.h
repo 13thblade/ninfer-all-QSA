@@ -67,7 +67,10 @@ struct VisionOverlayLayout {
 /// The five indexer parameters of a QSA-27B full-attention text layer. The MTP
 /// block has no trained indexer (the QSA fork's qwen35.cpp keeps every MTP key).
 struct QsaIndexerWeights {
-    WeightId query, key, query_norm, key_norm, key_pre_norm;
+    WeightId query, key, query_norm, key_norm;
+    // Absent when the donor's indexer has no per-token key norm (Prefrontal-AI's LSA
+    // distillation): the Op then pools the raw keys and norms the block mean.
+    std::optional<WeightId> key_pre_norm;
 };
 
 struct AttentionWeights {

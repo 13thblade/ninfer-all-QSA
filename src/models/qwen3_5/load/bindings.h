@@ -46,6 +46,13 @@ public:
     [[nodiscard]] WeightId direct(std::string name, artifact::Shape shape,
                                   QType format                  = QType::BF16,
                                   artifact::Residency residency = artifact::Residency::Device);
+    // The same, for a parameter the artifact may omit: a QSA donor without a per-token key
+    // norm carries no key_pre_norm, and the indexer's PreNorm path keys off its absence.
+    [[nodiscard]] std::optional<WeightId> optional_direct(
+        std::string name, artifact::Shape shape, QType format = QType::BF16,
+        artifact::Residency residency = artifact::Residency::Device);
+    // Whether the artifact declares `name`, for the tensor-parallel replica of an optional one.
+    [[nodiscard]] bool has(std::string_view name) const { return binder.contains(name); }
 
     // Binds `piece` of a parameter as a device weight of its own on `rank`, named `name@rank`
     // or `label`. The stored objects behind the parameter get no device demand from this.

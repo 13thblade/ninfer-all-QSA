@@ -431,7 +431,7 @@ public:
                 qsa.key   = rotated_linear(a->qsa->key);
                 qsa.query_norm   = tensor(a->qsa->query_norm);
                 qsa.key_norm     = tensor(a->qsa->key_norm);
-                qsa.key_pre_norm = tensor(a->qsa->key_pre_norm);
+                if (a->qsa->key_pre_norm) { qsa.key_pre_norm = tensor(*a->qsa->key_pre_norm); }
                 const auto& q = model_.config().text.qsa.value();
                 qsa.query_rows     = static_cast<std::uint32_t>(
                     std::uint64_t(q.indexer_n_heads) * q.indexer_head_dim);

@@ -1071,8 +1071,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                             static_cast<std::uint64_t>(qsa.record_width));
                         const Tensor projection = qsa.records.slice(
                             1, region, static_cast<std::int32_t>(committed));
+                        const Tensor* pre_norm =
+                            index.key_pre_norm ? &*index.key_pre_norm : nullptr;
                         const ops::QsaIndexerWeights weights{&index.query_norm, &index.key_norm,
-                                                             &index.key_pre_norm};
+                                                             pre_norm};
                         // The accepted verification columns are text tokens, so their
                         // three axes are equal: leave rope_positions null but keep the
                         // persistent tail axis plane in step with the live tail.
