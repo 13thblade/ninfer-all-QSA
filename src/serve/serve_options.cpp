@@ -1879,10 +1879,21 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
     }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
-        // it sizes the KV pool to free VRAM unless a capacity is given.
-        options.kv_capacity = options.context_cache.mode == ContextCacheMode::Hybrid
-                                  ? KvCapacityPolicy::automatic()
-                                  : KvCapacityPolicy::explicit_capacity(options.max_context);
+        // it sizes the KV pool to free VRAM unless a capacity is given. The QSA streamed tier
+        // likewise sizes from the device budget when --kv-headroom-mib asks for a reservation:
+        // a viewer that wants headroom free cannot also pin the pool to an explicit count, and
+        // under streaming the host pool -- not the device -- holds the full history. Without a
+        // headroom the streamed tier keeps its one-window-per-lane default as before.
+        const bool size_from_headroom =
+            options.context_cache.mode == ContextCacheMode::Hybrid ||
+            (qsa_streamed && kv_headroom_mib.has_value());
+        if (!size_from_headroom) {
+            options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        } else if (kv_headroom_mib.has_value()) {
+            options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
+        } else {
+            options.kv_capacity = KvCapacityPolicy::automatic();
+        }
     }
     if (options.context_cache.mode == ContextCacheMode::Hybrid) {
         if (legacy_cache_flag != nullptr) {

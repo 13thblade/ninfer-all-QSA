@@ -37,24 +37,33 @@
 ninfer-serve model.ninfer --qwen38-27b-qsa --qsa-prefill
 
 # 2 倍注意力窗口（4,096 token），开启 MTP 草稿（ngram 关闭），并把 KV 的 16,384 个位置留在显存、其余流式传输
-ninfer-serve model.ninfer --max-context 262144 --kv-capacity 262144\
+ninfer-serve model.ninfer --max-context 262144\
   --qwen38-27b-qsa --qsa-prefill --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--kv-capacity 1048576`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 0` 把显存整块交给引擎（预算在启动时分配完毕，余量 0 是预期结果）。四并发时显存预算为：权重 16.0 GiB、共享的 prefill staging 层 528 MiB、每 lane 一份的 MTP 池 2.06 GiB、indexer 分块键 2.15 GiB、`--kv-resident` 设备窗口 1.06 GiB。以代码类真实任务测试：每请求 32,940 token 的源码上下文，跨文件回答三个问题（答案全部正确）。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 256` 留出 256 MiB 给 CUDA 运行时开销，KV 容量自动计算（QSA stream 下为 `--max-context`，host pool 承载完整历史）。每组并发都按对应并发度重启服务实测，避免用 4-lane 资源配置去跑单发。
 
-| 并发 | 聚合 prefill (tok/s) | 聚合 decode (tok/s) | TTFT（最小–最大） | 每请求 prompt / 输出 |
-| --- | ---: | ---: | ---: | --- |
-| 单发（1 lane） | 1,490 | 97.3 | 22.2 s | 32,940 / 388 |
-| 双并发（2 lane） | 1,490 | 196.4 | 22.2–48.3 s | 32,940 / 267–388 |
-| 四并发（4 lane） | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
+测并发吞吐时让 decode 窗口真正重叠：短 prompt（约 93 token，各请求首句不同以避开前缀缓存）+ 要求 700 token 输出的代码生成任务，四个请求几乎同时进入 decode。端到端吞吐 = 输出 token 总数 ÷ 墙钟时间（从并发发起到最后一个请求返回），这才是并发合并速度；单请求速率之和在 decode 不重叠时没有物理意义。
 
-聚合 prefill = 各请求 prompt token 之和 ÷ prefill 串行总耗时：prefill 共用一份 staging 层、逐 lane 串行，所以这个数在各并发下几乎不变（单请求 1.48–1.50k tok/s）。聚合 decode = 各请求自身 decode 速率之和：decode 在 lane 间重叠，单请求速率随之下降，四并发时每 lane 仍为 88.1–97.9 tok/s，MTP 接受率 69.5–80.7%。TTFT 的阶梯来自串行 prefill。
+| 服务并发度 | 单请求 decode (tok/s) | 端到端吞吐 (tok/s) | 服务端 batch | MTP 接受率 | runtime / CUDA graph |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | 104.4 | 96.9 | 1.00 | 64.1% | 2.49 GiB / 开 |
+| 2 | 66.2 / 60.8 | 113.7 | 1.95 | 49.6–59.7% | 3.98 GiB / 关 |
+| 4 | 49.9–59.9 | 182.0 | 3.85 | 44.6–64.4% | 7.13 GiB / 关 |
 
-去掉 `--qsa-prefill` 走 dense prefill 时，同一任务、同一配置实测：单请求 prefill 1.74k tok/s、TTFT 19.0 s；四并发聚合 prefill 1,743 tok/s、每请求 decode 95.2–97.3 tok/s（和 385.2）、MTP 接受率 78.7–80.7%、TTFT 19.5–88.3 s。也就是说稀疏 prefill 让 prefill 慢约 17%、TTFT 多约 3 s，decode 基本不变。
+`batch` 是服务端每轮 decode 平均处理的行数（并发度 4 时 3.85，接近满批）。端到端吞吐 1→4 为 1.88×：单请求速率随并发摊薄，MTP 接受率也从 64% 降到 45–64%，是单卡 SM 饱和的结果。并发度 1 开启 CUDA graph、2/4 因逐 lane 回放而关闭，所以 1→2 的落差里含 graph 开关的影响。四并发显存预算为：权重 16.0 GiB、共享 prefill staging 层 528 MiB、每 lane 一份 MTP 池 2.06 GiB、indexer 分块键 2.15 GiB、`--kv-resident` 设备窗口 1.06 GiB。
+
+prefill 速度单独测（32,940-token 源码上下文，跨文件回答三个问题，答案全部正确）：prefill 共用一份 staging 层、逐 lane 串行，所以每请求速率不随并发变化。
+
+| prefill 分支 | 单请求 prefill (tok/s) | 说明 |
+| --- | ---: | --- |
+| QSA 稀疏（`--qsa-prefill`） | 1,490 | 稀疏窗口过滤有额外开销 |
+| dense（去掉 `--qsa-prefill`） | 1,743 | 快约 17%，TTFT 少约 3 s |
+
+两条路径的 decode 走同一分支，prefill 选择不影响上表的 decode 吞吐。
 
 本 fork 新增与改动的上游文件清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -95,24 +104,33 @@ When `--kv-resident` is a number other than `0`/`all`, the pool's automatic floo
 ninfer-serve model.ninfer --qwen38-27b-qsa --qsa-prefill
 
 # twice the attention window (4,096 tokens), MTP drafting on with ngram off, keeping 16,384 KV positions on the device and streaming the rest
-ninfer-serve model.ninfer --max-context 262144 --kv-capacity 262144\
+ninfer-serve model.ninfer --max-context 262144\
   --qwen38-27b-qsa --qsa-prefill --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--kv-capacity 1048576`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, and `--kv-headroom-mib 0` to hand the whole card to the engine (the budget is reserved at startup, so a 0 B remainder is the expected result). At four lanes the device budget is: 16.0 GiB of weights, a 528 MiB shared prefill staging layer, a 2.06 GiB MTP pool with one history per lane, 2.15 GiB of indexer block keys, and 1.06 GiB of `--kv-resident` device windows. Measured on real code tasks: every request reads a 32,940-token source context and answers the same three cross-file questions (all correct).
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, and `--kv-headroom-mib 256` to leave 256 MiB for CUDA runtime allocations, with the KV capacity sized automatically (one `--max-context` window under QSA streaming; the host pool holds the full history). Each concurrency was measured with the server restarted at that concurrency, so a single lane is not measured against a four-lane reservation.
 
-| Concurrency | aggregate prefill (tok/s) | aggregate decode (tok/s) | TTFT (min–max) | prompt / output per request |
-| --- | ---: | ---: | ---: | --- |
-| single (1 lane) | 1,490 | 97.3 | 22.2 s | 32,940 / 388 |
-| 2 concurrent (2 lanes) | 1,490 | 196.4 | 22.2–48.3 s | 32,940 / 267–388 |
-| 4 concurrent (4 lanes) | 1,490 | 377.5 | 22.4–101.6 s | 32,940 / 366–476 |
+Decode windows are made to overlap for the throughput test: short prompts (~93 tokens, distinct opening lines to avoid the prefix cache) asking for 700-token code answers, so all lanes enter decode at once. End-to-end throughput = output tokens / wall span (from the concurrent launch until the last response), the real aggregate rate; a sum of per-request rates is meaningless when their decode windows do not overlap.
 
-Aggregate prefill = sum of prompt tokens / total serialized prefill time: prefill shares one staging layer and runs lane by lane, so the figure stays flat across concurrency (1.48–1.50k tok/s per request). Aggregate decode = the sum of each request's own decode rate: decodes overlap, so each lane's rate dips accordingly — at four lanes every lane still runs 88.1–97.9 tok/s at 69.5–80.7% MTP acceptance. The TTFT staircase is that serialized prefill.
+| Server concurrency | per-request decode (tok/s) | end-to-end throughput (tok/s) | server batch | MTP acceptance | runtime / CUDA graph |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | 104.4 | 96.9 | 1.00 | 64.1% | 2.49 GiB / on |
+| 2 | 66.2 / 60.8 | 113.7 | 1.95 | 49.6–59.7% | 3.98 GiB / off |
+| 4 | 49.9–59.9 | 182.0 | 3.85 | 44.6–64.4% | 7.13 GiB / off |
 
-Dropping `--qsa-prefill` for a dense prefill, same task and same configuration: 1.74k tok/s per request, TTFT 19.0 s; at four lanes the aggregate prefill is 1,743 tok/s, each request decodes 95.2–97.3 tok/s (sum 385.2) at 78.7–80.7% MTP acceptance, with TTFT 19.5–88.3 s. The sparse prefill costs about 17% of prefill speed and three seconds of TTFT; decode is unchanged.
+`batch` is the average rows decoded per round on the server (3.85 at four lanes, near full batch). End-to-end throughput scales 1.88× from one to four lanes: the per-request rate thins out with concurrency and MTP acceptance drops from 64% to 45–64%, a saturated single-card SM. Concurrency 1 keeps CUDA graphs on while 2/4 turn them off for per-lane replay, so part of the 1→2 gap is the graph switch. At four lanes the device budget is: 16.0 GiB of weights, a 528 MiB shared prefill staging layer, a 2.06 GiB MTP pool with one history per lane, 2.15 GiB of indexer block keys, and 1.06 GiB of `--kv-resident` device windows.
+
+Prefill speed was measured separately (32,940-token source contexts, three cross-file questions, all answered correctly): prefill shares one staging layer and runs lane by lane, so the per-request rate does not change with concurrency.
+
+| prefill path | per-request prefill (tok/s) | note |
+| --- | ---: | --- |
+| QSA sparse (`--qsa-prefill`) | 1,490 | sparse window filtering adds overhead |
+| dense (without `--qsa-prefill`) | 1,743 | ~17% faster, ~3 s less TTFT |
+
+Both paths share the same decode branch, so the prefill choice does not change the decode throughput above.
 
 This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license. The upstream files this fork modifies are listed in [MODIFICATIONS.md](MODIFICATIONS.md); untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git history.
 
