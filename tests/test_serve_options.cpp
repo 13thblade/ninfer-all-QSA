@@ -1115,6 +1115,23 @@ int main() {
                           hybrid_explicit_kv.kv_capacity.explicit_tokens == 16384 &&
                           hybrid_explicit_kv.context_cache.host_cache_budget_bytes == 0U,
                       "hybrid mode must keep an explicit KV capacity and a zero Host budget");
+    // KV streaming puts the context in the host pool, so an explicit capacity and a device
+    // headroom no longer disagree: the headroom only sizes an automatic pool.
+    const ServeOptions explicit_kv_with_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "1048576",
+               "--kv-headroom-mib", "0"});
+    failures += check(explicit_kv_with_headroom.kv_capacity.mode ==
+                              ninfer::KvCapacityMode::Explicit &&
+                          explicit_kv_with_headroom.kv_capacity.explicit_tokens == 1048576 &&
+                          explicit_kv_with_headroom.kv_capacity.automatic_headroom_bytes == 0,
+                      "an explicit KV capacity must keep its pool beside a headroom");
+    const ServeOptions auto_kv_with_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto",
+               "--kv-headroom-mib", "0"});
+    failures += check(auto_kv_with_headroom.kv_capacity.mode ==
+                              ninfer::KvCapacityMode::Automatic &&
+                          auto_kv_with_headroom.kv_capacity.automatic_headroom_bytes == 0,
+                      "an automatic pool must still take the headroom");
     const ServeOptions catalog =
         parse({"ninfer-serve", "model.ninfer", "--use-original-prefix-caching"});
     failures += check(catalog.context_cache.mode == ninfer::ContextCacheMode::Legacy &&

@@ -365,7 +365,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-headroom-mib N           memory --kv-capacity auto leaves free (default\n"
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); alias --vram-headroom-mib\n"
+           "); ignored with an explicit --kv-capacity; alias --vram-headroom-mib\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
@@ -1923,11 +1923,13 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             (original_cache_selected ? "--use-original-prefix-caching" : catalog_option) +
             " selects the checkpoint catalog");
     }
-    if (kv_headroom_mib.has_value()) {
-        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw product::OptionConflict({"kv-headroom-mib", "kv-capacity"},
-                                          "--kv-headroom-mib requires --kv-capacity auto");
-        }
+    // --kv-headroom-mib sizes an automatic pool only. An explicit --kv-capacity is the
+    // caller's own bound and is not derived from free device memory: under KV streaming the
+    // total context lives in the host pool, so a manual capacity and a headroom no longer
+    // conflict -- the headroom simply has nothing to size. A resident pool that then does
+    // not fit fails at its own allocation, which names the knob to lower.
+    if (kv_headroom_mib.has_value() &&
+        options.kv_capacity.mode == KvCapacityMode::Automatic) {
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
     }
     if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {

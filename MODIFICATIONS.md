@@ -233,6 +233,11 @@ offered under the same Apache-2.0 license.
   `resolved_qsa_prefill()` (`program/planning/startup.cpp`) resolves it ahead of
   the legacy `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the
   default because upstream's wide-T QSA kernel is not yet optimised.
+- `--kv-headroom-mib` only sizes an automatic KV pool; it is no longer refused
+  beside an explicit `--kv-capacity`. Under KV streaming the context lives in the
+  host pool rather than in device memory, so the two are independent — a manual
+  capacity stays exactly as given, and a resident pool that does not fit still
+  fails at allocation and names the knob to lower.
 - `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
   `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
   resolved to the fully-resident sentinel) fall through to the shared
