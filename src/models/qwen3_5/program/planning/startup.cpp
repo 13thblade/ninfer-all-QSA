@@ -1915,24 +1915,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_resident_positions = inputs.kv_resident_positions;
     if (inputs.qsa && inputs.kv_resident_positions != 0) {
         // The pool serves decode and verification only: a prefill reads the staged layer, because
-        // its columns are committed prompt tokens and cannot be narrowed. A verification's columns
-        // overlap heavily in practice -- consecutive drafts re-read most of column 0's blocks --
-        // but the resolver may ask for the union of every column's own selection, so the floor is
-        // one budget window per column: kv_stream_minimum_slots(width, budget + 1), the same rule
-        // qwen4_exp floors its pool with, `budget + 1` counting the query's own incomplete block.
-        // A pool one window short does not fail loudly: the round degrades to column 0 alone in
-        // resolve_kernel, which is how --kv-resident 4096 dropped MTP acceptance from 81.8% to
-        // 6-7% while every log line still looked healthy. When this floor times four tokens is not
-        // below the context, streaming is off and every full-attention layer keeps its KV resident.
-        // An explicit --kv-resident above the floor is still honoured.
+        // its columns are committed prompt tokens and cannot be narrowed. Consecutive drafts'
+        // selections overlap heavily, so the pool does not reserve one window per column: the
+        // floor is ONE selection window plus one block per column, (--qsa-top-blocks + T) * 4
+        // tokens, i.e. `budget + width` pages. A round whose union outgrows the pool keeps column
+        // 0's selection and the blocks that call wrote and drops the draft columns
+        // (resolve_kernel), which accepts nothing from that round -- that is the documented
+        // tuning lever, not a failure: a user who wants every draft column's full selection
+        // raises --kv-resident, and the floor never shrinks below one window plus the writes.
+        // When this floor times four tokens is not below the context, streaming is off and every
+        // full-attention layer keeps its KV resident. An explicit --kv-resident above the floor
+        // is still honoured.
         const std::uint32_t width = widest_verify_window(*impl) + 1U;
         const std::uint32_t budget =
             inputs.parameters->text.qsa_block_budget != 0
                 ? inputs.parameters->text.qsa_block_budget
                 : static_cast<std::uint32_t>(ops::kQsaTopBlocksDefault);
-        const std::uint32_t floor_blocks = static_cast<std::uint32_t>(
-            ops::kv_stream_minimum_slots(static_cast<std::int32_t>(width),
-                                         static_cast<std::int32_t>(budget + 1U)));
+        const std::uint32_t floor_blocks = budget + width;
         const std::uint32_t slots = std::max(
             (inputs.kv_resident_positions + ops::kKvStreamPageTokens - 1U) /
                 ops::kKvStreamPageTokens,
