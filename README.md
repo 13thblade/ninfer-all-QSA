@@ -17,7 +17,8 @@
 用户可自行对照两版差异。
 
 后续计划：
-1. 提供Ngram/Dflash2/Dspine草稿的支持。
+1. 使多并发支持CUDA graph；
+2. 提供Ngram/Dflash2/Dspine草稿的支持。
 
 ## 旗标
 
@@ -44,17 +45,13 @@ ninfer-serve model.ninfer --max-context 262144\
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 256` 留出 256 MiB 给 CUDA 运行时开销，KV 容量自动计算（QSA stream 下为 `--max-context`，host pool 承载完整历史）。每组并发都按对应并发度重启服务实测，避免用 4-lane 资源配置去跑单发。
-
-测并发吞吐时让 decode 窗口真正重叠：短 prompt（约 93 token，各请求首句不同以避开前缀缓存）+ 要求 700 token 输出的代码生成任务，四个请求几乎同时进入 decode。端到端吞吐 = 输出 token 总数 ÷ 墙钟时间（从并发发起到最后一个请求返回），这才是并发合并速度；单请求速率之和在 decode 不重叠时没有物理意义。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启，`--kv-headroom-mib 256`。Decode速度基于真实代码任务测试得出。
 
 | 服务并发度 | 单请求 decode (tok/s) | 端到端吞吐 (tok/s) | 服务端 batch | MTP 接受率 | runtime / CUDA graph |
 | --- | --- | ---: | ---: | ---: | --- |
 | 1 | 104.4 | 96.9 | 1.00 | 64.1% | 2.49 GiB / 开 |
 | 2 | 66.2 / 60.8 | 113.7 | 1.95 | 49.6–59.7% | 3.98 GiB / 关 |
 | 4 | 49.9–59.9 | 182.0 | 3.85 | 44.6–64.4% | 7.13 GiB / 关 |
-
-`batch` 是服务端每轮 decode 平均处理的行数（并发度 4 时 3.85，接近满批）。端到端吞吐 1→4 为 1.88×：单请求速率随并发摊薄，MTP 接受率也从 64% 降到 45–64%，是单卡 SM 饱和的结果。并发度 1 开启 CUDA graph、2/4 因逐 lane 回放而关闭，所以 1→2 的落差里含 graph 开关的影响。四并发显存预算为：权重 16.0 GiB、共享 prefill staging 层 528 MiB、每 lane 一份 MTP 池 2.06 GiB、indexer 分块键 2.15 GiB、`--kv-resident` 设备窗口 1.06 GiB。
 
 prefill 速度单独测（32,940-token 源码上下文，跨文件回答三个问题，答案全部正确）：prefill 共用一份 staging 层、逐 lane 串行，所以每请求速率不随并发变化。
 
@@ -84,7 +81,8 @@ The older indexer tensors remain available; they were trained only on 16k–64k 
 Users can compare the two versions themselves.
 
 Planned work:
-1. Add support for Ngram/DFlash2/DSpine drafting.
+1. Enable CUDA graph support for multiple concurrent requests;
+2. Add support for Ngram/DFlash2/DSpine drafting.
 
 ## Flags
 
@@ -111,17 +109,13 @@ ninfer-serve model.ninfer --max-context 262144\
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, and `--kv-headroom-mib 256` to leave 256 MiB for CUDA runtime allocations, with the KV capacity sized automatically (one `--max-context` window under QSA streaming; the host pool holds the full history). Each concurrency was measured with the server restarted at that concurrency, so a single lane is not measured against a four-lane reservation.
-
-Decode windows are made to overlap for the throughput test: short prompts (~93 tokens, distinct opening lines to avoid the prefix cache) asking for 700-token code answers, so all lanes enter decode at once. End-to-end throughput = output tokens / wall span (from the concurrent launch until the last response), the real aggregate rate; a sum of per-request rates is meaningless when their decode windows do not overlap.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on, `--kv-headroom-mib 256`. Decode speed was measured on real code tasks.
 
 | Server concurrency | per-request decode (tok/s) | end-to-end throughput (tok/s) | server batch | MTP acceptance | runtime / CUDA graph |
 | --- | --- | ---: | ---: | ---: | --- |
 | 1 | 104.4 | 96.9 | 1.00 | 64.1% | 2.49 GiB / on |
 | 2 | 66.2 / 60.8 | 113.7 | 1.95 | 49.6–59.7% | 3.98 GiB / off |
 | 4 | 49.9–59.9 | 182.0 | 3.85 | 44.6–64.4% | 7.13 GiB / off |
-
-`batch` is the average rows decoded per round on the server (3.85 at four lanes, near full batch). End-to-end throughput scales 1.88× from one to four lanes: the per-request rate thins out with concurrency and MTP acceptance drops from 64% to 45–64%, a saturated single-card SM. Concurrency 1 keeps CUDA graphs on while 2/4 turn them off for per-lane replay, so part of the 1→2 gap is the graph switch. At four lanes the device budget is: 16.0 GiB of weights, a 528 MiB shared prefill staging layer, a 2.06 GiB MTP pool with one history per lane, 2.15 GiB of indexer block keys, and 1.06 GiB of `--kv-resident` device windows.
 
 Prefill speed was measured separately (32,940-token source contexts, three cross-file questions, all answered correctly): prefill shares one staging layer and runs lane by lane, so the per-request rate does not change with concurrency.
 
