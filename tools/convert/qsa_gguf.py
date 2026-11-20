@@ -74,6 +74,11 @@ COMPRESS_RATIOS_KEY = "qwen35.attention.compress_ratios"
 #: The five tensors llama.cpp's QSA-27B converter writes for each full-attention layer.
 ROLES = ("query", "key", "query_norm", "key_norm", "key_pre_norm")
 
+#: The same four without the per-token key norm. Prefrontal-AI's LSA distillation pools the
+#: raw keys and norms the block mean, so its maps carry no ``k_norm.pre_weight``; the engine
+#: then takes the indexer Op's pool-then-norm path (``key_pre_norm`` absent).
+ROLES_NO_PRE_NORM = ("query", "key", "query_norm", "key_norm")
+
 _GGUF_SUFFIX = {
     "query": "q_proj.weight",
     "key": "k_proj.weight",
@@ -208,9 +213,41 @@ def has_indexer_asset() -> bool:
     return indexer_asset_path() is not None
 
 
+def _asset_roles(handle) -> tuple[str, ...]:
+    """Which roles an asset carries, from its keys alone.
+
+    Five for a kuraneko1 donor, four for one without the per-token key norm. A mixture is
+    refused: the engine's PreNorm choice is per artifact, not per layer.
+    """
+
+    keys = set(handle.keys())
+    carries = [gguf_tensor(layer, "key_pre_norm") in keys for layer in qsa_layers()]
+    if all(carries):
+        return ROLES
+    if not any(carries):
+        return ROLES_NO_PRE_NORM
+    partial = [layer for layer, has in zip(qsa_layers(), carries) if has]
+    raise ValueError(
+        f"indexer asset carries key_pre_norm on {len(partial)} of {len(carries)} layers "
+        f"({partial[:3]}...); it must either have it on every layer or on none"
+    )
+
+
+def _asset_norm_form(handle) -> str:
+    """How the asset stores norm weights: the fork's ``1 + w``, or the donor's own ``w``.
+
+    ``one-plus`` is the default so assets written before the field existed keep their
+    established read path (subtract one). ``zero-centred`` skips it, which is what a donor
+    whose norms are already the additive gamma needs: no round trip through ``w + 1``.
+    """
+
+    metadata = handle.metadata() or {}
+    return str(metadata.get("norm_form", "one-plus"))
+
+
 def sources_from_asset(path: Path | None = None,
                        dtype: str = DIRECT_FORMAT) -> dict[str, LogicalSource]:
-    """Read the 80 indexer tensors from the asset, converting exactly as sources() does."""
+    """Read the indexer tensors from the asset, converting exactly as sources() does."""
     path = path or indexer_asset_path()
     if path is None:
         raise ValueError("no indexer asset; set NINFER_QSA_INDEXER_ASSET or pass a donor GGUF")
@@ -219,14 +256,16 @@ def sources_from_asset(path: Path | None = None,
 
     out: dict[str, LogicalSource] = {}
     with safe_open(str(path), framework="pt") as handle:
-        keys = set(handle.keys())
-        expected = {gguf_tensor(layer, role) for layer in qsa_layers() for role in ROLES}
+        keys      = set(handle.keys())
+        roles     = _asset_roles(handle)
+        norm_form = _asset_norm_form(handle)
+        expected  = {gguf_tensor(layer, role) for layer in qsa_layers() for role in roles}
         missing = sorted(expected - keys)
         if missing:
             raise ValueError(
                 f"indexer asset {path} is missing {len(missing)} tensors ({missing[:3]}...)")
         for layer in qsa_layers():
-            for role in ROLES:
+            for role in roles:
                 name = gguf_tensor(layer, role)
                 # Stored as F32 for the three norms and BF16 for the two projections (the
                 # converter casts those to BF16 anyway); go through F32 so either dtype works.
@@ -235,7 +274,7 @@ def sources_from_asset(path: Path | None = None,
                 if tuple(words.shape) != tuple(_SHAPES[role]):
                     raise ValueError(
                         f"{name}: asset shape {tuple(words.shape)} != expected {_SHAPES[role]}")
-                if role in _NORM_ROLES:
+                if role in _NORM_ROLES and norm_form != "zero-centred":
                     words = words - 1.0
                 target = dtype if role in _NORM_ROLES else "bf16"
                 torch_dtype = torch.float32 if target == "fp32" else torch.bfloat16
@@ -246,19 +285,22 @@ def sources_from_asset(path: Path | None = None,
     return out
 
 
-def register_parameters(model: Model, dtype: str = DIRECT_FORMAT) -> None:
+def register_parameters(model: Model, dtype: str = DIRECT_FORMAT,
+                        pre_norm: bool = True) -> None:
     """Add the QSA logical parameters to a model built from the dense 27B geometry.
 
     The stock ``qwen3_5`` builder does not know about the indexer.  Registering the
     parameters here (with correctly shaped placeholder sources) lets the existing
     ``Recipe.assign`` / ``cast_direct`` pipeline write them into the artifact without
     changing the builder used by every other recipe. ``dtype`` is the direct format
-    for the three norm weights (bf16 or fp32); the projections stay bf16.
+    for the three norm weights (bf16 or fp32); the projections stay bf16. ``pre_norm``
+    false registers the four tensors of a donor without the per-token key norm, which
+    is also what tells the engine to pool the raw keys and norm the block mean.
     """
 
     for layer in qsa_layers():
         prefix = f"text/layers/{layer}/"
-        for role in ROLES:
+        for role in (ROLES if pre_norm else ROLES_NO_PRE_NORM):
             name = parameter_name(layer, role)
             if name in model.parameters:
                 continue
@@ -299,6 +341,7 @@ __all__ = [
     "INDEXER_HEADS",
     "QSA_HEADER",
     "ROLES",
+    "ROLES_NO_PRE_NORM",
     "artifact_config",
     "check_header",
     "expected_tensors",

@@ -169,12 +169,15 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
         check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
         indexer_sources = qsa_gguf.sources(donor, dtype=indexer_dtype)
 
-    # Register the indexer parameters and their artifact config before the stock
-    # recipe body runs, exactly as qwen3_8_27b_qsa_gguf does.
-    qsa_gguf.register_parameters(model, dtype=indexer_dtype)
+    # A donor without a per-token key norm (Prefrontal-AI's LSA distillation) supplies four
+    # tensors per layer; registration and the parameter list follow whatever the source has,
+    # and the artifact's missing binding is what selects the Op's pool-then-norm path.
+    pre_norm = any(name.endswith("/key_pre_norm") for name in indexer_sources)
+    qsa_gguf.register_parameters(model, dtype=indexer_dtype, pre_norm=pre_norm)
     model.config.update(qsa_gguf.artifact_config())
+    roles = qsa_gguf.ROLES if pre_norm else qsa_gguf.ROLES_NO_PRE_NORM
     for layer in qsa_gguf.qsa_layers():
-        for role in qsa_gguf.ROLES:
+        for role in roles:
             recipe.add_parameter(qsa_gguf.parameter_name(layer, role))
 
     # Text tower, MTP block, vision and DFlash2 come from the target.

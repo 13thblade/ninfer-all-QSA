@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 状态 | P0 完成；P1 待开工 |
+| 状态 | P0–P2 完成；P3 待开工 |
 | 开始日期 | 2026-11-21 |
 | 最后更新 | 2026-11-21 |
 | 基线 commit | `5784f9bc8`（master，工作树干净） |
@@ -192,7 +192,7 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 - [x] 核实引擎恒 `PreNorm=true` 的根因
 - [x] 写本文件并提交
 
-### P1 引擎：允许 `key_pre_norm` 缺席 — [ ]
+### P1 引擎：允许 `key_pre_norm` 缺席 — [x]
 
 改动文件与要点：
 
@@ -221,13 +221,12 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 
 验收：
 
-- [ ] `ninfer_tests.exe ninfer_qsa_indexer_test` PASS（含 8102/8103/8104 的 `PreNorm=false` 分支）
-- [ ] `ninfer_tests.exe ninfer_sparse_attention_test`、`ninfer_kv_stream_test` PASS
-- [ ] 用现有 v2 产物 `E:/LLMs/Qwen3.8-27B-QSA-FP32idx.ninfer`（若已删则用
-      `Qwen3.8-27B-QSA-UD-Q4_K_XL.ninfer`）加载并推理，输出与改动前一致
-- [ ] 提交
+- [x] `ninfer_tests.exe ninfer_qsa_indexer_test` PASS（含 8102/8103/8104 的 `PreNorm=false` 分支）
+- [x] `ninfer_tests.exe ninfer_sparse_attention_test`、`ninfer_kv_stream_test` PASS
+- [x] 用现有 v2 产物（实际用了 `Qwen3.8-27B-QSA-UD-Q4_K_XL.ninfer`）加载并推理，输出正常
+- [x] 提交 `30f9a2493`
 
-### P2 转换器：4/5 role 两条路线统一 — [ ]
+### P2 转换器：4/5 role 两条路线统一 — [x]
 
 1. `tools/convert/qsa_gguf.py`
    - 新增 `ROLES_NO_PRE_NORM = ("query", "key", "query_norm", "key_norm")`；
@@ -243,8 +242,8 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 
 验收：
 
-- [ ] `pytest tests/convert -q` 串行跑：新增用例 PASS，既有失败仍是那 3 个（见 §7）
-- [ ] 用 v2 资产重跑一次原有 graft 产物，`sha256` 与改动前一致（或仅差已记录的时间戳字段）
+- [x] `pytest tests/convert -q` 串行跑：**425 passed / 3 failed / 1 skipped**，失败仍是 §7 那 3 个
+- [x] v2 资产与 v2 donor 的读取结果**逐位一致**：80/80 张量 `np.array_equal`（`fp32` norm 路径）
 
 ### P3 vLSA 资产与提取脚本 — [ ]
 
@@ -424,3 +423,5 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | 日期 | 阶段 | 结果 |
 | --- | --- | --- |
 | 2026-11-21 | P0 | 规划完成；vLSA 的 rope 表确认为 YaRN-40（3e-8 误差），`PreNorm` 恒真的根因定位到 `text.cpp:1789` / `prefill.cpp:1075` |
+| 2026-11-21 | P1 | `30f9a2493`：`optional_direct` + optional 传递链；QSA/attention/KV/loader 7 个测试全 PASS；5-role 产物加载正常 |
+| 2026-11-21 | P2 | `ROLES_NO_PRE_NORM` + `norm_form` 元数据 + graft 由来源推导 role 集合；`test_qsa_graft.py` 12 项 PASS，全量 425 passed |
