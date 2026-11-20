@@ -169,9 +169,9 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
         check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
         indexer_sources = qsa_gguf.sources(donor, dtype=indexer_dtype)
 
-    # A donor without a per-token key norm (Prefrontal-AI's LSA distillation) supplies four
-    # tensors per layer; registration and the parameter list follow whatever the source has,
-    # and the artifact's missing binding is what selects the Op's pool-then-norm path.
+    # A donor without a per-token key norm (Prefrontal-AI's long-16k-1M-heavy run) supplies
+    # four tensors per layer; registration and the parameter list follow whatever the source
+    # has, and the artifact's missing binding is what selects the Op's pool-then-norm path.
     pre_norm = any(name.endswith("/key_pre_norm") for name in indexer_sources)
     qsa_gguf.register_parameters(model, dtype=indexer_dtype, pre_norm=pre_norm)
     model.config.update(qsa_gguf.artifact_config())

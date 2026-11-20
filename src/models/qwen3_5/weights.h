@@ -68,8 +68,8 @@ struct VisionOverlayLayout {
 /// block has no trained indexer (the QSA fork's qwen35.cpp keeps every MTP key).
 struct QsaIndexerWeights {
     WeightId query, key, query_norm, key_norm;
-    // Absent when the donor's indexer has no per-token key norm (Prefrontal-AI's LSA
-    // distillation): the Op then pools the raw keys and norms the block mean.
+    // Absent when the donor's indexer has no per-token key norm (Prefrontal-AI's
+    // long-16k-1M-heavy run): the Op then pools the raw keys and norms the block mean.
     std::optional<WeightId> key_pre_norm;
 };
 

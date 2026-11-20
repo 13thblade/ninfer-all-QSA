@@ -74,9 +74,9 @@ COMPRESS_RATIOS_KEY = "qwen35.attention.compress_ratios"
 #: The five tensors llama.cpp's QSA-27B converter writes for each full-attention layer.
 ROLES = ("query", "key", "query_norm", "key_norm", "key_pre_norm")
 
-#: The same four without the per-token key norm. Prefrontal-AI's LSA distillation pools the
-#: raw keys and norms the block mean, so its maps carry no ``k_norm.pre_weight``; the engine
-#: then takes the indexer Op's pool-then-norm path (``key_pre_norm`` absent).
+#: The same four without the per-token key norm. Prefrontal-AI's long-16k-1M-heavy run pools
+#: the raw keys and norms the block mean, so its maps carry no ``k_norm.pre_weight``; the
+#: engine then takes the indexer Op's pool-then-norm path (``key_pre_norm`` absent).
 ROLES_NO_PRE_NORM = ("query", "key", "query_norm", "key_norm")
 
 _GGUF_SUFFIX = {

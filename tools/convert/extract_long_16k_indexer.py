@@ -1,5 +1,5 @@
-"""Extract the QSA indexer of Prefrontal-AI's LSA distillation (vLSA) into the asset format
-the graft reads, so a transplant no longer needs a kuraneko1 GGUF.
+"""Extract the pooled-key QSA indexer of Prefrontal-AI's long-16k-1M-heavy run into the asset
+format the graft reads, so a transplant no longer needs a kuraneko1 GGUF.
 
 The checkpoint is a ``maps`` dict of sixteen layers (3, 7, ... 63), each holding
 ``index_qk_proj`` ``[(4 + 1) * 128, 5120]`` with the query heads' rows first, the two
@@ -18,13 +18,19 @@ Two differences from a kuraneko1 donor decide the shape of this asset:
 The runtime scalars are checked, not trusted: this checkpoint's ``inverse_frequencies`` is
 ``theta^(-2i/64)`` under YaRN factor 40 over a 262,144-token window, and ``attention_scaling``
 is that factor's ``0.1 * ln(40) + 1``.  Extraction fails if either stops holding, so a
-different distillation cannot silently inherit the wrong rope.
+different distillation cannot silently inherit the wrong provenance.
+
+That factor is the **model's** rotation, not the indexer's own.  Prefrontal-AI serves
+Qwen3.8-27B at YaRN 40 (10,485,760 positions) and the indexer rotates with the trunk's
+frequencies and scale -- ``src/lsa/baselines/qsa.py``: "the rotation the model's own: its
+frequencies and its YaRN scale".  The artifact therefore records the rotation only as
+provenance; the engine gives the indexer whatever plan the trunk is served under.
 
 Per ``.gitignore`` (``*.safetensors``) the asset is NOT committed; it ships as a GitHub
 Release attachment (verified against the manifest ``asset_sha256``), or is rebuilt here.
 Run with the ninfer python env::
 
-    <py> tools/convert/extract_lsa_indexer.py [CHECKPOINT.pt] [ASSET_DIR]
+    <py> tools/convert/extract_long_16k_indexer.py [CHECKPOINT.pt] [ASSET_DIR]
 """
 from __future__ import annotations
 
@@ -44,11 +50,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.convert import qsa_gguf                      # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent / "assets"
-ASSET_NAME = "indexer_tensors_lsa.safetensors"
-MANIFEST_NAME = "indexer_tensors_lsa.manifest.json"
+ASSET_NAME = "indexer_tensors-long-16k-1M-heavy.safetensors"
+MANIFEST_NAME = "indexer_tensors-long-16k-1M-heavy.manifest.json"
 
-#: The indexer's rotation as this checkpoint trained it: YaRN factor 40 over the model's
-#: 262,144-token native window, at the model's 1e7 theta, on 64 of the 128 head dims.
+#: The rotation the donor was distilled under: YaRN factor 40 over the model's 262,144-token
+#: native window, at the model's 1e7 theta, on 64 of the 128 head dims.  This is the model's
+#: serving rotation (``lsa/assets/models/qwen38_27b.yaml``), not an indexer setting; the asset
+#: records it so a mismatch is caught, and the engine reads the trunk's plan instead.
 ROPE = {"rope_type": "yarn", "factor": 40.0, "original_max_position_embeddings": 262_144}
 THETA = 1.0e7
 ROTARY_PAIRS = 32
@@ -184,22 +192,22 @@ def extract(checkpoint: str, assets: Path = ASSETS) -> int:
     save_file(weights, str(asset), metadata={
         "format": "pt",
         "source": source.name,
-        "donor": "vLSA",
+        "donor": "long-16k-1M-heavy",
         "norm_form": "zero-centred",
         "attention_scaling": f"{scaling:.9g}",
-        "indexer_rope": f"yarn factor {ROPE['factor']:g} over "
-                        f"{ROPE['original_max_position_embeddings']}",
+        "distillation_rope": f"yarn factor {ROPE['factor']:g} over "
+                             f"{ROPE['original_max_position_embeddings']}",
     })
 
     data = asset.read_bytes()
     manifest = {
         "source_donor": source.name,
-        "donor_family": "vLSA (Prefrontal-AI/latent-sparse-attention)",
+        "donor_family": "Prefrontal-AI/latent-sparse-attention",
         "tensor_count": len(manifest_tensors),
         "precision": "BF16 projections + F32 zero-centred norms (per-tensor dtype below)",
         "norm_form": "zero-centred",
         "roles": list(roles),
-        "indexer_rope": ROPE,
+        "distillation_rope": ROPE,
         "attention_scaling": scaling,
         "inverse_frequencies": [float(v) for v in frequencies],
         "log_tau": log_tau,
@@ -214,16 +222,16 @@ def extract(checkpoint: str, assets: Path = ASSETS) -> int:
 
     print(f"wrote {asset} ({len(data) / 1e6:.2f} MB, {len(weights)} tensors)")
     print(f"asset_sha256 = {manifest['asset_sha256']}")
-    print(f"rope: factor {ROPE['factor']:g} over {ROPE['original_max_position_embeddings']}, "
-          f"attention_scaling {scaling:.9f}")
+    print(f"rope: the donor's model-level rotation, factor {ROPE['factor']:g} over "
+          f"{ROPE['original_max_position_embeddings']}, attention_scaling {scaling:.9f}")
     return 0
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NINFER_LSA_PT")
+    path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NINFER_LONG_16K_PT")
     if not path:
         raise SystemExit(
-            "usage: extract_lsa_indexer.py CHECKPOINT.pt [ASSET_DIR] "
-            "(or set NINFER_LSA_PT; there is no built-in path)")
+            "usage: extract_long_16k_indexer.py CHECKPOINT.pt [ASSET_DIR] "
+            "(or set NINFER_LONG_16K_PT; there is no built-in path)")
     directory = Path(sys.argv[2]) if len(sys.argv) > 2 else ASSETS
     sys.exit(extract(path, directory))

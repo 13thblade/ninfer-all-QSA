@@ -1911,6 +1911,10 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         // lane's persistent state, which every later decode/verify selection scores
         // against. Skipping it for a dense prefill would leave the prompt's blocks
         // without scores.
+        //
+        // The rope is the trunk's plan, deliberately: the indexer rotates with the model's
+        // own frequencies and YaRN scale (Prefrontal-AI's qsa.py), never a schedule of its
+        // own, so --rope-yarn / --rope-yarn-factor reach both paths alike.
         ops::qsa_indexer_append(index, first, weights, config_.rms_norm_eps, rope_yarn_,
                                 state.pooled, *append_tail, stream, indexer_positions);
 

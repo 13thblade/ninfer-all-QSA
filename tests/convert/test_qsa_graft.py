@@ -8,8 +8,9 @@ weights.  A regression here is silent: the artifact still loads, it just carries
 where the target asked for FP32.
 
 The role set is the second half: a donor without the indexer's per-token key norm
-(Prefrontal-AI's LSA distillation) supplies four tensors per layer, and the artifact must
-register exactly those — the missing binding is what selects the Op's pool-then-norm path.
+(Prefrontal-AI's long-16k-1M-heavy run) supplies four tensors per layer, and the artifact
+must register exactly those — the missing binding is what selects the Op's pool-then-norm
+path.
 
 The model and recipe are stubs — the point is the wiring, not the conversion, which
 ``test_qwen3_8_27b_qsa_gguf.py`` covers against a synthetic GGUF.

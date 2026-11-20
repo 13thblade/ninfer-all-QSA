@@ -734,7 +734,7 @@ std::optional<WeightId> Bindings::optional_direct(std::string name, artifact::Sh
                                                   QType format,
                                                   artifact::Residency residency) {
     // Absent is a valid state, not an error: the QSA-27B adaptation of a donor whose indexer
-    // has no per-token key norm (Prefrontal-AI's LSA distillation) simply carries no
+    // has no per-token key norm (Prefrontal-AI's long-16k-1M-heavy run) simply carries no
     // key_pre_norm, and nothing is added to `weights` for it.
     if (!binder.contains(name)) { return std::nullopt; }
     return parameter(std::move(name), std::move(shape), {}, format, residency);

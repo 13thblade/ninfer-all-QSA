@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `87c35b6d4` (merged through 20 November 2026) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 28 files added, 87 modified; no upstream file deleted |
+| Scope | 32 files added, 87 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -270,6 +270,20 @@ offered under the same Apache-2.0 license.
   Both routes resolve the indexer norms' direct format through
   `qsa_gguf.indexer_direct_format(config)`, so a graft carries the same FP32 norms
   as an artifact converted straight from a QSA GGUF.
+- `extract_long_16k_indexer.py` reads the pooled-key QSA indexer out of
+  Prefrontal-AI's long-16k-1M-heavy distillation checkpoint
+  (https://github.com/Prefrontal-AI/latent-sparse-attention) into
+  `assets/indexer_tensors-long-16k-1M-heavy.{safetensors,manifest.json}`: sixteen
+  layers of `index_qk_proj` split into query and key rows, the two zero-centred
+  Gemma norms stored verbatim (`norm_form=zero-centred`), and the donor's
+  model-level YaRN-40 rotation recorded as provenance (`distillation_rope`) rather
+  than as a setting — the engine rotates the indexer with the trunk's own plan.
+  That donor has no per-token key norm, so a graft from it registers four roles
+  and the Op takes its pool-then-norm path.
+- The indexer's `key_pre_norm` is optional end to end (`Bindings::optional_direct`,
+  `std::optional<WeightId>`, `std::optional<Tensor>`); its absence is what selects
+  the Op's pool-then-norm path, so no configuration flag can disagree with the
+  tensors an artifact actually carries.
 - `scripts/verify_qsa_gguf.py` is the offline preflight for a downloaded QSA GGUF.
 
 ### Tests
@@ -404,7 +418,7 @@ store instead (above), and the hybrid cache refuses to be built for it.
 
 ## Files
 
-### Added (28)
+### Added (32)
 
 Root (1)
 
@@ -413,6 +427,10 @@ Root (1)
 .github/workflows (1)
 
 - `.github/workflows/windows-release-cuda13.yml`
+
+docs/maintainer (1)
+
+- `docs/maintainer/qsa-vlsa-graft-plan.md`
 
 include/ninfer/ops (1)
 
@@ -446,8 +464,9 @@ src/runtime/engine/context_cache (1)
 
 - `src/runtime/engine/context_cache/qsa_resource_manager.h`
 
-tests/convert (1)
+tests/convert (2)
 
+- `tests/convert/test_long_16k_asset.py`
 - `tests/convert/test_qwen3_8_27b_qsa_gguf.py`
 
 tests/models/qwen3_5 (4)
@@ -463,16 +482,18 @@ tools/bench (3)
 - `tools/bench/run_qsa27b_32k_ab.py`
 - `tools/bench/run_qsa27b_kvstream_bench.py`
 
-tools/convert/assets (2)
+tools/convert/assets (3)
 
 - `tools/convert/assets/gdn_controls_bf16.manifest.json`
+- `tools/convert/assets/indexer_tensors-long-16k-1M-heavy.manifest.json`
 - `tools/convert/assets/indexer_tensors.manifest.json`
 
-tools/convert (5)
+tools/convert (6)
 
 - `tools/convert/convert_qsa27b.py`
 - `tools/convert/extract_gdn_controls.py`
 - `tools/convert/extract_indexer_tensors.py`
+- `tools/convert/extract_long_16k_indexer.py`
 - `tools/convert/qsa_gguf.py`
 - `tools/convert/qsa_graft_recipe.py`
 

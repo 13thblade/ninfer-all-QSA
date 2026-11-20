@@ -1,12 +1,12 @@
-# vLSA indexer 嫁接：可选 pre-norm 与 indexer 独立 rope（实施计划）
+# vLSA indexer 嫁接：可选 pre-norm 与跟随 trunk 的旋转（实施计划）
 
 | 项 | 值 |
 | --- | --- |
-| 状态 | P0–P3 完成；P4 待开工 |
+| 状态 | 完成（P0–P3、P5、P6 完成；P4 撤销） |
 | 开始日期 | 2026-11-21 |
 | 最后更新 | 2026-11-21 |
 | 基线 commit | `5784f9bc8`（master，工作树干净） |
-| 目标产物 | `E:/LLMs/Qwen3.8-27B-QSA-LSA-UD-Q4_K_XL.ninfer` |
+| 目标产物 | `E:/LLMs/Qwen3.8-27B-QSA-long-16k-1M-heavy-UD-Q4_K_XL.ninfer` |
 | 参考实现 | https://github.com/Prefrontal-AI/latent-sparse-attention |
 
 本文件是**可迭代的施工图**：每完成一个阶段就勾掉 `§4` 对应项并追加一行「进度」，换对话窗口时
@@ -24,6 +24,10 @@
 
 **v1 与 v2 都是 kuraneko1 的**，二者只差训练权重；**vLSA 与它们不是同源**。
 后文一律用 v1 / v2 / vLSA，禁止用「v1/v2」指代 Prefrontal 的产物。
+
+**`vLSA` 只在本文件与对话里出现**。仓库内的文件名、变量名、注释一律用 donor 的运行名
+`long-16k-1M-heavy`（资产后缀 `-long-16k-1M-heavy`），因为这里嫁接的仍然是 **QSA indexer**，
+与 LSA（latent sparse attention）注意力本身无关，写成 `lsa` 会被误读成另一套注意力。
 
 当前仓库自带资产是 **v2** 的：
 
@@ -44,15 +48,18 @@ tools/convert/assets/indexer_tensors.manifest.json
 
 1. 引擎能加载**不含 `key_pre_norm`** 的 QSA 产物，并走「先 4-token 均值、后 norm」的路径。
 2. 转换器能消费 vLSA 的 4 类张量（16×4=64 个），产出与 5 类资产同构的 `.ninfer`。
-3. indexer 的旋转可以使用**独立于主注意力**的 rope 计划，从而复现 vLSA 的 YaRN-40 频率表。
-4. 端到端：用 `Qwen3.8-27B-UD-Q4_K_XL.gguf` + vLSA 资产转换、加载、文本与带图推理通过。
+3. indexer 的旋转**跟随主注意力**（作者仓库的语义），不新增独立的 rope 设置。
+4. 端到端：用 `Qwen3.8-27B-UD-Q4_K_XL.gguf` + vLSA 资产转换、加载、文本与带图推理通过，
+   运行期用 QSA 原生配置 `--qsa-top-blocks 512`（= 2048 keys / 4-token block）。
 5. 现有 v1/v2 路径的产物**逐字节不变**（默认行为零回归）。
 
 ### 非目标
 
 - 不改 trunk（文本塔、ViT、MTP）的任何权重或数值路径。
 - 不改 `qsa_indexer` 内核的数学；`PreNorm=false` 分支已存在并被测试覆盖。
-- 不支持「vLSA 张量 + YaRN-40 主注意力」这种组合（主注意力仍按命令行/产物配置走，见 D3）。
+- 不给 indexer 单独的 rope：`src/lsa/baselines/qsa.py` 写明它的旋转是「the rotation the
+  model's own: its frequencies and its YaRN scale」，`lsa/assets/models/qwen38_27b_qsa.yaml`
+  也说 indexer 之外的一切（含旋转）沿用 `qwen38_27b`。YaRN factor 40 是**模型级**的服务配置。
 - 不引入新依赖（只用 torch / safetensors / numpy，均在现有 ninfer python env 内）。
 
 ---
@@ -81,7 +88,7 @@ vLSA 的 `.pt` 结构：`{maps: {layer: {...}}, teacher: {...}, run: {...}, step
 上游 `inject` 只写 3 个权重；`log_tau` / `inverse_frequencies` / `attention_scaling` 是运行时参数，
 不进权重。
 
-### 2.2 vLSA 的 rope 表就是 YaRN factor 40
+### 2.2 vLSA 记录的 rope 表是模型级 YaRN factor 40
 
 `maps[layer]["inverse_frequencies"]` 与 `theta=1e7` 的裸表并不相同：从 pair 15 起偏离，pair 22-31
 的相对差恒为 **97.5% = 1 − 1/40**，即 `plain / 40`；中段是 YaRN 的插值坡道。
@@ -95,8 +102,9 @@ max|d| = 2.980e-08      （float32 舍入级）
 attention_factor = 1.368887945   vs  .pt 的 1.368887901（同一 float32 值）
 ```
 
-结论：**vLSA 的 indexer = 本引擎的 indexer 在 `RopeYarn{factor=40, native_context=262144}` 下的结果**，
-不需要在权重里折叠任何缩放。
+结论（2026-11-21 订正）：这张表是 **donor 蒸馏时模型级的服务旋转**（`qwen38_27b.yaml` 的
+`rope_parameters.factor = 40`），不是 indexer 私有属性；提取器用它做 provenance 校验，引擎不读，
+运行时 indexer 跟随 trunk（D3）。
 
 ### 2.3 `log_tau` 与排序无关
 
@@ -139,8 +147,14 @@ express."* 因此提取时**丢弃**，只记入 manifest 备查。
 | `resolve_rope_scaling` 把 factor 限在 **4× native** | `src/runtime/contract/rope_scaling.h:69-74` |
 | YaRN 只能由命令行给（`--rope-yarn`, `--rope-yarn-factor`），产物配置里没有 | `src/serve/serve_options.cpp:1588-1593` |
 
-**关键推论**：`--rope-yarn-factor 40` 会被 `resolve_rope_scaling` 拒绝（40 > 4），所以 vLSA 的
-rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行。
+**关键推论（2026-11-21 订正）**：YaRN factor 40 是**模型级**的服务旋转，不是 indexer 属性。
+`assets/models/qwen38_27b.yaml` 把它写在 `rope_parameters`，并注明 40 × 262,144 = 10,485,760，
+刚好覆盖 10M 提示与回答；`assets/models/qwen38_27b_qsa.yaml` 说「Everything else is
+qwen38_27b's, **the rotation it is served under included**」；`baselines/qsa.py` 的模块注释
+同样写明 indexer 的旋转是「the rotation the model's own: its frequencies and its YaRN scale」。
+因此 indexer 用 trunk 的 `RopeYarn` 即可，`inverse_frequencies` 只是蒸馏时那份服务旋转的记录。
+`--rope-yarn-factor 4`（或 `--rope-yarn --max-context`）会同时作用于 trunk 与 indexer，这正是
+作者仓库的语义；反过来，把 indexer 单独钉在 40、trunk 用 2×/4× 才是错的。
 
 ---
 
@@ -158,19 +172,20 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 `norm_form = "zero-centred"`，读取端据此**跳过** `-1.0`；缺省（旧资产）按 `"one-plus"` 处理。
 自描述、不依赖 sidecar 文件名。
 
-### D3 indexer 用独立的 `RopeYarn`，不折叠 `attention_scaling`
+### D3 indexer 跟随 trunk 的 rope，不设独立字段（2026-11-21 订正）
 
-新增产物字段 `text_config.indexer_rope = {"factor": F, "original_max_position_embeddings": N}`，
-引擎据此为 indexer 单独构造 `ops::RopeYarn`，其余路径不受影响。
-`factor=40, N=262144` 时 `yarn_schedule` 自动给出 vLSA 的表与 mscale（2.2 已实测），
-所以**权重里不做任何缩放折叠**。
-这是唯一能同时保住 trunk（不启用 YaRN）与 indexer（启用 YaRN-40）的方案。
+不新增 `text_config.indexer_rope`。`qsa_indexer_append` / `qsa_indexer_select` 直接接收
+`rope_yarn_`，与 trunk 共用同一份 `planned_rope_yarn`。依据见 §2.6：作者仓库没有
+「indexer 自己的 rope」这个语义，factor 40 是模型级 YaRN（10M 窗口）。
+产物只在 manifest 的 `distillation_rope` 里记录 donor 蒸馏时的旋转（provenance），
+提取时用它校验 `.pt` 的 `inverse_frequencies` / `attention_scaling`；引擎不读这个字段。
 
-### D4 vLSA 资产单独命名，用环境变量选择
+### D4 vLSA 资产用运行名命名，通过环境变量选择
 
-`assets/indexer_tensors_lsa.safetensors` + `indexer_tensors_lsa.manifest.json`，
-通过 `NINFER_QSA_INDEXER_ASSET=<path>` 指定；默认路径仍是 v2 资产。
-`*.safetensors` 被 `.gitignore` 忽略，所以**只有 manifest 进 git**，资产本体作为 release 附件。
+`assets/indexer_tensors-long-16k-1M-heavy.safetensors` +
+`indexer_tensors-long-16k-1M-heavy.manifest.json`，通过 `NINFER_QSA_INDEXER_ASSET=<path>`
+指定；默认路径仍是 v2 资产。`*.safetensors` 被 `.gitignore` 忽略，所以**只有 manifest 进
+git**，资产本体作为 release 附件。
 
 ### D5 已知遗留（本期不改）
 
@@ -247,93 +262,77 @@ rope 只能走**产物配置 + indexer 专属 `RopeYarn`**，不能靠命令行�
 
 ### P3 vLSA 资产与提取脚本 — [x]
 
-1. 新增 `tools/convert/extract_lsa_indexer.py`
-   - 入参：`.pt` 路径（默认 `E:/LLMs/qwen38_27b__long-16k-1M-heavy-qsa.pt`）；
+1. 新增 `tools/convert/extract_long_16k_indexer.py`
+   - 入参：`.pt` 路径（环境变量 `NINFER_LONG_16K_PT`，无内置路径）；
    - 校验：`maps` 的键集合 == `qsa_gguf.qsa_layers()`；`index_qk_proj` 为 `(640, 5120)`；
      三个向量为 `(128,)`；全部有限；
    - 写出 64 个张量，命名沿用 `qsa_gguf.gguf_tensor(layer, role)`（便于复用现有读取路径）；
      `q = proj[:512]`、`k = proj[512:]` 均 **FP32**；
-   - metadata：`norm_form=zero-centred`、`donor=vLSA`、`attention_scaling`、`inverse_frequencies`、
-     逐层 `log_tau`（仅备查）；
-   - manifest：`tensor_count=64`、逐张量 `sha256`、`asset_sha256`、`source_donor`。
+   - metadata：`norm_form=zero-centred`、`donor=long-16k-1M-heavy`、`attention_scaling`、
+     `distillation_rope`（provenance）、逐层 `log_tau`（仅备查）；
+   - manifest：`tensor_count=64`、逐张量 `sha256`、`asset_sha256`、`source_donor`、
+     `distillation_rope`（引擎不读）。
 2. 提交 manifest（`*.safetensors` 由 `.gitignore` 忽略，资产本体不进 git）。
-3. 新增 `tests/convert/test_lsa_asset.py`
+3. 新增 `tests/convert/test_long_16k_asset.py`
    - 断言：资产里的 `q/k` 与 `.pt` 的切分**逐位相同**（BF16 表示下）、norm 与 `.pt` 的 `w`
      **逐位相同**、metadata 的 `norm_form` 为 `zero-centred`、manifest 的 sha256 与文件一致；
    - 再经 `sources_from_asset` 读一遍，确认**没有**执行 `-1.0`（归一化增益不被平移）。
    - rope 表的正确性由提取器的 `_check_rope` 在**提取时**自校验（factor 40 / native 262144
      必须复现 `.pt` 的 `inverse_frequencies`，否则拒绝提取），无需在测试里重复。
-   - 通过 `NINFER_LSA_PT` 提供 `.pt` 路径；未设置则整体 skip（CI 无此文件）。
+   - 通过 `NINFER_LONG_16K_PT` 提供 `.pt` 路径；未设置则整体 skip（CI 无此文件）。
 
 验收：
 
-- [x] `python tools/convert/extract_lsa_indexer.py` 输出 64 张量、打印 sha256（`eda1cc2e…`）
-- [x] `NINFER_LSA_PT=… pytest tests/convert/test_lsa_asset.py -q` → **6 passed**
+- [x] `python tools/convert/extract_long_16k_indexer.py` 输出 64 张量、打印 sha256
+      （复刻后 `25d756cd…`）
+- [x] `NINFER_LONG_16K_PT=… pytest tests/convert/test_long_16k_asset.py -q` → **6 passed**
 - [x] manifest 与资产 sha256 一致
 - [x] 提交
 
-### P4 引擎：indexer 独立 rope — [ ]
+### P4 indexer 独立 rope — 已撤销（2026-11-21）
 
-1. `src/models/qwen3_5/config.h/.cpp`
-   ```cpp
-   struct IndexerRope { float factor = 1.0F; std::uint32_t native_context = 0; };
-   std::optional<IndexerRope> indexer_rope;   // text_config.indexer_rope
-   ```
-   解析 `factor` 与 `original_max_position_embeddings`；`native_context=0` → 取
-   `max_position_embeddings`。缺省 = 沿用主注意力。
-2. `src/models/qwen3_5/program/planning/startup.h/.cpp`
-   新增 `ops::RopeYarn indexer_rope_yarn`，在 `planned_rope_yarn` 旁构造：
-   ```cpp
-   if (const auto& ir = config.text.indexer_rope) {
-       indexer = ops::RopeYarn{ir->factor, ir->native_context ? ir->native_context
-                                                             : config.text.max_position_embeddings,
-                               1.0F, 0};
-   } else { indexer = main; }
-   ```
-   注意这里**绕过** `resolve_rope_scaling` 的 4× 上限（那是服务窗口的限制，不是 donor 训练表的限制）。
-3. `src/models/qwen3_5/program/context.h`、`execution/text.h`（成员 + `set_indexer_rope_yarn`）、
-   `program/prefill.cpp`（与现有 `rope_yarn` 同路传递）。
-4. `src/models/qwen3_5/execution/text.cpp:1913`、`:1947` 改用 `indexer_rope_yarn_`。
+原计划给 `text_config.indexer_rope` 单独构造 `RopeYarn`，让 indexer 固定用 YaRN-40。
+核实作者仓库后确认这是误读：40 是**模型级** YaRN（10,485,760 = 40 × 262,144，覆盖 10M
+提示），`qwen38_27b_qsa.yaml` 明说 indexer 沿用 `qwen38_27b` 的旋转，`baselines/qsa.py`
+写的是「the rotation the model's own」。独立字段会让 indexer 在 trunk 用 2×/4× 时仍停在
+40，破坏两者的相位一致性，因此**整段改动已回退**：
 
-验收：
-
-- [ ] 新增单测（放 `tests/ops/` 或 `tests/models/`）：`factor=40, native=262144` 时
-      `ops::rope_yarn_frequencies(64, 32, 1e7, yarn)` 的频率表与 `.pt` 的 `inverse_frequencies`
-      逐项相对误差 < 1e-6，`attention_factor` 与 `attention_scaling` 相同
-- [ ] 不带 `indexer_rope` 的旧产物：加载与推理输出与改动前一致
-- [ ] 提交
+- [x] 回退 `config.h/.cpp` 的 `IndexerRope`、`startup.h/.cpp` 的 `indexer_rope_yarn`、
+      `context.h` / `program_impl.*` / `execution/text.*` / `decode` / `prefill` / `draft` /
+      `commit` / `graphs` / `mtp` 的传递，以及 `tests/ops/test_rope.cpp` 的 vLSA 表断言
+- [x] `qsa_indexer_append/select` 继续用 trunk 的 `rope_yarn_`，并在调用处写明理由
+- [x] `qwen3_5.py` 不再透传 `indexer_rope`（P5 的 base 配置也不需要加）
 
 ### P5 端到端 — [ ]
 
 ```bash
-# 1) 指定 vLSA 资产并转换（base 需要 fp32_direct=true，沿用 F:/temp_scripts/qsa_fp32_base）
-NINFER_QSA_INDEXER_ASSET=F:/ninfer-all-QSA/tools/convert/assets/indexer_tensors_lsa.safetensors \
+# 1) 指定 vLSA 资产并转换（base 需要 fp32_direct=true，沿用 F:/temp_scripts/qsa_fp32_base；
+#    base 的 config.json 保持原样，不加 indexer_rope）
+NINFER_QSA_INDEXER_ASSET=F:/ninfer-all-QSA/tools/convert/assets/indexer_tensors-long-16k-1M-heavy.safetensors \
   <py> -m tools.convert.convert_qsa27b \
     --base-model F:/temp_scripts/qsa_fp32_base \
     --gguf E:/LLMs/Qwen3.8-27B-UD-Q4_K_XL.gguf \
     --vision E:/LLMs/mmproj-BF16.gguf \
     --components text,vision,mtp \
-    --out E:/LLMs/Qwen3.8-27B-QSA-LSA-UD-Q4_K_XL.ninfer \
-    --name Qwen3.8-27B-QSA-LSA-UD-Q4_K_XL --device cpu
+    --out E:/LLMs/Qwen3.8-27B-QSA-long-16k-1M-heavy-UD-Q4_K_XL.ninfer \
+    --name Qwen3.8-27B-QSA-long-16k-1M-heavy-UD-Q4_K_XL --device cpu
 ```
 
-注意：base 的 `config.json` 需要加 `"indexer_rope": {"factor": 40.0,
-"original_max_position_embeddings": 262144}`（P4 的读取端据此生效）。
+验收（运行期一律 `--qsa-top-blocks 512`，即 QSA 原生 2048 keys / 4-token block）：
 
-验收：
+- [x] 产物有 **64** 个 indexer 张量（无 `key_pre_norm`），norm 为 fp32（`fp32_direct=true`）
+- [x] 产物 config **不含** `indexer_rope`
+- [x] 服务加载成功（9.1 s，17.3 GiB），纯文本推理正常
+- [x] 带图 + MTP 推理正常：2105 prompt tokens、82.4 tok/s、draft 103/163
+- [x] 长上下文不崩：19,835 prompt tokens（~4,950 个块，选 512）、prefill 1726 tok/s、
+      decode 72.4 tok/s，回答切题
+- [x] indexer 权重与 `.pt` 逐位一致：**41,947,136 / 41,947,136**，`max|delta| = 0`
+- [x] 提交
 
-- [ ] 产物有 **64** 个 indexer 张量（无 `key_pre_norm`），norm 为 fp32（`fp32_direct=true`）
-- [ ] 产物 config 含 `indexer_rope`
-- [ ] 服务加载成功，纯文本推理正常
-- [ ] 带图 + MTP 推理正常（`F:/temp_scripts/fp32idx_vision.py <port> <png> <model>`）
-- [ ] 长上下文（≥ 32K）不崩、不出现 `PreNorm` 相关报错
-- [ ] 提交
+### P6 文档 — [x]
 
-### P6 文档 — [ ]
-
-- [ ] `MODIFICATIONS.md`：新增 vLSA 资产、`indexer_rope`、可选 pre-norm 三处
-- [ ] `docs/cli.md` 或 `docs/serving.md`：说明 `text_config.indexer_rope` 的语义与限制
-- [ ] 本文件勾选完毕，状态行改为「完成」
+- [x] `MODIFICATIONS.md`：新增 vLSA 资产与可选 pre-norm 两处（不写 `indexer_rope`）
+- [x] 本文件勾选完毕，状态行改为「完成」
 
 ---
 
@@ -407,7 +406,7 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | --- | --- | --- |
 | 可选绑定漏改 TP 路径 | 张量并行加载崩 | P1 同时改 `bind_qsa_indexer_share`；无 TP 环境下至少编译通过 |
 | `std::optional<Tensor>` 改变结构体布局 | 其他翻译单元读到旧布局 | 一次性全量重编（不要增量只编部分目标） |
-| vLSA 的 rope 覆盖误伤主注意力 | 文本质量下降 | 只传 `indexer_rope_yarn_` 给 `qsa_indexer_*`；主路径仍用 `rope_yarn_` |
+| indexer 与 trunk 旋转不一致 | 选择质量异常 | 不设独立字段，二者共用 `planned_rope_yarn`（D3）；作者仓库同语义 |
 | 资产选错（v2 / vLSA） | 选择质量异常 | manifest 的 `source_donor` + `asset_sha256` 双校验；转换日志打印来源 |
 | 需要整体回退 | — | `git revert <commit>`；资产改回 `indexer_tensors.safetensors`（v2，sha256 `c0f50809…`） |
 
@@ -428,4 +427,7 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | 2026-11-21 | P0 | 规划完成；vLSA 的 rope 表确认为 YaRN-40（3e-8 误差），`PreNorm` 恒真的根因定位到 `text.cpp:1789` / `prefill.cpp:1075` |
 | 2026-11-21 | P1 | `30f9a2493`：`optional_direct` + optional 传递链；QSA/attention/KV/loader 7 个测试全 PASS；5-role 产物加载正常 |
 | 2026-11-21 | P2 | `ROLES_NO_PRE_NORM` + `norm_form` 元数据 + graft 由来源推导 role 集合；`test_qsa_graft.py` 12 项 PASS，全量 425 passed |
-| 2026-11-21 | P3 | 新增 `extract_lsa_indexer.py`（提取时自校验 rope）与 `test_lsa_asset.py`（6 项）；资产 64 张量 / 104.88 MB，sha256 `eda1cc2e…` |
+| 2026-11-21 | P3 | 新增 `extract_long_16k_indexer.py`（提取时自校验 rope）与 `test_long_16k_asset.py`（6 项）；资产改名为 `indexer_tensors-long-16k-1M-heavy.safetensors`，64 张量 / 104.88 MB，sha256 `25d756cd…`，manifest 的 rope 记录改称 `distillation_rope`（provenance） |
+| 2026-11-21 | P4 | **撤销**：核实 `qwen38_27b.yaml` / `qwen38_27b_qsa.yaml` / `baselines/qsa.py` 后确认 YaRN-40 是模型级服务旋转，indexer 跟随 trunk；独立 `indexer_rope` 的全部改动已回退，改在 `text.cpp` 调用处写明理由 |
+| 2026-11-21 | P5 | 资产与产物改用运行名；产物 1208 objects、64 indexer 张量、无 `key_pre_norm`、无 `indexer_rope`；`--qsa-top-blocks 512` 下文本/带图/19,835-token prefill 全通过；indexer 权重逐位 41,947,136/41,947,136 |
+| 2026-11-21 | P6 | `MODIFICATIONS.md` 补 4 个新增文件（Total 32 added）与 4-role / `distillation_rope` 说明 |

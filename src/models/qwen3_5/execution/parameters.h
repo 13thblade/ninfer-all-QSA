@@ -69,8 +69,8 @@ struct QsaIndexerParameters {
     Tensor query_norm;
     Tensor key_norm;
     // The zero-centred RMSNorm the raw indexer keys take before the 4-token pool. Absent on
-    // a donor whose indexer has none (Prefrontal-AI's LSA), which selects the Op's
-    // pool-then-norm path instead of norm-then-pool.
+    // a donor whose indexer has none (Prefrontal-AI's long-16k-1M-heavy run), which selects
+    // the Op's pool-then-norm path instead of norm-then-pool.
     std::optional<Tensor> key_pre_norm;
     // The indexer's geometry, as the artifact's QsaConfig: its query and key rows, its
     // block width, and its selection budget in blocks.

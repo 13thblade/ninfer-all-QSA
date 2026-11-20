@@ -1,4 +1,4 @@
-"""The vLSA extraction keeps the checkpoint's values and records how to read them.
+"""The long-16k-1M-heavy extraction keeps the checkpoint's values and records how to read them.
 
 Prefrontal-AI's distillation stores four indexer tensors per layer, with the query heads'
 rows first in one ``index_qk_proj`` and the norms already zero-centred.  A mistake in the
@@ -6,9 +6,10 @@ split or in the ``norm_form`` marker is silent — the artifact still loads, it 
 different blocks — so this pins both against the checkpoint itself.
 
 The checkpoint is a local 340 MB file with no public download in CI, so the test runs only
-with ``NINFER_LSA_PT`` set::
+with ``NINFER_LONG_16K_PT`` set::
 
-    NINFER_LSA_PT=E:/LLMs/qwen38_27b__long-16k-1M-heavy-qsa.pt pytest tests/convert/test_lsa_asset.py
+    NINFER_LONG_16K_PT=E:/LLMs/qwen38_27b__long-16k-1M-heavy-qsa.pt \
+        pytest tests/convert/test_long_16k_asset.py
 """
 
 from __future__ import annotations
@@ -23,19 +24,19 @@ import torch
 from safetensors import safe_open
 
 from tools.convert import qsa_gguf
-from tools.convert import extract_lsa_indexer as extractor
+from tools.convert import extract_long_16k_indexer as extractor
 
-CHECKPOINT = os.environ.get("NINFER_LSA_PT")
+CHECKPOINT = os.environ.get("NINFER_LONG_16K_PT")
 
 pytestmark = pytest.mark.skipif(
     not CHECKPOINT or not Path(CHECKPOINT).is_file(),
-    reason="set NINFER_LSA_PT to the vLSA checkpoint to run this",
+    reason="set NINFER_LONG_16K_PT to the long-16k-1M-heavy checkpoint to run this",
 )
 
 
 @pytest.fixture(scope="module")
 def built(tmp_path_factory):
-    assets = tmp_path_factory.mktemp("lsa-assets")
+    assets = tmp_path_factory.mktemp("long-16k-assets")
     assert extractor.extract(str(CHECKPOINT), assets) == 0
     asset = assets / extractor.ASSET_NAME
     manifest = json.loads((assets / extractor.MANIFEST_NAME).read_text(encoding="utf-8"))
@@ -112,5 +113,7 @@ def test_manifest_hash_matches_the_payload(built):
     asset, manifest = built
     assert manifest["asset_sha256"] == hashlib.sha256(asset.read_bytes()).hexdigest()
     assert manifest["asset_bytes"] == asset.stat().st_size
-    assert manifest["indexer_rope"]["factor"] == 40.0
-    assert manifest["indexer_rope"]["original_max_position_embeddings"] == 262_144
+    # Provenance only: the rotation the donor's model was served under at distillation time.
+    # The engine gives the indexer the trunk's plan, so nothing reads this back as a setting.
+    assert manifest["distillation_rope"]["factor"] == 40.0
+    assert manifest["distillation_rope"]["original_max_position_embeddings"] == 262_144

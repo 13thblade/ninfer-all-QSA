@@ -1,14 +1,14 @@
 {
-  "asset_bytes": 104880280,
-  "asset_sha256": "eda1cc2e55a138aa376e3f6ed8d9c06dc68057b08e66ce038356ec7b5d92e3b3",
+  "asset_bytes": 104880296,
+  "asset_sha256": "25d756cd03731c66a5f8fdf5e99eebb3efc13c70bf767a563678d44eb664a18a",
   "attention_scaling": 1.3688879013061523,
-  "donor_family": "vLSA (Prefrontal-AI/latent-sparse-attention)",
-  "git_note": "*.safetensors is gitignored; ship as a GitHub Release attachment verified against asset_sha256, or rebuild from the checkpoint",
-  "indexer_rope": {
+  "distillation_rope": {
     "factor": 40.0,
     "original_max_position_embeddings": 262144,
     "rope_type": "yarn"
   },
+  "donor_family": "Prefrontal-AI/latent-sparse-attention",
+  "git_note": "*.safetensors is gitignored; ship as a GitHub Release attachment verified against asset_sha256, or rebuild from the checkpoint",
   "inverse_frequencies": [
     1.0,
     0.6042963862419128,
