@@ -168,18 +168,26 @@ def sources(gguf: GGUFFile, dtype: str = DIRECT_FORMAT) -> dict[str, LogicalSour
     return out
 
 
-# --- optional offline asset of the 80 F32 indexer tensors ------------------------------
-# Route-B graft can read the indexer tensors from a compact asset safetensors built by
-# extract_indexer_tensors.py instead of the full ~16 GB donor GGUF. The env var overrides:
-#   unset            -> use the committed default asset if present, else require a donor
-#   <path>           -> use that asset file
-#   off|none|0       -> disable the asset, require a donor GGUF exactly as before
-# The asset stores donor F32 values verbatim (norms still carry 1 + w), and sources_from_asset
-# below applies the SAME -1.0 un-fold and BF16 cast as sources(), so an asset graft is
-# bit-identical to a donor-GGUF graft.
+# --- optional offline asset of the indexer tensors --------------------------------------
+# Route-B graft can read the indexer tensors from a compact asset safetensors instead of a
+# donor GGUF.  Two assets exist and they are NOT interchangeable:
+#   indexer_tensors-long-16k-1M-heavy.safetensors  Prefrontal-AI's pooled-key indexer
+#                                                  (four roles, zero-centred norms) -- default
+#   indexer_tensors.safetensors                    kuraneko1's v2 five-role indexer, kept to
+#                                                  reproduce older artifacts; never implicit
+# The env var selects:
+#   unset                -> the long-16k asset; when it is missing the caller is told the raw
+#                           .pt donor is needed, and the legacy asset is NOT substituted
+#   <path>               -> that asset file
+#   legacy|legacy-v2     -> the legacy asset, only because the caller named it
+#   off|none|0           -> disable the asset, require a donor GGUF exactly as before
+# The legacy asset stores the GGUF's 1 + w norms; the long-16k one stores zero-centred w and
+# says so in its metadata.  sources_from_asset applies the matching un-fold either way.
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-INDEXER_ASSET_NAME = "indexer_tensors.safetensors"
+INDEXER_ASSET_NAME = "indexer_tensors-long-16k-1M-heavy.safetensors"
+LEGACY_INDEXER_ASSET_NAME = "indexer_tensors.safetensors"
 INDEXER_ASSET_ENV = "NINFER_QSA_INDEXER_ASSET"
+_LEGACY_ASSET_TOKENS = ("legacy", "legacy-v2")
 _indexer_warned: list = [False]
 
 
@@ -187,6 +195,13 @@ def indexer_asset_path() -> Path | None:
     raw = os.environ.get(INDEXER_ASSET_ENV)
     if raw is not None and raw.strip().lower() in ("off", "none", "0"):
         return None
+    if (raw or "").strip().lower() in _LEGACY_ASSET_TOKENS:
+        legacy = _ASSETS_DIR / LEGACY_INDEXER_ASSET_NAME
+        if not legacy.is_file():
+            raise ValueError(
+                f"{INDEXER_ASSET_ENV}={raw}: the legacy indexer asset is missing ({legacy}); "
+                "build it with tools/convert/extract_indexer_tensors.py <DONOR.gguf>")
+        return legacy
     if raw:
         path = Path(raw)
         if not path.is_file():
@@ -197,12 +212,14 @@ def indexer_asset_path() -> Path | None:
         return default
     if not _indexer_warned[0]:
         # *.safetensors is gitignored, so a fresh checkout has the manifest but no payload.
-        # The graft then needs a donor GGUF, which is correct but must be visible up front.
+        # This asset is distilled from the .pt donor and cannot be rebuilt from a GGUF; say
+        # so instead of quietly downgrading to the legacy five-role asset.
         print(
-            f"warning: {INDEXER_ASSET_ENV} is unset and the QSA indexer asset is missing "
-            f"({default}); the graft will read the 80 indexer tensors from a donor GGUF "
-            "(pass --donor / --source indexer=<GGUF>, or build the asset with "
-            "tools/convert/extract_indexer_tensors.py <DONOR.gguf>).",
+            f"warning: the QSA indexer asset is missing ({default});\n"
+            "         this route needs the raw .pt donor - build the asset with\n"
+            "         tools/convert/extract_long_16k_indexer.py <DONOR.pt>,\n"
+            f"         or set {INDEXER_ASSET_ENV}=legacy to use the old kuraneko1 v2 asset "
+            "on purpose.",
             file=sys.stderr,
         )
         _indexer_warned[0] = True
@@ -250,7 +267,11 @@ def sources_from_asset(path: Path | None = None,
     """Read the indexer tensors from the asset, converting exactly as sources() does."""
     path = path or indexer_asset_path()
     if path is None:
-        raise ValueError("no indexer asset; set NINFER_QSA_INDEXER_ASSET or pass a donor GGUF")
+        raise ValueError(
+            "no indexer asset: the default long-16k asset is missing (build it from the "
+            "raw .pt donor with tools/convert/extract_long_16k_indexer.py), set "
+            f"{INDEXER_ASSET_ENV}=legacy to use the old v2 asset on purpose, or pass a donor "
+            "GGUF")
 
     from safetensors import safe_open
 
@@ -355,4 +376,5 @@ __all__ = [
     "has_indexer_asset",
     "INDEXER_ASSET_ENV",
     "INDEXER_ASSET_NAME",
+    "LEGACY_INDEXER_ASSET_NAME",
 ]

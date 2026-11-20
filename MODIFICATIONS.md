@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `87c35b6d4` (merged through 20 November 2026) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 32 files added, 87 modified; no upstream file deleted |
+| Scope | 33 files added, 87 modified; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -279,7 +279,11 @@ offered under the same Apache-2.0 license.
   model-level YaRN-40 rotation recorded as provenance (`distillation_rope`) rather
   than as a setting — the engine rotates the indexer with the trunk's own plan.
   That donor has no per-token key norm, so a graft from it registers four roles
-  and the Op takes its pool-then-norm path.
+  and the Op takes its pool-then-norm path. It is the converter's default indexer
+  asset: the legacy kuraneko1 v2 asset is read only when named
+  (`--indexer-asset legacy` or `NINFER_QSA_INDEXER_ASSET=legacy`), and a missing
+  default stops the conversion with a request for the raw `.pt` donor rather than
+  downgrading to different weights.
 - The indexer's `key_pre_norm` is optional end to end (`Bindings::optional_direct`,
   `std::optional<WeightId>`, `std::optional<Tensor>`); its absence is what selects
   the Op's pool-then-norm path, so no configuration flag can disagree with the
@@ -464,8 +468,9 @@ src/runtime/engine/context_cache (1)
 
 - `src/runtime/engine/context_cache/qsa_resource_manager.h`
 
-tests/convert (2)
+tests/convert (3)
 
+- `tests/convert/test_indexer_asset.py`
 - `tests/convert/test_long_16k_asset.py`
 - `tests/convert/test_qwen3_8_27b_qsa_gguf.py`
 

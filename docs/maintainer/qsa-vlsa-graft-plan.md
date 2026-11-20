@@ -29,16 +29,19 @@
 `long-16k-1M-heavy`（资产后缀 `-long-16k-1M-heavy`），因为这里嫁接的仍然是 **QSA indexer**，
 与 LSA（latent sparse attention）注意力本身无关，写成 `lsa` 会被误读成另一套注意力。
 
-当前仓库自带资产是 **v2** 的：
+当前**默认**资产是 vLSA（long-16k）的：
 
 ```
-tools/convert/assets/indexer_tensors.manifest.json
-  source_donor = Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M-v2.gguf
-  tensor_count = 80
-  asset_sha256 = c0f50809d5f6bdb93c07031f5ad45cc4aa479d2a0a2a448345870ee1be5cc98b
+tools/convert/assets/indexer_tensors-long-16k-1M-heavy.manifest.json
+  source_donor = qwen38_27b__long-16k-1M-heavy-qsa.pt
+  tensor_count = 64
+  asset_sha256 = 25d756cd03731c66a5f8fdf5e99eebb3efc13c70bf767a563678d44eb664a18a
 ```
 
-磁盘上的 `indexer_tensors.safetensors`（104,889,856 B）与上述 sha256 一致（2026-11-21 核对）。
+`indexer_tensors.manifest.json`（v2，80 张量）保留作复现旧产物，只有显式
+`--indexer-asset legacy` 或 `NINFER_QSA_INDEXER_ASSET=legacy` 才会用到。默认资产缺失时
+转换器直接报错并要求原始 `.pt` donor（`extract_long_16k_indexer.py`），**不会**静默回退到
+旧张量或 donor GGUF。
 
 ---
 
@@ -180,12 +183,20 @@ qwen38_27b's, **the rotation it is served under included**」；`baselines/qsa.p
 产物只在 manifest 的 `distillation_rope` 里记录 donor 蒸馏时的旋转（provenance），
 提取时用它校验 `.pt` 的 `inverse_frequencies` / `attention_scaling`；引擎不读这个字段。
 
-### D4 vLSA 资产用运行名命名，通过环境变量选择
+### D4 vLSA 资产用运行名命名，并且是默认；旧 v2 只可显式指定
 
 `assets/indexer_tensors-long-16k-1M-heavy.safetensors` +
-`indexer_tensors-long-16k-1M-heavy.manifest.json`，通过 `NINFER_QSA_INDEXER_ASSET=<path>`
-指定；默认路径仍是 v2 资产。`*.safetensors` 被 `.gitignore` 忽略，所以**只有 manifest 进
-git**，资产本体作为 release 附件。
+`indexer_tensors-long-16k-1M-heavy.manifest.json` 是**默认**输入。选择顺序：
+
+1. `--indexer-asset <path>` / `NINFER_QSA_INDEXER_ASSET=<path>` —— 指定文件；
+2. `--indexer-asset legacy` / `NINFER_QSA_INDEXER_ASSET=legacy` —— 旧 v2 五角色资产，
+   **必须显式点名**，缺文件时报错；
+3. 都没有 —— 用默认的 long-16k 资产；它不存在时**报错要求原始 `.pt` donor**
+   （`extract_long_16k_indexer.py`），不静默换用 v2，也不静默改读 donor GGUF；
+4. `NINFER_QSA_INDEXER_ASSET=off|none|0` —— 完全关闭资产，回到 donor GGUF 路径。
+
+`*.safetensors` 被 `.gitignore` 忽略，所以**只有 manifest 进 git**，资产本体作为 release
+附件。
 
 ### D5 已知遗留（本期不改）
 
@@ -431,3 +442,4 @@ cmd.exe //c "F:\temp_scripts\build_ninfer.bat ninfer_tests"
 | 2026-11-21 | P4 | **撤销**：核实 `qwen38_27b.yaml` / `qwen38_27b_qsa.yaml` / `baselines/qsa.py` 后确认 YaRN-40 是模型级服务旋转，indexer 跟随 trunk；独立 `indexer_rope` 的全部改动已回退，改在 `text.cpp` 调用处写明理由 |
 | 2026-11-21 | P5 | 资产与产物改用运行名；产物 1208 objects、64 indexer 张量、无 `key_pre_norm`、无 `indexer_rope`；`--qsa-top-blocks 512` 下文本/带图/19,835-token prefill 全通过；indexer 权重逐位 41,947,136/41,947,136 |
 | 2026-11-21 | P6 | `MODIFICATIONS.md` 补 4 个新增文件（Total 32 added）与 4-role / `distillation_rope` 说明 |
+| 2026-11-21 | 默认资产 | 转换器默认改为 long-16k 资产；默认缺失时报错要求原始 `.pt` donor，旧 v2 只在 `--indexer-asset legacy` / `NINFER_QSA_INDEXER_ASSET=legacy` 时启用；新增 `test_indexer_asset.py`（6 项）与 `--indexer-asset` 解析测试 |

@@ -7,6 +7,7 @@ run without the 16-30 GB model file.  The real-file preflight is
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from math import prod
 
@@ -195,3 +196,20 @@ def test_proposal_head_is_packed_by_default():
     assert parser.parse_args(required + ["--no-proposal"]).proposal is False
     # --proposal stays accepted as an explicit opt-in (scripts written before cbe7d8b57).
     assert parser.parse_args(required + ["--proposal"]).proposal is True
+
+
+def test_indexer_asset_is_chosen_explicitly(monkeypatch):
+    """Default leaves the env alone; 'default' clears it; 'legacy' must be named."""
+    parser = convert_qsa27b.build_parser()
+    required = ["--base-model", "base", "--gguf", "model.gguf", "--out", "out.ninfer"]
+    assert parser.parse_args(required).indexer_asset is None
+    assert parser.parse_args(required + ["--indexer-asset", "legacy"]).indexer_asset == "legacy"
+
+    env = qsa_gguf.INDEXER_ASSET_ENV
+    monkeypatch.setenv(env, "legacy")
+    convert_qsa27b.apply_indexer_asset("default")
+    assert env not in os.environ
+    convert_qsa27b.apply_indexer_asset("legacy")
+    assert os.environ[env] == "legacy"
+    convert_qsa27b.apply_indexer_asset("/assets/chosen.safetensors")
+    assert os.environ[env] == "/assets/chosen.safetensors"

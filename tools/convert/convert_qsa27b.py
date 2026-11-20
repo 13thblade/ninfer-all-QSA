@@ -5,12 +5,15 @@ Handles both inputs, deciding from the file itself:
 1. **already grafted** -- the GGUF carries its 80 F32 ``blk.N.indexer.*`` tensors.
    The graft step is skipped and the converted file goes through the fork's
    official ``qwen3_8_27b_qsa_gguf`` recipe, exactly as before.
-2. **stock GGUF** -- the GGUF has the 866 dense tensors only.  The 80 indexer
-   tensors are transplanted from a QSA donor *during* conversion
-   (``tools/convert/qsa_graft_recipe.py``), so no intermediate grafted GGUF is
-   written.  This is the published method: the QSA Unsloth releases copy the 866
-   stock tensors byte-for-byte and append the same 80 FP32 indexer tensors
-   without retraining or requantization.
+2. **stock GGUF** -- the GGUF has the 866 dense tensors only.  The indexer
+   tensors are transplanted from a QSA donor or from one of the committed
+   indexer assets *during* conversion (``tools/convert/qsa_graft_recipe.py``), so
+   no intermediate grafted GGUF is written.  The default asset is the long-16k
+   pooled-key indexer (four roles); the kuraneko1 v2 five-role asset is read only
+   with ``--indexer-asset legacy``, and a missing default asks for the raw .pt
+   donor instead of substituting other weights.  This is the published method: the
+   QSA Unsloth releases copy the 866 stock tensors byte-for-byte and append their
+   FP32 indexer tensors without retraining or requantization.
 
 Example (route B -- stock GGUF + donor, direct to .ninfer)::
 
@@ -110,12 +113,14 @@ def preflight(gguf_path: Path, donor_path: Path | None, *, check: bool) -> tuple
 
         if donor_path is None and not has_indexer_asset():
             raise SystemExit(
-                "error: this GGUF has no QSA indexer tensors and neither a donor nor the "
-                "indexer asset is available;\n"
-                "       pass --donor <Qwen3.8-27B-QSA>.gguf (or set QSA_INDEXER_GGUF, or "
-                "NINFER_QSA_INDEXER_ASSET),\n"
-                "       build the asset with tools/convert/extract_indexer_tensors.py "
-                "<DONOR.gguf>, or use an already-grafted GGUF"
+                "error: this GGUF has no QSA indexer tensors and the long-16k indexer asset "
+                "is missing;\n"
+                "       this route needs the raw .pt donor - build the asset with\n"
+                "       tools/convert/extract_long_16k_indexer.py <DONOR.pt>,\n"
+                "       or pass --indexer-asset legacy to use the old kuraneko1 v2 asset on "
+                "purpose,\n"
+                "       or pass --donor <Qwen3.8-27B-QSA>.gguf / set QSA_INDEXER_GGUF, "
+                "or use an already-grafted GGUF"
             )
         if donor_path is None:
             print(f"indexer  : asset {indexer_asset_path()}")
@@ -128,6 +133,25 @@ def preflight(gguf_path: Path, donor_path: Path | None, *, check: bool) -> tuple
     return already, mtp
 
 
+def apply_indexer_asset(choice: str | None) -> None:
+    """``--indexer-asset``: choose where the graft reads the indexer tensors.
+
+    ``default`` clears an inherited environment variable so the long-16k asset is used;
+    ``legacy`` names the kuraneko1 v2 asset on purpose; anything else is a path.  Unset
+    leaves the environment alone, so ``NINFER_QSA_INDEXER_ASSET`` keeps working for
+    scripted runs.
+    """
+    if choice is None:
+        return
+    sys.path.insert(0, str(ROOT))
+    from tools.convert.qsa_gguf import INDEXER_ASSET_ENV
+
+    if choice.strip().lower() in ("default", "auto"):
+        os.environ.pop(INDEXER_ASSET_ENV, None)
+    else:
+        os.environ[INDEXER_ASSET_ENV] = choice
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The converter's command line.
 
@@ -136,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     p = argparse.ArgumentParser(
         description="Pack a Qwen3.8-27B GGUF into a .ninfer artifact, grafting the "
-                    "QSA indexer from a donor when the GGUF does not carry one")
+                    "QSA indexer from an asset or a donor when the GGUF does not carry one")
     p.add_argument("--base-model", type=Path, required=True,
                    help="the stock Qwen3.8-27B model directory (config/tokenizer source)")
     p.add_argument("--gguf", type=Path, required=True,
@@ -144,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--donor", type=Path, default=None,
                    help="Qwen3.8-27B-QSA GGUF that carries the 80 F32 indexer tensors "
                         f"(default: ${DONOR_ENV}; there is no built-in path)")
+    p.add_argument("--indexer-asset", default=None,
+                   metavar="{default,legacy,PATH}",
+                   help="where the graft reads the indexer tensors: the long-16k asset "
+                        "(default when NINFER_QSA_INDEXER_ASSET is unset), the legacy "
+                        "kuraneko1 v2 asset ('legacy', never implicit), or an explicit "
+                        ".safetensors path")
     p.add_argument("--vision", type=Path, default=None, help="mmproj-BF16.gguf")
     p.add_argument("--dflash2", type=Path, default=None,
                    help="the infer-dflash2 official weight directory")
@@ -170,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     p = build_parser()
     args = p.parse_args()
+    apply_indexer_asset(args.indexer_asset)
 
     if not args.gguf.is_file():
         p.error(f"GGUF not found: {args.gguf}")
@@ -197,14 +228,16 @@ def main() -> int:
             if not has_indexer_asset():
                 raise SystemExit(
                     "error: this GGUF has no QSA indexer tensors and no donor was found;\n"
-                    f"       pass --donor <Qwen3.8-27B-QSA>.gguf or set {DONOR_ENV},\n"
-                    "       or build the indexer asset with "
-                    "tools/convert/extract_indexer_tensors.py <DONOR.gguf>"
+                    "       the long-16k asset is missing and needs the raw .pt donor:\n"
+                    "       tools/convert/extract_long_16k_indexer.py <DONOR.pt>,\n"
+                    "       or pass --indexer-asset legacy to use the old kuraneko1 v2 "
+                    "asset on purpose,\n"
+                    f"       or pass --donor <Qwen3.8-27B-QSA>.gguf / set {DONOR_ENV}"
                 )
-            print("plan     : graft 80 indexer tensors from the indexer asset during "
+            print("plan     : graft the indexer tensors from the indexer asset during "
                   "conversion (no donor, no intermediate GGUF)", flush=True)
         else:
-            print(f"plan     : graft 80 indexer tensors from {donor.name} during conversion "
+            print(f"plan     : graft the indexer tensors from {donor.name} during conversion "
                   f"(no intermediate GGUF)", flush=True)
         recipe = f"{GRAFT_RECIPE}:graft_qsa_indexer"
     if "mtp" in components and not mtp:

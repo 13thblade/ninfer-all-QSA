@@ -159,7 +159,9 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
     # projections stay BF16.
     indexer_dtype = qsa_gguf.indexer_direct_format(config)
 
-    # Indexer source: prefer the committed asset; fall back to a donor GGUF (legacy path).
+    # Indexer source: the long-16k asset is the default.  The legacy kuraneko1 v2 asset is
+    # reached only by naming it (NINFER_QSA_INDEXER_ASSET=legacy, or --indexer-asset legacy),
+    # and a donor GGUF only when no asset is selected -- a missing default never downgrades.
     if qsa_gguf.has_indexer_asset():
         indexer_sources = qsa_gguf.sources_from_asset(dtype=indexer_dtype)
     else:
@@ -183,7 +185,7 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
     # Text tower, MTP block, vision and DFlash2 come from the target.
     qwen3_8_27b_gguf(model, recipe, sources)
 
-    # ... and the 80 indexer parameters are filled from the asset or the donor. Both
+    # ... and the indexer parameters are filled from the asset or the donor. Both
     # un-fold the stored 1 + w norms, so the bytes match the official path.
     formats: dict[str, str] = {}
     for name, source in indexer_sources.items():
