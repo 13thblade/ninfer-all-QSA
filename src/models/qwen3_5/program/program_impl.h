@@ -1025,6 +1025,12 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    // QSA streamed tier: the pages of 64-token text KV a lane's Device address space covers.
+    // Derived from the stream geometry (plan.stream_slots, the --kv-resident window floored by
+    // the indexer's block budget), zero when streaming is off. The Device text pages are
+    // bookkeeping -- the pinned host planes hold the authority and the dense prefill reads the
+    // shared staging layer -- so a lane reserves this window, not its whole history.
+    const std::uint32_t text_stream_window_pages;
     // Frozen context-cache shape: an engaged host budget has already resolved host_state_slots,
     // host_kv_capacity_bytes and the long-anchor count on the plan this Program was built from.
     const ContextCacheOptions context_cache;

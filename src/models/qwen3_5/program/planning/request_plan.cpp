@@ -497,6 +497,14 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                 std::min(capacity, base->summary.prompt_tokens + backend_window_tokens - 1U));
         }
     }
+    // QSA streamed tier: the Device text address space is bookkeeping -- the pinned host planes
+    // hold the authority, the dense prefill reads the shared staging layer and a decode reads the
+    // lane's resident pool -- so it covers only the stream window, never a prompt's whole history.
+    // A history-sized entitlement would take the one shared staging pool once per lane.
+    if (text_stream_window_pages != 0) {
+        base->text_kv_page_entitlement =
+            std::min(base->text_kv_page_entitlement, text_stream_window_pages);
+    }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,

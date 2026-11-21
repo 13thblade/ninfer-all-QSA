@@ -872,9 +872,10 @@ private:
 class KVAddressSpaceStore {
 public:
     KVAddressSpaceStore(LogicalKVPageStore& pages, KVExecutionTablePool& tables,
-                        std::uint32_t address_capacity, std::uint32_t page_capacity)
+                        std::uint32_t address_capacity, std::uint32_t page_capacity,
+                        bool host_resident = false)
         : pages_(&pages), tables_(&tables), page_capacity_(page_capacity),
-          addresses_(address_capacity), free_(address_capacity),
+          host_resident_(host_resident), addresses_(address_capacity), free_(address_capacity),
           memberships_(checked_membership_cells(address_capacity, page_capacity)),
           free_count_(address_capacity) {
         if (address_capacity == 0 || page_capacity == 0 ||
@@ -1628,9 +1629,14 @@ public:
     // needs; only an explicit truncate releases it, and commit_frontier publishes valid tokens.
     void ensure_mapped_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
                                  RankStreams stream = {}) {
-        Address& address           = require_active(handle);
-        const std::uint32_t target = pages_for_tokens(tokens);
-        if (target > entitlement(address)) {
+        Address& address     = require_active(handle);
+        std::uint32_t target = pages_for_tokens(tokens);
+        if (host_resident_) {
+            // The pinned host planes hold every column past the Device window, so a prompt longer
+            // than the entitlement maps only the pages the address covers; the rest of its
+            // history stays in Host memory and the frontier tracks it there.
+            target = std::min(target, entitlement(address));
+        } else if (target > entitlement(address)) {
             throw std::invalid_argument(
                 "KV coverage exceeds active entitlement: tokens=" + std::to_string(tokens) +
                 " required_pages=" + std::to_string(target) +
@@ -1667,8 +1673,11 @@ public:
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
+        // A host-resident tier (the QSA streamed store) keeps the authority in the lane's pinned
+        // planes, so its committed frontier may run past the Device pages the address covers: the
+        // address holds only the stream window while the host copy holds the whole history.
         if (frontier < address.committed_frontier ||
-            pages_for_tokens(frontier) > address.page_count) {
+            (!host_resident_ && pages_for_tokens(frontier) > address.page_count)) {
             throw std::invalid_argument(
                 "KV committed frontier is invalid: frontier=" + std::to_string(frontier) +
                 " committed=" + std::to_string(address.committed_frontier) +
@@ -1676,11 +1685,14 @@ public:
                 " page_count=" + std::to_string(address.page_count));
         }
         if (frontier == address.committed_frontier) { return; }
-        const std::uint32_t page_size          = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        // Coverage is published only for pages the address still covers: under a host-resident
+        // tier the prefill staging pages above the resident window were dropped, and the frontier
+        // past them lives in the pinned host copy.
+        const std::uint32_t covered_pages = std::min(pages_for_tokens(frontier), address.page_count);
         const std::uint32_t first_changed_page = address.committed_frontier / page_size;
-        const std::uint32_t final_changed_page = (frontier - 1U) / page_size;
-        for (std::uint32_t page = first_changed_page; page <= final_changed_page; ++page) {
-            const std::uint32_t begin   = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+        for (std::uint32_t page = first_changed_page; page < covered_pages; ++page) {
+            const std::uint32_t begin   = page * page_size;
             const std::uint32_t columns = std::min(page_size, frontier - begin);
             if (columns > pages_->committed_columns(membership(address, page))) {
                 pages_->commit_coverage(membership(address, page), columns);
@@ -1694,7 +1706,12 @@ public:
         if (frontier > address.committed_frontier) {
             throw std::invalid_argument("KV destructive truncate extends the frontier");
         }
-        const std::uint32_t target = pages_for_tokens(frontier);
+        // A host-resident tier covers only its stream window: a frontier past the window is held
+        // by the pinned host planes, and the Device pages stop at the entitlement.
+        const bool frontier_past_window =
+            host_resident_ && pages_for_tokens(frontier) > entitlement(address);
+        const std::uint32_t target =
+            frontier_past_window ? entitlement(address) : pages_for_tokens(frontier);
         if (frontier == address.committed_frontier && target == address.page_count) { return; }
         for (std::uint32_t page = target; page < address.page_count; ++page) {
             if (!pages_->can_dematerialize(membership(address, page))) {
@@ -1707,7 +1724,7 @@ public:
         const auto tail_changes = [&](std::uint32_t columns) {
             return columns != pages_->committed_columns(membership(address, target - 1U));
         };
-        if (target != 0) {
+        if (!frontier_past_window && target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
             if (tail_changes(columns) &&
@@ -1722,7 +1739,7 @@ public:
             pages_->release_active_reference(page);
             pages_->dematerialize(page, address.reservation);
         }
-        if (target != 0) {
+        if (!frontier_past_window && target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
             if (tail_changes(columns)) {
@@ -2080,6 +2097,9 @@ private:
     LogicalKVPageStore* pages_    = nullptr;
     KVExecutionTablePool* tables_ = nullptr;
     std::uint32_t page_capacity_  = 0;
+    // The authority is the lane's pinned host planes (the QSA streamed tier): a committed
+    // frontier may run past the Device pages the address currently covers.
+    bool host_resident_           = false;
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;

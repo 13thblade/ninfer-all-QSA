@@ -274,6 +274,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                          const Steering* steering_source)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
+      text_stream_window_pages(
+          plan.stream_slots == 0
+              ? 0U
+              : kv_pages_for_tokens(plan.stream_slots *
+                                    static_cast<std::uint32_t>(ops::kKvStreamPageTokens))),
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
@@ -404,7 +409,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
-        decoder->text_kv.execution_tables().logical_page_capacity());
+        decoder->text_kv.execution_tables().logical_page_capacity(), plan.stream_slots != 0);
     if (vision_broker && kv_arena && kv_arena->window_capacity_bytes() != 0) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
         // a context transaction or a pressure-planning session is in flight, or while any lane has

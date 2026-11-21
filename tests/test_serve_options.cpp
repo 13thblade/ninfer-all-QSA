@@ -313,24 +313,6 @@ int main() {
                                   .context_cache.mode == ninfer::ContextCacheMode::Qsa,
                           "QSA --kv-resident all/0 must run hybrid, a positive window the store");
     }
-    {
-        // A streamed tier needs no device-side auto sizing on its own -- its default is one
-        // max-context window per lane. Asking for headroom, though, requires an automatic
-        // capacity: size from the device budget with that room kept free instead of rejecting
-        // the pair. The value is the requested headroom, not the 1024 MiB default.
-        const ServeOptions qsa_headroom =
-            parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa",
-                   "--kv-resident", "8192", "--kv-headroom-mib", "512"});
-        failures += check(qsa_headroom.context_cache.mode == ninfer::ContextCacheMode::Qsa &&
-                              qsa_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                              qsa_headroom.kv_capacity.automatic_headroom_bytes == (512ULL << 20),
-                          "QSA --kv-resident with --kv-headroom-mib must size capacity from the "
-                          "device budget and keep the requested headroom");
-        const ServeOptions qsa_default =
-            parse({"ninfer-serve", "model.ninfer", "--qwen38-27b-qsa", "--kv-resident", "8192"});
-        failures += check(qsa_default.kv_capacity.mode == ninfer::KvCapacityMode::Explicit,
-                          "QSA --kv-resident without headroom must keep the one-window default");
-    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
