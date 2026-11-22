@@ -12,7 +12,7 @@
 
 现提供经过了16k~1M上下文、约352M数据集训练的QSA indexer张量（训练时冻结Qwen3.8-27B权重，因此理论上可嫁接于任意Qwen3.8-27B模型），极大改善上下文信息召回能力，大幅降低了工具调用失败的频率，该张量现为默认选项。新版QSA indexer张量提供者原仓库在：https://github.com/Prefrontal-AI/latent-sparse-attention
 
-旧版 indexer 张量仍提供，该张量仅经过16~64k上下文、约43.6M数据集训练。旧版QSA indexer张量提供者原仓库在：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+旧版 indexer 张量仍提供，但不再推荐，该张量仅经过16~64k上下文、约43.6M数据集训练，在工具调用等需要精确schema的场景下会有较高频率出错的问题。旧版QSA indexer张量提供者原仓库在：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
 用户可自行对照两版差异。
 
@@ -76,7 +76,7 @@ Optimized the KV cache prefix reuse strategy and fixed several related bugs.
 
 QSA indexer tensors trained on 16k–1M contexts over a ~352M-token dataset are now provided (the Qwen3.8-27B weights were frozen during training, so in principle they graft onto any Qwen3.8-27B model). They greatly improve context information recall and sharply cut the frequency of tool-call failures, and are now the default. The upstream repository of the new QSA indexer tensors: https://github.com/Prefrontal-AI/latent-sparse-attention
 
-The older indexer tensors remain available; they were trained only on 16k–64k contexts over a ~43.6M-token dataset. The upstream repository of the old QSA indexer tensors: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+The older indexer tensors remain available but are no longer recommended; they were trained only on 16k–64k contexts over a ~43.6M-token dataset and fail relatively often in scenarios that need a precise schema, such as tool calls. The upstream repository of the old QSA indexer tensors: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
 Users can compare the two versions themselves.
 
