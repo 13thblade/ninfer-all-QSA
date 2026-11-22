@@ -12,7 +12,9 @@
 // for a lane some other conversation took, and holds the same StateImage bytes beside them:
 //
 //   [0, state_bytes)              the StateImage host image (GDN, continuation hidden, draft state)
-//   [state_bytes, + plane_bytes)  the lane's KV planes (K, V, K-scale, V-scale per layer)
+//   [state_bytes, + plane_bytes)  the lane's KV planes at the image key's length: the host pages
+//                                 the key reached of every plane (K, V, K-scale, V-scale per
+//                                 layer), not the lane's whole --max-context-wide capacity
 
 #include "models/qwen3_5/program/prefix/qsa_continuation.h"
 #include "models/qwen3_5/program/context_work.h"
@@ -37,11 +39,6 @@ std::uint64_t ProgramImpl::qsa_state_image_bytes() const {
     if (state_images == nullptr) { return 0; }
     return QsaContinuationStore::page_rounded(state_images->host_layout().image_bytes,
                                               QsaContinuationStore::kHostPageBytes);
-}
-
-std::uint64_t ProgramImpl::qsa_plane_image_bytes(std::uint32_t lane) const {
-    if (!qsa_stream_state.has_value() || lane >= qsa_stream_state->lanes) { return 0; }
-    return qsa_lane_plane_bytes(*qsa_stream_state, lane);
 }
 
 // ---- the lane's retained states ---------------------------------------------------------------
@@ -437,9 +434,17 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                 state_store->physical_slot(*state), compute_streams, nullptr, lane);
             state_store->activate_copied(*state);
             sequence.state = ActiveStateBinding{.read = *state, .write = *state};
+            // The plane half is as long as the key the image was written at -- never the lane's
+            // live frontier, which may be another sequence's by now, and never the lane's full
+            // capacity. Rebuilding the chunk list at `key.position` is what makes the payload's
+            // length and offsets match the save side exactly.
+            if (stored.key.position != stored.key.tokens.size()) {
+                throw std::logic_error("QSA admission image key and position disagree");
+            }
             std::vector<ImageChunk> chunks;
-            qsa_collect_plane_chunks(*qsa_stream_state, lane, chunks);
-            if (stored.bytes < state_bytes + qsa_image_chunk_bytes(chunks)) {
+            qsa_collect_plane_prefix_chunks(*qsa_stream_state, lane, stored.key.position, chunks);
+            const std::uint64_t plane_bytes = qsa_image_chunk_bytes(chunks);
+            if (stored.bytes < state_bytes + plane_bytes) {
                 throw std::runtime_error("QSA admission image has no KV part");
             }
             std::vector<ImageRegion> regions;
@@ -457,7 +462,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
                     plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
                 const std::uint64_t backend_bytes =
                     std::uint64_t(stored.backend_pages) * backend_layout.page_stride;
-                if (stored.bytes < state_bytes + qsa_image_chunk_bytes(chunks) + backend_bytes) {
+                if (stored.bytes < state_bytes + plane_bytes + backend_bytes) {
                     throw std::runtime_error("QSA admission image has no MTP part");
                 }
                 if (stored.mtp_kv_valid > stored.backend_committed_frontier) {
@@ -894,11 +899,15 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
     LanePrefixRecord& record = qsa_lane_prefix[lane];
     if (record.epoch == 0 || record.epoch != lane_epochs[lane] || record.held.empty()) { return; }
     try {
+        // The image is exactly as long as its key: the plane half carries the host pages the key
+        // reached, not the lane's whole capacity (which --max-context sizes, several times over
+        // what --host-cache-mib grants the store).
+        const std::uint32_t position    = record.held.position;
         const std::uint64_t state_bytes = qsa_state_image_bytes();
-        const std::uint64_t plane_bytes = qsa_plane_image_bytes(lane);
-        if (state_bytes == 0 || plane_bytes == 0) { return; }
         std::vector<ImageChunk> chunks;
-        qsa_collect_plane_chunks(*qsa_stream_state, lane, chunks);
+        qsa_collect_plane_prefix_chunks(*qsa_stream_state, lane, position, chunks);
+        const std::uint64_t plane_bytes = qsa_image_chunk_bytes(chunks);
+        if (state_bytes == 0 || plane_bytes == 0) { return; }
 
         // MTP backend-KV: the lane's retained draft address space, captured the same way the native
         // qwen3_5 session snapshot captures it (session_snapshot.cpp:547-588) -- pages keyed off the
@@ -940,7 +949,8 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
                 const std::vector<std::byte*>& pages = qsa_store_->images()[*index].pages;
                 // The StateImage half first (now including the QSA indexer region, so a store
                 // resume restores pooled/tail/tail_axes, not just GDN + hidden), then the text-KV
-                // planes and the MTP staging at their page offset.
+                // plane prefixes (the key's pages of every plane) and the MTP staging at their
+                // page offset.
                 state_images->copy_to_host_segments(physical, pages,
                                                     QsaContinuationStore::kHostPageBytes,
                                                     compute_streams, /*include_qsa=*/true, nullptr,
@@ -960,8 +970,9 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
                         mtp_staging.data(), *backend_layout, compute_streams);
                     regions.push_back(ImageRegion{mtp_staging.data(), std::size_t(backend_bytes)});
                 }
-                // Wait for the StateImage D2H and the MTP D2H (into staging) before the host
-                // memcpy reads the staging buffer.
+                // Wait for the StateImage and MTP D2H copies before any host read: the plane
+                // prefix memcpy below reads the pinned host planes, which the round's kernels
+                // write on the compute streams.
                 device.synchronize();
                 qsa_copy_image(regions, pages, QsaContinuationStore::kHostPageBytes, true,
                                state_bytes / QsaContinuationStore::kHostPageBytes);
@@ -973,10 +984,14 @@ void ProgramImpl::qsa_write_lane_image(std::uint32_t lane, StateImageHandle stat
         if (qsa_reuse_trace_enabled()) {
             std::fprintf(stderr,
                          "[retire] lane=%u anchor=%u held=%u whole=%d store_used=%llu "
-                         "store_budget=%llu\n",
+                         "store_budget=%llu image=%llu state=%llu plane=%llu backend=%llu\n",
                          lane, record.anchor.position, record.held.position, whole ? 1 : 0,
                          static_cast<unsigned long long>(qsa_store_->used_bytes()),
-                         static_cast<unsigned long long>(qsa_store_->budget_bytes()));
+                         static_cast<unsigned long long>(qsa_store_->budget_bytes()),
+                         static_cast<unsigned long long>(payload),
+                         static_cast<unsigned long long>(state_bytes),
+                         static_cast<unsigned long long>(plane_bytes),
+                         static_cast<unsigned long long>(backend_bytes));
             std::fflush(stderr);
         }
     } catch (...) {

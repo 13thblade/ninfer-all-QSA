@@ -188,11 +188,11 @@ struct ImageRegion {
 void qsa_copy_image(std::span<const ImageRegion> regions, std::span<std::byte* const> pages,
                     std::size_t page_bytes, bool save, std::size_t page_offset = 0);
 
-// One contiguous run of a lane's authoritative KV: a plane of one streamed layer. `data` is the
-// live pinned host plane (a `[leading, 128, heads, pages]` tensor) and `bytes` its whole extent.
-// The image keeps the planes whole -- the page is the tensors' innermost axis, so a position's
-// pages are strided and cannot be sliced off with one memcpy; a whole-plane copy is one memcpy per
-// plane and round-trips exactly.
+// One contiguous run of a lane's authoritative KV: `bytes` of one streamed layer's plane from
+// `data` on. A plane is `[leading, kPagedKVPageSize, heads, pages]` with `ne[0]` innermost
+// (core/tensor.cpp:50), so its pages are its *outermost* run and a page prefix is a plain byte
+// prefix of the plane: an image's plane half is `used * page_bytes` and round-trips exactly at
+// any length. qsa_collect_plane_prefix_chunks (qsa_image.h) is what computes it.
 struct ImageChunk {
     std::byte* data = nullptr;
     std::size_t bytes = 0;
@@ -221,8 +221,8 @@ struct StoredImage {
     std::vector<std::byte*> pages; // 8 MiB slices; empty while only on disk
     std::uint64_t bytes     = 0;   // exact image bytes (<= pages.size() * page_bytes)
     std::uint64_t last_used = 0;
-    // 0: an endpoint image -- the StateImage half followed by the lane's KV planes, so it can
-    //    serve a lane that no longer owns its planes.
+    // 0: an endpoint image -- the StateImage half followed by the lane's KV planes at the key's
+    //    length, so it can serve a lane that no longer owns its planes.
     // 1: an anchor image -- the StateImage half only, taken where a turn's prompt ended. Its
     //    planes stay in the lane (an anchor resume is same-lane by construction), and carrying a
     //    second copy of them would halve how many turns the budget holds.

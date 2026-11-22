@@ -959,10 +959,9 @@ public:
     [[nodiscard]] std::optional<StartResult> take_qsa_published() noexcept {
         return std::exchange(qsa_pending_published_, std::nullopt);
     }
-    // The image a lane's record and StateImage slot occupy: the StateImage host image (conv,
-    // recurrent, continuation hidden, and any draft state) page-rounded, then the plane chunks.
+    // The StateImage host image (conv, recurrent, continuation hidden, and any draft state)
+    // page-rounded: the fixed floor of an image, whatever its key's length.
     [[nodiscard]] std::uint64_t qsa_state_image_bytes() const;
-    [[nodiscard]] std::uint64_t qsa_plane_image_bytes(std::uint32_t lane) const;
 
     [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base,
