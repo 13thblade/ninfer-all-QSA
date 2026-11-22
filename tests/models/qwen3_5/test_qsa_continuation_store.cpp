@@ -3,6 +3,9 @@
 // qwen4_exp_core.cpp (Stored / take_pages / make_host_room / find_stored / store_image / retire).
 
 #include "models/qwen3_5/program/prefix/qsa_continuation.h"
+#include "models/qwen3_5/program/prefix/qsa_image.h"
+
+#include "core/dtype.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -16,11 +19,13 @@
 using ninfer::models::qwen3_5::detail::ImageChunk;
 using ninfer::models::qwen3_5::detail::ImageRegion;
 using ninfer::models::qwen3_5::detail::QsaImageGeometry;
+using ninfer::models::qwen3_5::detail::qsa_collect_plane_prefix_chunks;
 using ninfer::models::qwen3_5::detail::qsa_copy_image;
 using ninfer::models::qwen3_5::detail::qsa_copy_plane_chunks;
 using ninfer::models::qwen3_5::detail::qsa_image_bytes;
 using ninfer::models::qwen3_5::detail::qsa_image_chunk_bytes;
 using ninfer::models::qwen3_5::detail::qsa_kv_bytes_per_head_token;
+using ninfer::models::qwen3_5::detail::qsa_lane_plane_bytes;
 
 namespace {
 
@@ -31,6 +36,8 @@ using ninfer::models::qwen3_5::detail::QsaLaneRetentionView;
 using ninfer::models::qwen3_5::detail::QsaContinuationStore;
 using ninfer::models::qwen3_5::detail::qsa_choose_reuse;
 using ninfer::models::qwen3_5::detail::qsa_prefix_reuse;
+
+using ninfer::models::qwen3_5::QsaStreamState;
 
 int failures = 0;
 
@@ -289,6 +296,139 @@ void test_image_payload_roundtrip() {
     expect(store.used_bytes() == 0, "the image's pages are released with it");
 }
 
+void test_plane_prefix_length_model() {
+    // An image carries the pages its key reached, not the lane's whole capacity. The lane's planes
+    // here are the QSA-27B int8 profile's four: 256 + 256 code bytes and two 4-entry FP16 scale
+    // planes = 528 B per head*token per layer (qsa_kv_bytes_per_head_token), in 64-token host
+    // pages.
+    constexpr std::int32_t kHeads  = 4;
+    constexpr std::int32_t kPages  = 8; // a small capacity: the length model is the point
+    constexpr std::int32_t kLayers = 2;
+    std::vector<std::vector<std::byte>> storage(4 * kLayers);
+    const auto make = [&](std::size_t slot, std::int32_t leading, ninfer::DType dtype) {
+        const std::size_t bytes =
+            std::size_t(leading) * 64 * kHeads * kPages * ninfer::dtype_size(dtype);
+        const std::size_t block = bytes / kPages;
+        storage[slot].resize(bytes);
+        // Each page block carries its own number, so a wrong page offset cannot hide.
+        for (std::size_t page = 0; page < std::size_t(kPages); ++page) {
+            std::fill_n(storage[slot].begin() + std::ptrdiff_t(page * block),
+                        std::ptrdiff_t(block), std::byte(page + slot * 16));
+        }
+        // Built after the storage is final, so the view never outlives its buffer.
+        return ninfer::Tensor(storage[slot].data(), dtype, {leading, 64, kHeads, kPages});
+    };
+    QsaStreamState stream;
+    stream.lanes  = 1;
+    stream.layers = kLayers;
+    stream.layer_states.resize(kLayers);
+    for (std::int32_t layer = 0; layer < kLayers; ++layer) {
+        const std::size_t base = std::size_t(layer) * 4;
+        stream.layer_states[layer].host.k_pages       = make(base + 0, 256, ninfer::DType::I8);
+        stream.layer_states[layer].host.v_pages       = make(base + 1, 256, ninfer::DType::I8);
+        stream.layer_states[layer].host.k_scale_pages = make(base + 2, 4, ninfer::DType::FP16);
+        stream.layer_states[layer].host.v_scale_pages = make(base + 3, 4, ninfer::DType::FP16);
+    }
+
+    std::vector<ImageChunk> chunks;
+    qsa_collect_plane_prefix_chunks(stream, 0, 0, chunks);
+    expect(chunks.empty() && qsa_image_chunk_bytes(chunks) == 0,
+           "a zero-length key carries no plane bytes");
+
+    // 129 tokens = 3 whole host pages: the third is copied whole though the key stops inside it.
+    const std::uint64_t page_layer = std::uint64_t(64) * kHeads * 528;
+    qsa_collect_plane_prefix_chunks(stream, 0, 129, chunks);
+    expect(chunks.size() == 4 * std::size_t(kLayers),
+           "the image carries every allocated plane, in layer then plane order");
+    expect(qsa_image_chunk_bytes(chunks) == 3 * page_layer * kLayers,
+           "the plane half is the key's pages of every layer, not the lane's capacity");
+
+    // Cross-module oracle: the geometry model's KV term at the store's real 64-token page. Its
+    // per-layer axes term (3 * 3 * 4 B) is the only part the plane half never carries.
+    QsaImageGeometry g;
+    g.page_tokens             = 64;
+    g.kv_heads                = kHeads;
+    g.full_layers             = kLayers;
+    g.kv_bytes_per_head_token = qsa_kv_bytes_per_head_token(ninfer::KvCacheStorage::Int8Group64);
+    g.indexer_head_dim        = 0;
+    g.compress_ratio          = 1;
+    expect(qsa_image_chunk_bytes(chunks) == qsa_image_bytes(129, g) - 36ULL * kLayers,
+           "the plane half matches the geometry model's KV term exactly");
+
+    // Every chunk is whole pages 0..2 of its plane and nothing of page 3.
+    bool prefix_ok = true;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const std::size_t block = storage[i].size() / std::size_t(kPages);
+        prefix_ok = prefix_ok && chunks[i].bytes == 3 * block &&
+                    chunks[i].data == storage[i].data();
+        for (std::size_t page = 0; page < 3; ++page) {
+            for (std::size_t k = 0; k < block; ++k) {
+                prefix_ok = prefix_ok &&
+                            chunks[i].data[page * block + k] == std::byte(page + i * 16);
+            }
+        }
+    }
+    expect(prefix_ok, "every chunk is whole pages 0..2 of its plane, and none of page 3");
+
+    // A page-aligned key takes exactly its pages; one token more takes one more whole page.
+    qsa_collect_plane_prefix_chunks(stream, 0, 128, chunks);
+    expect(qsa_image_chunk_bytes(chunks) == 2 * page_layer * kLayers,
+           "128 tokens is exactly two pages");
+    qsa_collect_plane_prefix_chunks(stream, 0, 130, chunks);
+    expect(qsa_image_chunk_bytes(chunks) == 3 * page_layer * kLayers,
+           "130 tokens still takes three pages");
+
+    // A full window carries the whole plane -- exactly the payload a whole-plane image had.
+    qsa_collect_plane_prefix_chunks(stream, 0, std::uint32_t(kPages) * 64U, chunks);
+    expect(qsa_image_chunk_bytes(chunks) == qsa_lane_plane_bytes(stream, 0),
+           "a full window's plane half is the whole plane");
+    qsa_collect_plane_prefix_chunks(stream, 0, std::uint32_t(kPages) * 64U + 5U, chunks);
+    expect(qsa_image_chunk_bytes(chunks) == qsa_lane_plane_bytes(stream, 0),
+           "a key past the capacity clamps to the whole plane rather than reading past it");
+
+    // The real path: an image of exactly this payload round-trips through the store's pages, and
+    // the pages past the key are left as the load found them (they belong to no reader).
+    QsaContinuationStore store(64ULL << 20);
+    const HeldPrefix key = key_of(31, 129);
+    qsa_collect_plane_prefix_chunks(stream, 0, 129, chunks);
+    const std::uint64_t payload = qsa_image_chunk_bytes(chunks);
+    expect(store.store_image(key, payload, 0, true), "a length-based payload holds its pages");
+    const auto index = store.stored_index(key);
+    expect(index.has_value(), "a length-based image is found by its key");
+    store.write_payload(*index, chunks);
+    const std::vector<std::vector<std::byte>> orig = storage;
+    for (std::vector<std::byte>& plane : storage) {
+        std::fill(plane.begin(), plane.end(), std::byte{0});
+    }
+    qsa_collect_plane_prefix_chunks(stream, 0, 129, chunks); // the load reads the key's length
+    store.read_payload(*index, chunks);
+    bool restored  = true;
+    bool untouched = true;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const std::size_t block = storage[i].size() / std::size_t(kPages);
+        for (std::size_t k = 0; k < 3 * block; ++k) {
+            restored = restored && storage[i][k] == orig[i][k];
+        }
+        for (std::size_t k = 3 * block; k < storage[i].size(); ++k) {
+            untouched = untouched && storage[i][k] == std::byte{0};
+        }
+    }
+    expect(restored, "a load restores the key's pages byte-for-byte");
+    expect(untouched, "a load never writes the pages past the key");
+
+    // A storage without the scale planes (their leading extent is zero) is one plane fewer, and
+    // the chunk order -- layer, then K/V -- is what keeps save and load symmetric.
+    std::vector<std::byte> codes(std::size_t(256) * 64 * kHeads * kPages);
+    QsaStreamState bare;
+    bare.lanes  = 1;
+    bare.layers = 1;
+    bare.layer_states.resize(1);
+    bare.layer_states[0].host.k_pages =
+        ninfer::Tensor(codes.data(), ninfer::DType::I8, {256, 64, kHeads, kPages});
+    qsa_collect_plane_prefix_chunks(bare, 0, 129, chunks);
+    expect(chunks.size() == 1 && qsa_image_chunk_bytes(chunks) == 3 * 65536,
+           "absent planes are skipped, so an image never names a plane it does not carry");
+}
 void test_three_way_choice() {
     QsaContinuationStore store(64ULL << 20);
     std::vector<TokenId> prompt(256);
@@ -368,6 +508,7 @@ int main() {
     test_image_save_load_roundtrip();
     test_plane_chunks_roundtrip();
     test_image_payload_roundtrip();
+    test_plane_prefix_length_model();
     test_three_way_choice();
     if (failures != 0) {
         std::cerr << failures << " QSA continuation-store checks failed\n";
