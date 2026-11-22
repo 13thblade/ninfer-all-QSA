@@ -100,7 +100,7 @@ std::vector<double> decode_block(KvCoding coding, const std::uint8_t* codes, con
             x[d] = e2m1(n) * e4m3(scales[d / 16]);
             break;
         }
-        case KvCoding::F16: break;
+        default: break;
         }
     }
     return x;
@@ -127,7 +127,7 @@ double error_bound(KvCoding c) {
     case KvCoding::Lloyd4:
     case KvCoding::Nvfp4G16: return 0.25;
     case KvCoding::RootE8: return 0.5;
-    case KvCoding::F16: break;
+    default: break;
     }
     return 0.0;
 }
@@ -145,6 +145,7 @@ const char* storage_name(KvCacheStorage s) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8: return "rk4v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value: return "rk2v4-e8";
     case KvCacheStorage::Bf16Packed: return "bf16p";
+    case KvCacheStorage::Mxfp8: return "mxfp8";
     }
     return "?";
 }

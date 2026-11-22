@@ -87,6 +87,8 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::Mxfp8:
+        return "mxfp8";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
@@ -295,6 +297,15 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (speculative.adaptive && !speculative.rounds_per_window.empty()) {
+            std::ostringstream widths;
+            for (std::size_t i = 0; i < speculative.rounds_per_window.size(); ++i) {
+                if (i != 0) { widths << ','; }
+                widths << speculative.rounds_per_window[i];
+            }
+            print_metric(backend + " rounds by width", widths.str());
+            print_metric(backend + " width changes", std::to_string(speculative.window_transitions));
+        }
     }
 
     // Qwen3.8-Flash-Next's n-gram table reads since startup (warm-up included).
@@ -399,6 +410,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.kv_cache_automatic       = cli.kv_cache_automatic;
         engine_options.speculative              = cli.speculative;
         engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;

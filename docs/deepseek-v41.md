@@ -102,16 +102,22 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 Not built for this family: the `--kv-dtype` formats (the caches hold the release's FP8/FP4 codes), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
 (`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
-and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
-disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
+and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool.
+Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
 share, prompts in [spans](#prompt-spans) as on one device; without `--tensor-split` the first
 device, which also holds the model, serves fewer experts, so that every device's misses take the
 same time over its bus; [expert
 parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_matrix/q4_k`, `gguf_moe_matrix/q4_k`) do not apply to this
-family: its routed experts are IQ1_S, IQ1_M, IQ2_XXS and IQ2_S, none Q4_K.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for the Q8_0 and Q5_K dense projections and for IQ1_M expert banks
+that the delivery's banks and slots bring to the device (16-byte aligned expert pointers,
+`MoeTable::aligned16`), where the card's profile takes them; IQ1_S, IQ2_XXS, IQ2_XS and IQ2_S keep
+the synchronous loop. The values are those of the synchronous loop. On an RTX 3090 (350 W) a
+3,552-token prompt of the Coder build, bound by the copies of host experts, prefills at 627-629
+instead of 613-616 tokens/s with the synchronous loop, with the same perplexity.
 
 ## Converting
 
@@ -717,6 +723,10 @@ keeps instead of prefilling those tokens again:
   Flash-Next keeps the state inside its span instead; here a span keeps one state, the one its
   prefill tail and drafter taps are planned for (`state_at`), and a second one is not
   implemented.
+- **Documents, files and slots.** A long last message also keeps a state at a span's end inside
+  it, where a later prompt with the same document and another question resumes; a prompt shorter
+  than a span keeps none. Images go to a disk tier, a prefix cache file and session slot files
+  ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.

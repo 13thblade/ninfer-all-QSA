@@ -42,10 +42,16 @@ tower), and MTP speculative decoding (`--spec mtp`). The three published NInfer 
 include Unsloth's shared-Q8_0 MTP block. The upstream GSQ-RCO GGUF sources omit it, so new
 conversions must supply it separately; see [MTP](#mtp-speculative-decoding).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to Q4_K expert banks whose tables are
-16-byte aligned (`MoeTable::aligned16`): device banks, a rank's share under tensor parallelism, and
-the slot pools that host and disk experts' prompt chunks fill. The published Q2_0, IQ3_S and IQ1_M
-releases have no Q4_K experts.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for Q2_0, IQ4_XS, IQ4_NL, Q4_0, Q5_0, Q8_0, Q4_K and Q5_K matrices
+and expert banks and for IQ1_M expert banks, where the card's profile takes them. Expert banks need
+16-byte aligned expert pointers (`MoeTable::aligned16`): device banks, a rank's share under tensor
+parallelism, and the slot pools and caches that host and disk experts fill. IQ3_S, IQ2_* and Q6_K
+keep the synchronous loop. The values are those of the synchronous loop. On an RTX 3090 (350 W)
+with the Q2_0 release's experts in host memory a 3,740-token prompt prefills at 2.38-2.39k instead
+of 2.28-2.29k tokens/s with the synchronous loop, and 16-token windows score at 283 instead of
+267 tokens/s, with the same perplexity.
 
 ## Convert
 
@@ -343,6 +349,22 @@ spare and the rest comes from the disk. A read of the artifact's files that fail
 runs (an expert or an n-gram row) fails the requests of that round with `unavailable`; the expert
 cache forgets what it held, the Engine counts an `engine_recoveries` and serves the queue on.
 
+### Host experts that do not all fit
+
+The page-locked block of GGUF host experts holds them in the artifact's order while they fit the
+host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still
+lock, less 4 GiB for what startup pins after them: WDDM charges page-locked memory there, about
+half the RAM, so 48 GB of experts on a 64 GB Windows machine do not pin whole
+([#358](https://github.com/iamwavecut/ninfer-all/issues/358)). `--expert-host-mib N` pins at most
+`N` MiB. The block registers in parts of about 1 GiB, and a part the host refuses ends it. When it
+holds every expert, the run is the host run above. Otherwise the experts run as disk experts do,
+through the device expert cache: each is copied from its pinned bytes where the block holds it and
+read from the artifact's files where it does not, and the startup line names both amounts. The
+results equal the host and disk runs; host-only options (`--expert-misses mapped`,
+`--expert-tail-skip`, `--expert-prefill-buffers`, `--expert-profile`, `--expert-profile-out`)
+are refused then. Native
+(non-GGUF) host banks register per layer and are not divided this way.
+
 Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below one
 let the CPU compute a share of the missing experts; this mode is experimental: on one RTX 3090 with
 an 8-core EPYC 7302P it decoded 3.1 tok/s at a share of 0 and 5.3 at 0.5 against 31.4 at 1, and its
@@ -353,7 +375,10 @@ bounded pinned staging. Use `--max-concurrency 1` for native host execution. Und
 and WSL2, recognised by `/dev/dxg`) a device's copies may queue behind one another whatever their
 streams, so the tables, the CPU/GPU partition and the CPU's sum that a decode graph takes after it
 waited for the host reach the device through mapped host memory and a copy kernel; a queued copy
-there would hold back the expert copies that end the wait. The bytes are the same either way.
+there would hold back the expert copies that end the wait. The bytes are the same either way. For
+the same reason the staged misses of GGUF host experts reach the device there by a copy kernel
+that reads them in place, not by the copy engine: a decode or verification call's misses and
+admissions, while a replayed layer waits for them; prompt chunks keep the copy engine.
 
 ### The CPU share
 
@@ -730,7 +755,9 @@ A request that does not draft (a decision read) runs its prompt without the MTP 
 sequence's snapshots and images carry no MTP state and serve only requests that do not draft.
 With `--disk-kv-restore` a
 prompt also resumes from an image on
-disk, which a later run finds there too.
+disk, which a later run finds there too. A long last message also keeps an image inside it, where a
+later prompt with the same document and another question resumes, and the images also go to a
+prefix cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
 as for Gemma 4 ([Structured output](gemma4.md#structured-output)): the grammar's token mask applies
@@ -1026,10 +1053,7 @@ not.
   shared by the sequences: a step of another sequence than the last captures it again and updates
   the graph in place; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
-  Under WDDM (Windows, and WSL2) so do the passes of GGUF host experts with staged misses: there a
-  graph's copies queued after a layer's wait for the misses could hold back the service's copies
-  that end it, and the startup log says that graphs are off. `--no-cuda-graph` decodes eagerly
-  everywhere.
+  `--no-cuda-graph` decodes eagerly everywhere.
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run

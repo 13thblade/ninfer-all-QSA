@@ -5,6 +5,7 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -494,8 +495,8 @@ struct Executor::Impl {
                             table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                                std::int64_t(x - first) * hidden * p.down_row_bytes;
                         }
-                        bool gate_up_aligned = p.gate_up_row_bytes % 16 == 0;
-                        bool down_aligned    = p.down_row_bytes % 16 == 0;
+                        bool gate_up_aligned = true;
+                        bool down_aligned    = true;
                         for (std::size_t i = 0; i < table.size(); ++i) {
                             const auto address = reinterpret_cast<std::uintptr_t>(table[i]);
                             const bool aligned = table[i] == nullptr || address % 16 == 0;
@@ -784,6 +785,11 @@ struct Executor::Impl {
             }
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                         std::move(sources), transport);
+            // Where a device's copies queue behind one another whatever their streams
+            // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
+            // misses can hold the copies the graph queued after it ahead of the delivery's own,
+            // which end that wait. Eager passes wait on the host and queue nothing behind the wait.
+            if (serialized_copy_queue()) { options.cuda_graphs = false; }
             // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
             for (auto& p : layers) {
                 if (p.delivery_layer < 0) { continue; }
@@ -791,9 +797,8 @@ struct Executor::Impl {
                 const auto aligned = [&](std::size_t alias) {
                     return delivery->alias_aligned(l, alias, 16);
                 };
-                p.gate_up_aligned16 =
-                    p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
-                p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+                p.gate_up_aligned16 = aligned(0) && aligned(1) && aligned(2);
+                p.down_aligned16    = aligned(3);
             }
         }
     }

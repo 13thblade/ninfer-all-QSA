@@ -88,6 +88,8 @@ struct Options {
 #else
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
 #endif
+    // --kv-dtype given: without it Inkling 2 scores its MXFP8 default (EngineOptions).
+    bool kv_explicit = false;
     bool quick                          = false;
     bool lm_head_q4                     = false;
     bool lm_head_q6                     = false;
@@ -128,13 +130,13 @@ std::string usage_text() {
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
-           "       [--expert-prefill-buffers 1|2]\n"
+           "       [--expert-prefill-buffers 1|2] [--expert-host-mib N]\n"
            "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
            "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
            "       [--iq1m-experts matrix|vector]\n"
            "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
-           "       [--kv-dtype bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p] "
+           "       [--kv-dtype bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p|mxfp8] "
            "[--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -220,6 +222,7 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                                                    [&](bool on) { out.nvfp4_w4a8_int = on; })) {
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
+            out.kv_explicit              = true;
             if (dtype == "bf16") {
                 out.kv = ninfer::KvCacheStorage::BFloat16;
             } else if (dtype == "fp16") {
@@ -242,10 +245,12 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
             } else if (dtype == "bf16p") {
                 out.kv = ninfer::KvCacheStorage::Bf16Packed;
+            } else if (dtype == "mxfp8") {
+                out.kv = ninfer::KvCacheStorage::Mxfp8;
             } else {
                 usage_error("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, rk4v4, "
                             "rk4v4-e8, "
-                            "rk2v4-e8, nvfp4, k8v4 or bf16p");
+                            "rk2v4-e8, nvfp4, k8v4, bf16p or mxfp8 (Inkling 2)");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -416,6 +421,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "k8v4";
     case ninfer::KvCacheStorage::Bf16Packed:
         return "bf16p";
+    case ninfer::KvCacheStorage::Mxfp8:
+        return "mxfp8";
     }
     throw std::logic_error("unknown KV dtype");
 }
@@ -510,6 +517,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.kv_resident_positions         = options.kv_resident;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    engine_options.kv_cache_automatic = !options.kv_explicit;
     engine_options.lm_head_q4       = options.lm_head_q4;
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;

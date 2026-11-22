@@ -43,6 +43,15 @@ int launch_configuration_tests() {
     failures +=
         check(parse({"ninfer-serve", "--config", half}).kv_cache == ninfer::KvCacheStorage::Float16,
               "flat serving JSON did not preserve native FP16 selection");
+    failures += check(!parse({"ninfer-serve", "--config", half}).kv_cache_automatic,
+                      "a configured kv-dtype left the storage to the Engine");
+    {
+        const auto mxfp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "mxfp8"});
+        failures += check(mxfp8.kv_cache == ninfer::KvCacheStorage::Mxfp8 && !mxfp8.kv_cache_automatic,
+                          "--kv-dtype mxfp8 did not select MXFP8 KV explicitly");
+        failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_cache_automatic,
+                          "serving without --kv-dtype did not leave the storage to the Engine");
+    }
     const std::string base = write("base.ini", "model = from-file.ninfer\n"
                                                "host = 0.0.0.0\n"
                                                "port = 9000\n"
@@ -202,6 +211,14 @@ int main() {
         failures += check(rejected, "server accepted an invalid --draft-confidence");
     }
     {
+        // Inkling 2's DSpark drafter takes the floor of its drafts' probabilities.
+        const auto spark = parse({"ninfer-serve", "model.ninfer", "--spec", "dspark",
+                                  "--draft-tokens", "2", "--draft-min-p", "0.3"}).speculative;
+        failures += check(spark.backend == ninfer::SpeculativeBackend::DSpark &&
+                              spark.draft_tokens == 2 && spark.draft_min_p == 0.3F,
+                          "server did not preserve --spec dspark --draft-min-p");
+    }
+    {
         // A DSpine drafter: the artifact --draft-model names beside --spec dspine, nowhere else.
         const auto spine = parse({"ninfer-serve", "model.ninfer", "--spec", "dspine",
                                   "--draft-model", "drafter.ninfer", "--draft-tokens", "7",
@@ -327,6 +344,17 @@ int main() {
                              "--expert-dma-share", "auto", "--expert-dma-share", "0.5",
                              "--expert-dma-share", "auto"}).hybrid_experts.dma_share.has_value() == false,
                       "server did not preserve an automatic hybrid DMA share");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                             "--expert-host-mib", "24576"}).hybrid_experts.host_bytes ==
+                          (24576ULL << 20) &&
+                          !parse({"ninfer-serve", "model.ninfer"}).hybrid_experts.host_bytes,
+                      "server did not preserve --expert-host-mib");
+    {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--expert-host-mib", "1.5"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted a fractional --expert-host-mib");
+    }
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
@@ -1108,6 +1136,13 @@ int main() {
                           !hybrid_minimal.context_cache.hybrid.tap_ladder_tokens &&
                           !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens,
                       "hybrid mode alone must size KV automatically and leave tuning derived");
+    // The option that named the hybrid cache reaches the server, which refuses it for a family
+    // without that cache; the default names none.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).hybrid_cache_flag.empty() &&
+                          hybrid.hybrid_cache_flag == "--use-alt-prefix-caching" &&
+                          parse({"ninfer-serve", "model.ninfer", "--cache-tap-ladder", "8192"})
+                                  .hybrid_cache_flag == "--cache-tap-ladder",
+                      "the option naming the hybrid prefix cache was not recorded");
     const ServeOptions hybrid_explicit_kv =
         parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--max-context", "8192",
                "--kv-capacity", "16384", "--host-cache-mib", "0"});
@@ -1210,16 +1245,36 @@ int main() {
                                                {"--device-snapshot-slots", "2"},
                                                {"--cache-taps-per-request", "2"},
                                                {"--cache-tap-ladder", "2048"},
-                                               {"--cache-tap-min-gap", "64"}}) {
+                                               {"--cache-tap-min-gap", "64"},
+                                               {"--prefix-cache-file", "file.cache",
+                                                "--cache-tap-ladder", "2048"},
+                                               {"--cache-tap-ladder", "2048",
+                                                "--prefix-cache-file", "file.cache"}}) {
         std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
         arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());
         failures += check(parse(arguments).context_cache.mode == ninfer::ContextCacheMode::Hybrid,
                           "a hybrid prefix-cache flag did not keep the default hybrid cache");
+        // The cache file alone also serves the families with an Engine core of their own, whose
+        // caches the catalog's options configure: it parses beside them, the flags recorded for
+        // the server's refusal in the other families.
+        const bool file_alone = hybrid_flag.size() == 2 && hybrid_flag[0] == "--prefix-cache-file";
         for (const std::vector<std::string>& catalog_selector :
              std::vector<std::vector<std::string>>{{"--use-original-prefix-caching"},
-                                                   {"--host-kv-mib", "64"}}) {
+                                                   {"--host-kv-mib", "64"},
+                                                   {"--disk-kv-path", "kv"}}) {
             std::vector<std::string> mixed = arguments;
             mixed.insert(mixed.end(), catalog_selector.begin(), catalog_selector.end());
+            if (file_alone) {
+                const ServeOptions options = parse(std::move(mixed));
+                failures += check(
+                    options.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                        options.hybrid_cache_flag == "--prefix-cache-file" &&
+                        options.catalog_cache_flag == catalog_selector[0] &&
+                        options.context_cache.hybrid.persistent_file ==
+                            (std::filesystem::current_path() / "file.cache").lexically_normal(),
+                    "--prefix-cache-file beside a catalog option was not kept for the server");
+                continue;
+            }
             bool rejected = false;
             try {
                 (void)parse(std::move(mixed));
@@ -1735,6 +1790,10 @@ int main() {
                              "drafter.ninfer", "--draft-tokens", "15", "--adaptive-mtp"})
                               .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
                       "--adaptive-mtp was refused with a masked drafter");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens",
+                             "7", "--adaptive-mtp"})
+                              .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
+                      "--adaptive-mtp was refused with the DSpark drafter");
     bool adaptive_without_drafter_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-mtp"});

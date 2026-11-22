@@ -103,9 +103,18 @@ struct ServeOptions {
     NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    bool kv_cache_automatic                = false; // no --kv-dtype (EngineOptions::kv_cache_automatic)
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
+    // The option that named the hybrid prefix cache (--use-alt-prefix-caching or one of its
+    // settings, --prefix-cache-file only when no other does); empty when it is the default. A
+    // family without the hybrid cache refuses it, except --prefix-cache-file in the families with
+    // an Engine core of their own, which save their own cache to it.
+    std::string hybrid_cache_flag;
+    // The option that selected the checkpoint catalog beside --prefix-cache-file, which only the
+    // families with an Engine core of their own then accept.
+    std::string catalog_cache_flag;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;

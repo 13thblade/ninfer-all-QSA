@@ -70,6 +70,7 @@ const char* storage_name(KvCacheStorage storage) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8: return "rk4v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value: return "rk2v4-e8";
     case KvCacheStorage::Bf16Packed: return "bf16p";
+    case KvCacheStorage::Mxfp8: return "mxfp8";
     }
     return "?";
 }
@@ -149,7 +150,8 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
         case S::Float16:
             key[d] = f16(k.at<std::uint16_t>(page, head, slot, d));
             break;
-        case S::BFloat16: break;
+        case S::BFloat16:
+        case S::Mxfp8: break;
         }
         switch (storage) {
         case S::Int8Group64:
@@ -179,7 +181,8 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
         case S::Float16:
             value[d] = f16(v.at<std::uint16_t>(page, head, slot, d));
             break;
-        case S::BFloat16: break;
+        case S::BFloat16:
+        case S::Mxfp8: break;
         }
     }
 }

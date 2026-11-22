@@ -58,21 +58,28 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
+  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply (the
+  server refuses `--default-thinking-budget`) and the
   [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
   as under `stop`.
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
-the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
+the context cache the shared paged KV pool. Several GPUs divide
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts of a
-release such as HauhauCS's whose expert tables are 16-byte aligned (`MoeTable::aligned16`): device
-banks, and the delivery's banks and slots that bring host or disk experts to the device. The QAT
-Q4_0 release has no Q4_K experts.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for the QAT release's Q4_0 projections and experts, and for the
+Q4_K, Q5_0, Q5_K and Q8_0 matrices of a mixed-format GGUF such as HauhauCS's, where the card's
+profile takes them. The 26B's 704-wide expert rows and the 2,112-wide rows of its dense MLP start
+on 4 bytes only; staged, they copy 4 bytes at a time. Experts need 16-byte aligned expert pointers
+(`MoeTable::aligned16`): device banks, and the delivery's banks and slots that bring host or disk
+experts to the device. The values are those of the synchronous loop. On an RTX 3090 (350 W) a
+3,655-token prompt of the QAT release prefills at 7.61-7.62k instead of 6.43-6.51k tokens/s with
+the synchronous loop, and a 296-token prompt at 3.35k instead of 3.19k, with the same perplexity.
 
 ## Converting
 
@@ -172,8 +179,9 @@ does not fit is refused at startup with the numbers.
 ## KV-cache formats
 
 `--kv-dtype` selects the caches' storage. The 16-bit default keeps F16 rows (the prompt kernels'
-type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and scales per 256-wide block with the
-engine's D256 codecs (`ops/kv_cache`), each block's codes and scales in two planes:
+type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and
+scales per 256-wide block in the engine's KV row codings (`ops/kv_cache/kv_row.h`, the same that
+Inkling 2's and Flint's 128-wide planes use), each block's codes and scales in two planes:
 
 | `--kv-dtype` | sliding blocks: keys | sliding blocks: values | full-attention plane |
 |---|---|---|---|
@@ -315,6 +323,9 @@ keeps instead of prefilling those tokens again:
   the assistant. Requests with the same system prompt resume after it on any sequence, also when
   they arrive together, since a prompt that has not started prefilling looks for images again at
   its first chunk. A disposable request (a decision read) leaves no image of its end.
+- **Documents, files and slots.** A long last message also keeps a state inside it, where a later
+  prompt with the same document and another question resumes; images go to a disk tier, a prefix
+  cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore
@@ -566,7 +577,9 @@ memory and `disk` in the artifact's files, read through the OS page cache. Both 
 with the resident kernels and outputs (top-8 GeGLU, the 704-wide middle, the dense branch and the
 sandwich norms) on the GPU, except the share of decode and verification misses that CPU threads
 compute (the CPU share below). A 12 GB card runs the model this way; the GPU holds 1.7 GiB of other
-weights instead of 13.7 GiB.
+weights instead of 13.7 GiB. Host experts the pinned block cannot hold (`--expert-host-mib`, or a
+host that cannot pin them all, such as Windows past about half its RAM) are read from the
+artifact's files as disk experts are, with the same results.
 
 ```sh
 ninfer /models/gemma4.ninfer --expert-residency host
