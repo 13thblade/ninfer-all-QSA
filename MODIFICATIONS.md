@@ -130,9 +130,13 @@ offered under the same Apache-2.0 license.
   image's own length, prefix dropping, and payload write/read. There is no disk
   tier.
 - `program/prefix/qsa_image.*` maps a lane's authoritative KV to image order:
-  the planes are kept whole (one memcpy per plane, exact round trip), because a
-  page is the inner axis of the `[leading, 128, heads, pages]` tensor and one
-  position's pages are strided.
+  each plane contributes the `ceil(position / 64)` whole host pages its key
+  reached. Page is the outermost contiguous axis of `[leading, 128, heads,
+  pages]` (`ne[0]` is the inner one), so the prefix is a byte prefix of the plane:
+  one memcpy per plane, no strided gather and no staging buffer.
+  `qsa_collect_plane_prefix_chunks` derives the chunks from the image key, save
+  uses the held position and restore uses `stored.key.position`; admission
+  requires `state + plane + backend` to equal the payload exactly for that key.
 - `program/prefix/qsa_continuation_program.cpp` is the admission itself:
   `qsa_quote` settles the three-way choice (the lane's live prefix, its
   prompt-end snapshot, the store's longest image); `qsa_reserve` starts the
@@ -143,6 +147,9 @@ offered under the same Apache-2.0 license.
   `qsa_copy_image`, and its MTP backend-KV pages through
   `DeviceKVPagePool::copy_from_host` (restoring `mtp_kv_valid` and the committed
   frontier, then letting the bridge advance it as a live resume does);
+  a store landing also resets every streamed layer's `KvStreamMap` for that lane
+  and drops the shared staging triple, so decode cannot trust residency entries
+  left behind by the tenant that was evicted from the lane;
   `qsa_retire` writes an endpoint image before the lane is released and charges
   the real StateImage geometry, so a store failure never fails the request that
   just finished. Anchor capture runs where a prompt ends (`prefill.cpp`) and also
@@ -215,6 +222,11 @@ offered under the same Apache-2.0 license.
   passes: it first takes slots nothing reads this round, and only then reclaims a
   draft column's slot, which costs that column its KV and is reported as the
   recoverable overflow.
+- Prefill and the device pool are disjoint: `run_qsa` takes the narrow pool route
+  only for `phase != Phase::Prefill` calls that fit the stream window, so every
+  prefill chunk reads the shared staging layer regardless of `--qsa-prefill`.
+  The route lives inside the QSA-only executor; a run without
+  `--qwen38-27b-qsa` keeps its native dense attention and never reaches it.
 - An overflowing round degrades on the device, before acceptance:
   `resolve_kernel` writes the worst overflow code into a per-lane device flag and
   empties the draft columns' shortlists (their blocks are `-1` in the table),
@@ -318,7 +330,11 @@ offered under the same Apache-2.0 license.
   131,072 tokens, the plane and payload round trips with the short-payload
   refusal, and the three-way choice (live, anchor, store, an equal-length
   regenerate, a media mismatch, and a lane epoch change that leaves only the
-  store).
+  store). Its length-model checks pin the per-plane page prefix at aligned and
+  unaligned keys (128 vs 129 tokens), the image total against the geometry
+  model byte for byte, a store round trip that restores the prefix without
+  writing any page past the key, an absent plane being skipped and an
+  out-of-capacity key clamping to the whole plane.
 - State and layout: `tests/models/qwen3_5/test_state_image_layout.cpp` covers the
   QSA regions of the image; `tests/models/qwen3_5/test_engine_hybrid_prefix_real.cpp`
   gates its readout/shared-read diagnostics behind `NINFER_TEST_READOUT_DEBUG` and
@@ -335,7 +351,9 @@ offered under the same Apache-2.0 license.
   the per-lane overflow words, the streamed K/V-only gate and the device-side
   degradation rules; `tests/ops/test_kv_stream.cpp` pins the two-column pool
   floor, column 0's residency, the truncated draft shortlists and the round
-  flag; `tests/test_prefill_pacing.cpp` covers the QSA step floor.
+  flag, plus the reset contract: a populated map loses every block and slot and
+  the next resolve re-fetches them from the replaced host pages;
+  `tests/test_prefill_pacing.cpp` covers the QSA step floor.
 - Converter: `tests/convert/test_qwen3_8_27b_qsa_gguf.py` and
   `test_gguf_blocks.py`.
 
@@ -414,8 +432,9 @@ store instead (above), and the hybrid cache refuses to be built for it.
   budget is 8 GiB; `--host-cache-mib 0` disables the store.
 - Only a conversation's endpoint is written to the store. A turn closure resumes
   from the lane's retained prompt-end snapshot instead; an image is what a
-  conversation resumes from once another session took its lane. An image keeps
-  the lane's planes whole, so it costs the lane's full plane capacity.
+  conversation resumes from once another session took its lane. An image carries
+  only the key's whole host pages per plane, so its cost follows the retained
+  length rather than the lane's full `--max-context` plane capacity.
 - QSA runs on one device without tensor parallelism, with at most the engine's
   eight lanes, and with CUDA graphs off above one concurrent request. Upstream
   `qwen4_exp` (native QSA) also runs batches of several sequences eagerly, so a
