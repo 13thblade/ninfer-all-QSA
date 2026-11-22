@@ -13,10 +13,10 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Upstream commit | `87c35b6d4` (merged through 20 November 2026) |
+| Upstream commit | `8f029b0ca` (merged through 22 November 2026; the fork previously tracked `87c35b6d4`) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 33 files added, 87 modified; no upstream file deleted |
+| Scope | 35 files added, 89 modified relative to the tracked upstream commit; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -448,6 +448,27 @@ store instead (above), and the hybrid cache refuses to be built for it.
   --qsa-top-blocks` blocks, or `--kv-resident` when that is larger); a context at
   or below it turns streaming off and keeps every full-attention layer resident
   (the startup warning names the levers).
+- The upstream context-store options do not apply to the QSA streamed tier:
+  `--prefix-cache-file` (and the other hybrid-only flags) are refused at startup
+  with a family-specific error. The QSA store is selected by a positive
+  `--kv-resident` and its own `--host-cache-mib` budget, not by the hybrid tier's
+  cache file.
+
+### Upstream merge of 22 November 2026
+
+The tracked upstream base moved from `87c35b6d4` to `8f029b0ca` (77 commits:
+Inkling 2, quantized KV planes including `mxfp8`, a context store with
+checkpoints and a disk tier, and GGUF MMQ work). 226 upstream files and 124 fork
+files changed, 29 in both; only three text conflicts, none in the QSA core.
+`docs/cli.md` and `docs/serving.md` keep the fork's QSA flag rows and take
+upstream's superset `--kv-dtype` / `--spec` rows. `src/serve/operational_log.cpp`
+keeps the QSA history-window and pinned-host-KV lines alongside upstream's
+`own_cache` family branch; Qwen3.8-27B is not in that branch, so it still logs
+through the hybrid/context-cache lines. Upstream's new `--prefix-cache-file`
+option path assigned a null `catalog_option` into a `std::string` on the QSA
+tier and crashed at startup; `src/serve/serve_options.cpp` now substitutes an
+empty string (and `"the default"` in the conflict message) so the existing
+`refuse_family_options` guard rejects it with a clear error instead.
 
 ## Files
 
