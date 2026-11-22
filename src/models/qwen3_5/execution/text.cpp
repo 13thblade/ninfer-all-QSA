@@ -1798,6 +1798,12 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         const char* setting = std::getenv("NINFER_QSA_DENSE_PREFILL");
         return setting == nullptr || std::strcmp(setting, "0") != 0;
     }();
+    // `dense` is only the throughput trade: skip the indexer's selection and read the layer's
+    // whole KV once. It carries no route guard, because the prefill route below is gated on the
+    // phase and neither branch reads the decode pool; the preconditions it might look like it
+    // has are invariants instead -- attn_mix rejects a call without an execution envelope before
+    // run_qsa, and flat_positions is a contiguous 1-D view, which the dense Op validates itself.
+    const bool dense_prefill = phase == Phase::Prefill && dense_prefill_opt;
 
     for (std::size_t part_index = 0; part_index < parts.size(); ++part_index) {
         const Part& part    = parts[part_index];
@@ -1937,9 +1943,6 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         // pool's fallback withholds draft columns, which a prefill does not have. Reading the
         // staged layer keeps every prefill column complete, and the pool then serves only decode
         // and verification, where a column really is a draft.
-        const bool dense_prefill =
-            phase == Phase::Prefill && dense_prefill_opt &&
-            active_causal_attention_envelope_ != nullptr && call_positions.is_contiguous();
         if (!dense_prefill) {
             selected =
                 workspace::matrix(work_, DType::I32, static_cast<std::int32_t>(qsa.block_budget), W);
@@ -1951,6 +1954,11 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         PagedKVLayerView read = layer;
         bool wide_stream_call = false;
         std::int32_t first_host = 0;
+        // Both routes live under run_qsa, which only a --qwen38-27b-qsa run enters: attn_mix
+        // dispatches here when the Program bound an indexer, the indexer exists only with the
+        // flag, and qsa_stream only when --kv-resident sized a window (planning/startup.cpp
+        // sets stream_slots only for `qsa && kv_resident_positions != 0`). A model without the
+        // flag keeps its native dense attention, so it never reaches this phase test.
         if (qsa_stream != nullptr) {
             if (phase != Phase::Prefill && W <= static_cast<std::int32_t>(qsa_stream->width)) {
                 // Streamed tier: the lane's prefix blocks the host copy does not hold source

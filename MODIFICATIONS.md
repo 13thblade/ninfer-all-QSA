@@ -61,7 +61,10 @@ offered under the same Apache-2.0 license.
   dense causal attention (`causal_softmax_attention_cached`) instead of scoring
   and gathering a selection it has already copied; decode and speculative
   verification keep the sparse route, whose pool holds only the resolved blocks.
-  `NINFER_QSA_DENSE_PREFILL=0` restores the sparse route for both.
+  `NINFER_QSA_DENSE_PREFILL=0` restores the sparse selection for both.
+  The route itself is gated on the phase, not on that choice: no prefill chunk
+  reads the `--kv-resident` decode pool, so a dense prefill needs no special
+  guard against the pool's narrow-T path.
 - `--vision` is enabled under QSA: the indexer takes the prompt's 3-D M-RoPE
   positions, and a multimodal prefill runs the dense route.
 - The artifact's own MTP drafts drive speculative decoding under QSA; only the
@@ -232,9 +235,10 @@ offered under the same Apache-2.0 license.
   blocks, 1 to 65,536; unset or `0` keeps the artifact's own 512 blocks, and the
   value is fixed at startup so a captured graph replays the grid it captured.
 - `--qsa-prefill` (`ninfer-serve` only) sends prefill through the sparse branch
-  as well; with `--kv-resident` a sparse prefill reads the shared staging copy
-  of the layer, never the decode pool, and restoring a store image invalidates
-  the lane's residency maps at admission; it is refused without
+  as well; under `--kv-resident` every prefill chunk — dense or sparse — reads
+  the shared staging copy of the layer and never the decode pool, and restoring
+  a store image invalidates the lane's residency maps at admission; it is
+  refused without
   `--qwen38-27b-qsa`, and `resolved_qsa_prefill()`
   (`program/planning/startup.cpp`) resolves it ahead of the legacy
   `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the default
