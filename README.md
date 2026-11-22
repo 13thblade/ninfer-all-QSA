@@ -45,7 +45,7 @@ ninfer-serve model.ninfer --max-context 262144\
 
 ## 实测
 
-单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启、`--vision-residency overlay`、`--prefill-chunk 1024`、`--kv-headroom-mib 0`、`--kv-capacity auto`（显式设置--kv-headroom-mib时须显式设置--kv-capacity auto否则引擎会自动按VRAM余量配置预算）。Decode速度基于真实代码任务测试得出。
+单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启、`--vision-residency overlay`、`--prefill-chunk 1024`、`--kv-headroom-mib 0`、`--kv-capacity auto`（显式设置--kv-headroom-mib时须显式设置--kv-capacity auto）。Decode速度基于真实代码任务测试得出。
 
 | 服务并发度 | 单请求 decode (tok/s) | 端到端吞吐 (tok/s) | 服务端 batch | MTP 接受率 | runtime / CUDA graph |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -109,7 +109,7 @@ ninfer-serve model.ninfer --max-context 262144\
 
 ## Measurements
 
-One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on; `--vision-residency overlay`; `--prefill-chunk 1024`; `--kv-headroom-mib 0`; `--kv-capacity auto` (setting `--kv-headroom-mib` explicitly requires `--kv-capacity auto` as well; in auto mode the engine sizes the KV budget from the VRAM it leaves free). Decode speed was measured on real code tasks.
+One RTX 3090 Ti 24 GB, `Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`, int8 KV, `--qwen38-27b-qsa`, `--qsa-prefill`, `--max-context 262144`, `--qsa-top-blocks 512`, `--kv-resident 8192`, **MTP drafting on (draft-tokens 3) with ngram drafting off**, greedy decode; `--wddm-evictable-budget` on; `--vision-residency overlay`; `--prefill-chunk 1024`; `--kv-headroom-mib 0`; `--kv-capacity auto` (setting `--kv-headroom-mib` explicitly requires `--kv-capacity auto` as well). Decode speed was measured on real code tasks.
 
 | Server concurrency | per-request decode (tok/s) | end-to-end throughput (tok/s) | server batch | MTP acceptance | runtime / CUDA graph |
 | --- | --- | ---: | ---: | ---: | --- |
