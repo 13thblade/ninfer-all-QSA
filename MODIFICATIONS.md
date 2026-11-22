@@ -13,7 +13,7 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Upstream commit | `8f029b0ca` (merged through 22 November 2026; the fork previously tracked `87c35b6d4`) |
+| Upstream commit | `baef81615` (merged through 22 November 2026; the fork previously tracked `8f029b0ca`, before that `87c35b6d4`) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 | Scope | 35 files added, 89 modified relative to the tracked upstream commit; no upstream file deleted |
@@ -469,6 +469,33 @@ option path assigned a null `catalog_option` into a `std::string` on the QSA
 tier and crashed at startup; `src/serve/serve_options.cpp` now substitutes an
 empty string (and `"the default"` in the conflict message) so the existing
 `refuse_family_options` guard rejects it with a clear error instead.
+
+### Upstream merge of 23 November 2026
+
+The tracked base moved from `8f029b0ca` to `baef81615` (21 commits: Flint and
+Gemma 4 thinking budgets, Inkling 2 long-context and DSpark performance, a
+`POST /shutdown` admin route behind `--admin-token`, and engine checkpoint
+fixes). 40 upstream files and 124 fork files changed, 8 in both; a real merge
+had zero text conflicts and touched no QSA-core file. The one overlapping hunk
+was the README changelog line, where the automatic merge kept both the fork's
+QSA rows and upstream's new entries. `generation_service.cpp` auto-merged: the
+fork's `catalog_cache_flag` null fix and the QSA refusal branch are intact;
+upstream only removed Gemma4/Flint's `--default-thinking-budget` refusal.
+
+Build note: this merge changed seven headers (`serve_options.h` gained
+`admin_token`, `http_server.h` gained `shutdown_handler_`, and five others).
+With MSVC + Ninja under a Chinese locale, `/showIncludes` can leave a TU's
+dependency record empty, so an incremental build reused objects compiled
+against the old struct layouts. The result was startup corruption — a garbage
+`SamplingOverrides::top_p` (`top_p must be in [0,1]` during warmup) and, after
+touching only part of the graph, an access violation while moving
+`ServeOptions` into the model registry. Building with `VSLANG=1033` after
+touching every header/TU that mentions `ServeOptions`, `ModelDefinition`, or
+the sampling structures produced a clean binary: all six suites, gateA
+(`ANCHOR_MATCH=True`, `kind=2 cached=750`), the logprobs probe (8/8 tokens,
+cold -0.015738 / resumed -0.013672) and longrun (14/14 at `prefill=33`) match
+the pre-merge numbers. No source change was needed; the merge is exactly the
+two parents' tree.
 
 ## Files
 
