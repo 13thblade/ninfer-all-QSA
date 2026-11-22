@@ -58,10 +58,11 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply (the
-  server refuses `--default-thinking-budget`) and the
-  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
-  as under `stop`.
+  `reasoning_content`. A thinking budget (`--thinking-budget`, `--default-thinking-budget`, a
+  request's) counts the tokens of the thought channel the model opens; once reached, the engine
+  closes the channel with Qwen's early-close guidance and `<channel|>`, masks `<|channel>` for the
+  rest of the response, and the model answers. `--reasoning-loop conclude` closes it the same way
+  ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
@@ -330,7 +331,9 @@ keeps instead of prefilling those tokens again:
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore
 resumes only where a state was kept (a sequence's end, its checkpoint, a stored image), not at an
-arbitrary common prefix.
+arbitrary common prefix. A sequence's own state can go back a little: a next prompt that departs
+from what the sequence read after its last prompt (a reply the template renders otherwise) resumes
+where it departs, the sequence taken back there, while its rings still hold that position's window.
 
 A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
 the sequence goes back to where the stop string's match began, the state its visible text

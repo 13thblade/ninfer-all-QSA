@@ -691,6 +691,10 @@ struct DeepSeekV41Core::Request {
     std::vector<std::uint32_t> shared_at;
     // The checkpoint among them (MessageCheckpoint), 0 for none.
     std::uint32_t checkpoint_at = 0;
+    // The checkpoint as MessageCheckpoint::at places it in the last message, before
+    // place_checkpoint() moves it to a prompt step's end (0: none), and where the template closes
+    // that message.
+    std::uint32_t message_checkpoint = 0, closed_at = 0;
 
     std::uint32_t slot         = 0;
     std::uint32_t reused       = 0;
@@ -1276,9 +1280,41 @@ struct DeepSeekV41Core::Impl {
     // (MessageCheckpoint::on_steps); where they stay on the GPU, as placed.
     [[nodiscard]] std::uint32_t checkpoint_on_steps(std::uint32_t at,
                                                     std::span<const std::uint32_t> frontiers,
-                                                    std::span<const ContextMediaMark> media) const {
+                                                    std::span<const ContextMediaMark> media,
+                                                    std::uint32_t from) const {
         if (instance.model->expert_residency() == ExpertResidency::Device) { return at; }
-        return MessageCheckpoint::on_steps(at, frontiers, media, instance.executor->prompt_step());
+        return MessageCheckpoint::on_steps(at, frontiers, media, instance.executor->prompt_step(),
+                                           from);
+    }
+
+    // The states a request keeps besides its checkpoint: the shared prefixes, and the anchor when
+    // it moved inside the last message's closure.
+    [[nodiscard]] static std::vector<std::uint32_t> kept_states(const Request& r) {
+        std::vector<std::uint32_t> kept = r.shared_at;
+        if (r.checkpoint_at != 0) {
+            kept.erase(std::find(kept.begin(), kept.end(), r.checkpoint_at));
+        }
+        if (r.anchor_at < r.closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), r.anchor_at), r.anchor_at);
+        }
+        return kept;
+    }
+
+    // The message checkpoint on the prompt steps that run from `from`: placed when the request is
+    // made (from 0) and again where its prompt resumes, whose steps would otherwise end on both
+    // sides of a checkpoint placed for steps from 0 and add one.
+    void place_checkpoint(Request& r, std::uint32_t from) const {
+        const std::vector<std::uint32_t> kept = kept_states(r);
+        if (r.checkpoint_at != 0) {
+            r.shared_at.erase(std::find(r.shared_at.begin(), r.shared_at.end(), r.checkpoint_at));
+            r.checkpoint_at = 0;
+        }
+        if (r.message_checkpoint == 0) { return; }
+        if (const std::uint32_t at = checkpoint_on_steps(r.message_checkpoint, kept, r.media, from);
+            at > from && at >= kMinStoredTokens && at < r.anchor_at && image_pays(at)) {
+            r.checkpoint_at = at;
+            r.shared_at.insert(std::upper_bound(r.shared_at.begin(), r.shared_at.end(), at), at);
+        }
     }
 
     // Whether a shared prefix or a checkpoint of `tokens` is worth an image: saving it and copying
@@ -1500,6 +1536,7 @@ struct DeepSeekV41Core::Impl {
         slot.last_used   = ++use_clock;
         slot.disposable  = r.disposable;
         r.reused = r.prefilled = reused;
+        if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
@@ -1893,6 +1930,7 @@ struct DeepSeekV41Core::Impl {
                 slot.media   = std::move(media);
                 r.reuse_path = path;
                 r.reused = r.prefilled = from_store;
+                place_checkpoint(r, from_store);
                 std::lock_guard lock(stats_mutex);
                 stats.reused_prompt_tokens += from_store;
             }
@@ -3186,33 +3224,19 @@ DeepSeekV41Core::make_request(GroupMember& member, std::optional<std::uint32_t>&
         }
         // Where the template closes the prompt's last message: the turn closure, or the end.
         const std::uint32_t closed_at = request->anchor_at;
-        // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
-        // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
-        // when the template rewrites what follows it. The sequence's anchor moves there: a device
-        // snapshot, copied to the host as an image only when another request takes the sequence.
-        if (!options.execution.branches) {
-            for (const auto& opportunity : data.context_cache.opportunities) {
-                const bool only_default =
-                    has_shared_candidate_evidence(opportunity.evidence,
-                                                  SharedCandidateEvidence::DefaultAutomatic) &&
-                    !has_shared_candidate_evidence(
-                        opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
-                                                  SharedCandidateEvidence::RequestedAutomatic |
-                                                  SharedCandidateEvidence::EngineStructural);
-                if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && only_default &&
-                    opportunity.frontier > 0 && opportunity.frontier < request->anchor_at) {
-                    request->anchor_at = opportunity.frontier;
-                }
-            }
-        }
-        // Shared prefixes worth an image of their own: a declared or structural boundary. The
-        // default one at the prompt's end moved the anchor above instead; an image there copied
-        // the whole state to the host on every turn.
+        // Shared prefixes worth an image of their own: a declared or structural boundary, and the
+        // protocol's default one (DefaultAutomatic: OpenAI and Anthropic put it where the prompt's
+        // last message ends), where a repeat of the prompt resumes, and the next turn when the
+        // template rewrites what follows it. DeepSeek-V4.1's images are small (about 1 KB a
+        // position), so that one costs little each turn, and the anchor stays where the template
+        // closes the prompt: a next turn that keeps the closure resumes after it (the other
+        // families move the anchor to the default boundary instead).
         for (const auto& opportunity : data.context_cache.opportunities) {
             const auto evidence   = opportunity.evidence;
             const bool structural = has_shared_candidate_evidence(
                 evidence, SharedCandidateEvidence::ExplicitBoundary |
                               SharedCandidateEvidence::RequestedAutomatic |
+                              SharedCandidateEvidence::DefaultAutomatic |
                               SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
@@ -3223,23 +3247,11 @@ DeepSeekV41Core::make_request(GroupMember& member, std::optional<std::uint32_t>&
         std::sort(request->shared_at.begin(), request->shared_at.end());
         request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
                                  request->shared_at.end());
-        // The checkpoint lies in the last message as the template closes it: with the anchor
-        // moved inside that closure, the message before it would count as the last one (in a
-        // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
-        // state like the shared ones.
-        std::vector<std::uint32_t> kept = request->shared_at;
-        if (request->anchor_at < closed_at) {
-            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
-                        request->anchor_at);
-        }
-        if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media), kept,
-                request->media);
-            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
-            request->checkpoint_at = at;
-            request->shared_at.insert(
-                std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);
-        }
+        // The checkpoint lies in the last message as the template closes it.
+        request->closed_at          = closed_at;
+        request->message_checkpoint = MessageCheckpoint::at(
+            data.tap_hints.hints, closed_at, Impl::kept_states(*request), request->media);
+        impl_->place_checkpoint(*request, 0);
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;

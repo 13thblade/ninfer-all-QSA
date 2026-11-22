@@ -48,10 +48,11 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   the assistant marker, the switch GLM's templates use for the same role-marker format, and Flint
   then answers at once; [typed decisions](serving.md#typed-decisions) read their labels there.
   Without it, a one-label question puts about 10^-11 of the first token's probability on the
-  labels, the rest on `<think>`. Flint has no early-close control, so thinking budgets do not
-  apply (the server refuses `--default-thinking-budget`) and the
-  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under
-  `conclude` as under `stop`.
+  labels, the rest on `<think>`. A thinking budget (`--thinking-budget`,
+  `--default-thinking-budget`, a request's) counts the tokens of the `<think>` block the model
+  opens; once reached, the engine closes the block with Qwen's early-close guidance and `</think>`,
+  masks `<think>` for the rest of the response, and the model answers. `--reasoning-loop conclude`
+  closes it the same way ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's: temperature 1.0, top-p 0.95, top-k 20.
 - **Speculative decoding by context lookup.** Recursive publishes no draft model. `--lookup-ngram
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to
@@ -199,7 +200,10 @@ keeps instead of prefilling those tokens again:
 
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore
-resumes only where a state was kept, not at an arbitrary common prefix.
+resumes only where a state was kept, not at an arbitrary common prefix. A sequence's own state can
+go back a little: a next prompt that departs from what the sequence read after its last prompt (a
+reply the template renders otherwise) resumes where it departs, the sequence taken back there,
+while its rings still hold that position's window.
 
 A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
 the sequence goes back to where the stop string's match began, the state its visible text
@@ -276,10 +280,12 @@ repetitions, the first having spread ±22%.
   score alike: 15.270 against llama.cpp's 15.195 (+0.49%); per window the mean NLL differs by
   -0.012 to +0.022 nats. On 40 KB, device, host and disk experts give the same perplexity,
   19.560887.
-- **Branched reads.** `ninfer_flint_branches_real_test` (with `NINFER_FLINT_ARTIFACT`) checks
-  that a branch alone reads bit for bit as a plain chunk of its tokens; that beside another
-  branch, first or second, it reads the same whatever that branch holds; and that a read joining
-  the prompt's last chunk leaves nothing of its branches in the sequence.
+- **Branched reads and sequences.** `ninfer_flint_branches_real_test` (with
+  `NINFER_FLINT_ARTIFACT`; `NINFER_FLINT_EXPERTS=host` or `disk` on a 24 GB card) checks that a
+  branch alone reads bit for bit as a plain chunk of its tokens; that beside another branch, first
+  or second, it reads the same whatever that branch holds; that a read joining the prompt's last
+  chunk leaves nothing of its branches in the sequence; and that a prompt on the second sequence
+  reads bit for bit as on the first, one decode step of both giving both the same row.
 
 ### Rounding with the pass
 

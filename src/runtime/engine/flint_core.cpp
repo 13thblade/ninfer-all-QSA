@@ -407,6 +407,10 @@ struct FlintCore::Request {
     std::vector<std::uint32_t> shared_at;
     // The checkpoint among them (MessageCheckpoint), 0 for none.
     std::uint32_t checkpoint_at = 0;
+    // The checkpoint as MessageCheckpoint::at places it in the last message, before
+    // place_checkpoint() moves it to a prompt step's end (0: none), and where the template closes
+    // that message.
+    std::uint32_t message_checkpoint = 0, closed_at = 0;
 
     std::uint32_t slot         = 0;
     std::uint32_t reused       = 0;
@@ -455,6 +459,8 @@ struct FlintCore::Impl {
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
         // The typed readout's token ids, on a request's first generated token only.
         const std::vector<TokenId>* readout = nullptr;
+        // A token the row cannot take (<think> once an early close was applied).
+        std::optional<TokenId> ban_token;
     };
 
     FlintInstance& instance;
@@ -519,6 +525,7 @@ struct FlintCore::Impl {
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
     DeviceBuffer readout_ids, readout_values;
     std::unique_ptr<PinnedHostBuffer> host_readout;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
@@ -607,6 +614,10 @@ struct FlintCore::Impl {
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
+        bf16_neg_mask = DeviceBuffer(sizeof(std::uint16_t));
+        const std::uint16_t kBf16NegLarge = 0xC600U;
+        CUDA_CHECK(ninfer::copy_and_wait(bf16_neg_mask.p, &kBf16NegLarge, sizeof(kBf16NegLarge),
                                          cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
@@ -953,6 +964,18 @@ struct FlintCore::Impl {
         return static_cast<std::uint32_t>(held.size());
     }
 
+    // Where the prompt departs from what a sequence read: their common prefix, at most what
+    // prefix_reuse() allows.
+    static std::uint32_t departure(const std::vector<TokenId>& held, const Request& prompt) {
+        const auto& tokens = prompt.prompt_tokens;
+        if (held.empty() || tokens.empty()) { return 0; }
+        const std::size_t most =
+            std::min(held.size(), prompt.branches ? tokens.size() : tokens.size() - 1);
+        return static_cast<std::uint32_t>(
+            std::mismatch(held.begin(), held.begin() + std::ptrdiff_t(most), tokens.begin()).first -
+            held.begin());
+    }
+
     // The stored image that serves the most of the prompt, and how much.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         return store.best([&](const Store::Image& image) {
@@ -964,10 +987,41 @@ struct FlintCore::Impl {
     // (MessageCheckpoint::on_steps); where they stay on the GPU, as placed.
     [[nodiscard]] std::uint32_t checkpoint_on_steps(std::uint32_t at,
                                                     std::span<const std::uint32_t> frontiers,
-                                                    std::span<const ContextMediaMark> media) const {
+                                                    std::span<const ContextMediaMark> media,
+                                                    std::uint32_t from) const {
         if (instance.model->expert_residency() == ExpertResidency::Device) { return at; }
         return MessageCheckpoint::on_steps(at, frontiers, media,
-                                           instance.executor->options().prefill_chunk);
+                                           instance.executor->options().prefill_chunk, from);
+    }
+
+    // The states a request keeps besides its checkpoint: the shared prefixes, and the anchor when
+    // it moved inside the last message's closure.
+    [[nodiscard]] static std::vector<std::uint32_t> kept_states(const Request& r) {
+        std::vector<std::uint32_t> kept = r.shared_at;
+        if (r.checkpoint_at != 0) {
+            kept.erase(std::find(kept.begin(), kept.end(), r.checkpoint_at));
+        }
+        if (r.anchor_at < r.closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), r.anchor_at), r.anchor_at);
+        }
+        return kept;
+    }
+
+    // The message checkpoint on the prompt steps that run from `from`: placed when the request is
+    // made (from 0) and again where its prompt resumes, whose steps would otherwise end on both
+    // sides of a checkpoint placed for steps from 0 and add one.
+    void place_checkpoint(Request& r, std::uint32_t from) const {
+        const std::vector<std::uint32_t> kept = kept_states(r);
+        if (r.checkpoint_at != 0) {
+            r.shared_at.erase(std::find(r.shared_at.begin(), r.shared_at.end(), r.checkpoint_at));
+            r.checkpoint_at = 0;
+        }
+        if (r.message_checkpoint == 0) { return; }
+        if (const std::uint32_t at = checkpoint_on_steps(r.message_checkpoint, kept, {}, from);
+            at > from && at >= kMinStoredTokens && at < r.anchor_at && image_pays(at)) {
+            r.checkpoint_at = at;
+            r.shared_at.insert(std::upper_bound(r.shared_at.begin(), r.shared_at.end(), at), at);
+        }
     }
 
     // Whether a shared prefix or a checkpoint of `tokens` is worth an image: saving it and copying
@@ -1127,7 +1181,18 @@ struct FlintCore::Impl {
             const std::uint32_t live       = prefix_reuse(slot.fed, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, r);
             const auto [image, from_store] = find_stored(r);
-            if (from_store > std::max(live, anchored)) {
+            // A prompt that departs from what the sequence read after its last prompt (a reply the
+            // template renders otherwise, a regenerated one) resumes where it departs, the
+            // sequence taken back there, when its rings still hold that position's window: the
+            // closure of the last prompt, which the anchor at the default boundary would compute
+            // again, and the reply's tokens the prompt keeps.
+            const std::uint32_t departs = live == 0 ? departure(slot.fed, r) : 0;
+            if (departs > std::max(anchored, from_store) &&
+                executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs)) {
+                slot.fed.resize(departs);
+                reused       = departs;
+                r.reuse_path = PrefixReusePath::PrivateEndpoint;
+            } else if (from_store > std::max(live, anchored)) {
                 std::vector<TokenId> tokens = store.images()[image].tokens;
                 const PrefixReusePath path  = store.images()[image].path;
                 retire(s);
@@ -1162,6 +1227,7 @@ struct FlintCore::Impl {
         slot.last_used  = ++use_clock;
         slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
+        if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.enabled      = true;
             r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::None;
@@ -1284,6 +1350,18 @@ struct FlintCore::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
+
+    // Gives `token` the logit -8192 in `count` columns from `column`: the row cannot draw it.
+    void ban(const Tensor& logits, std::size_t column, std::size_t count,
+             std::optional<TokenId> token, cudaStream_t stream) const {
+        if (!token || *token < 0 || static_cast<std::uint32_t>(*token) >= domain) { return; }
+        for (std::size_t c = column; c < column + count; ++c) {
+            auto* at = static_cast<std::uint16_t*>(logits.data) +
+                       c * static_cast<std::size_t>(logits.ne[0]) + static_cast<std::size_t>(*token);
+            CUDA_CHECK(cudaMemcpyAsync(at, bf16_neg_mask.p, sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
                 std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
@@ -1332,6 +1410,7 @@ struct FlintCore::Impl {
         const Tensor logical(sample_position.p, DType::I32, {width});
         const Tensor logits =
             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
+        for (std::size_t b = 0; b < n; ++b) { ban(logits, b, 1, rows[b].ban_token, stream); }
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1436,7 +1515,8 @@ struct FlintCore::Impl {
                          .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
                                              r.first_token == Clock::time_point{}
                                          ? &exec.readout_tokens
-                                         : nullptr};
+                                         : nullptr,
+                         .ban_token = r.output.banned_token()};
     }
 
     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
@@ -1520,6 +1600,7 @@ struct FlintCore::Impl {
                 slot.fed     = std::move(tokens);
                 r.reuse_path = path;
                 r.reused = r.prefilled = from_store;
+                place_checkpoint(r, from_store);
                 std::lock_guard lock(stats_mutex);
                 stats.reused_prompt_tokens += from_store;
             }
@@ -1866,6 +1947,21 @@ struct FlintCore::Impl {
             return accepted;
         }
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
+        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
+            // A reached thinking budget or the loop guard's conclusion closes the reasoning the
+            // model opened: append the control span (<guidance></think>) to the next step's feed.
+            const auto pending_control = r.output.pending_control_tokens();
+            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
+            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
+            if (forced.accepted_tokens != control.size() || forced.finished()) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "thinking control preview returned an invalid decision");
+            }
+            r.generated.insert(r.generated.end(), control.begin(), control.end());
+            r.budget->commit(static_cast<std::uint32_t>(control.size()));
+            push_events(r, r.output.commit_preview(), std::nullopt);
+            r.feed.insert(r.feed.end(), control.begin(), control.end());
+        }
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
         }
@@ -1935,7 +2031,7 @@ struct FlintCore::Impl {
     // One step of every decoding request. Those whose context or drafter proposes a continuation
     // run one speculative round together, the rest one batched decode step.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative, drafting;
+        std::vector<std::shared_ptr<Request>> alone, batch, speculative, drafting;
         std::vector<std::vector<TokenId>> proposals;
         // Which of the round's proposals came from a context lookup.
         std::vector<char> looked_up;
@@ -1958,6 +2054,10 @@ struct FlintCore::Impl {
                 }
                 continue;
             }
+            if (request->feed.size() > 1) {
+                alone.push_back(request);
+                continue;
+            }
             if (steps > 0 && speculates(*request)) {
                 std::vector<TokenId> proposal(steps);
                 const std::uint32_t found =
@@ -1976,7 +2076,8 @@ struct FlintCore::Impl {
             }
             batch.push_back(request);
         }
-        if (batch.empty() && speculative.empty() && drafting.empty() && deferred.empty()) {
+        if (alone.empty() && batch.empty() && speculative.empty() && drafting.empty() &&
+            deferred.empty()) {
             return;
         }
         const auto start = Clock::now();
@@ -1989,11 +2090,35 @@ struct FlintCore::Impl {
             }
         }
         if (!deferred.empty()) { sample_deferred(deferred); }
+        for (const auto& request : alone) {
+            // The control span that closes the reasoning, after the token before it: one forward
+            // of all of them, then the token after.
+            Request& r = *request;
+            if (r.constrained && !r.mask) { schedule_mask(r); }
+            instance.executor->forward(r.slot, r.feed, 1);
+            Slot& slot = slots[r.slot];
+            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
+            r.position += static_cast<std::uint32_t>(r.feed.size());
+            if (!mask_ready(r)) {
+                defer_sample(r, instance.executor->logits(1), 0, ops::kSamplePurposeDecode);
+                continue;
+            }
+            const SampleRow row = sample_row(r);
+            TokenId token       = 0;
+            runtime::RawTokenLogprob logprob;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
+                   std::span(&logprob, 1));
+            try {
+                if (!mask_usable(request)) { continue; }
+                accept(request, token, row.logprobs ? &logprob : nullptr);
+                next_mask(request);
+            } catch (...) { fail(request, std::current_exception()); }
+        }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + speculative.size();
+        stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
     }
 
@@ -2236,6 +2361,9 @@ struct FlintCore::Impl {
                                    stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
         const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
+        for (std::size_t j = 0; j < b; ++j) {
+            ban(logits, std::size_t(starts[j]), widths[j], rows[j].ban_token, stream);
+        }
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2672,18 +2800,10 @@ FlintCore::make_request(GroupMember& member, std::optional<std::uint32_t>& budge
         // moved inside that closure, the message before it would count as the last one (in a
         // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
         // state like the shared ones.
-        std::vector<std::uint32_t> kept = request->shared_at;
-        if (request->anchor_at < closed_at) {
-            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
-                        request->anchor_at);
-        }
-        if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, {}), kept, {});
-            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
-            request->checkpoint_at = at;
-            request->shared_at.insert(
-                std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);
-        }
+        request->closed_at          = closed_at;
+        request->message_checkpoint = MessageCheckpoint::at(
+            data.tap_hints.hints, closed_at, Impl::kept_states(*request), {});
+        impl_->place_checkpoint(*request, 0);
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;

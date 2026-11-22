@@ -151,6 +151,16 @@ batch drafts until each of its requests has reached the floor or the round's wid
 ran nearly every step for all of them and were slower than plain steps
 ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)).
 
+The Inkling 2 Engine also times a lone DSpark request's rounds against plain decoding, since at a
+long context a round can cost more than the tokens it keeps save. It keeps decayed sums of the
+tokens committed and the seconds spent in the running mode; every 64 steps it runs the other mode
+for a few (4 plain steps, or 8 rounds while the request decodes plainly, after one warm-up step
+each) and switches when that mode committed tokens more than 3% faster. A plain step only slows
+down as the context grows, so while rounds lead the plain rate last measured by more than 10% the
+plain probe is skipped. Plain steps still write the drafter's caches, so a round can follow any
+plain step, and both modes commit the target's own tokens, so the text does not change. A new
+request starts with drafts.
+
 ### MTP attention window
 
 Each MTP draft step attends over the whole history of its cache, so at a long context the draft
@@ -512,6 +522,26 @@ previous file is kept. Ctrl+C with console text selected only copies the text. W
 process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
 tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 
+With `--admin-token TOKEN` the same stop is reachable over HTTP as `POST /shutdown`, a route
+that exists only while the token is set -- without it the port answers 404. The request carries
+`TOKEN` as a bearer or `x-api-key` header, and with `--api-key` set it carries that key too, since
+the route is an API route: the engine key as the bearer, the token as `x-api-key`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/shutdown \
+  -H 'Authorization: Bearer local-secret' \
+  -H 'x-api-key: stop-token'
+```
+
+A wrong or missing token is a 401. A correct one is acknowledged with 202 and
+`{"status":"stopping",...}`; the stop itself runs moments later, off the request's own thread,
+because stopping closes the listener that would flush the response. From then on it is the stop
+above: new connections are refused, every running and queued request ends with a 503, the prefix
+cache saves when `--prefix-cache-file` is set, and the process exits after the save. A repeated
+request finds the route already gone, and one more Ctrl+C during the stop exits at once without
+saving, as with the console stop. The route is not on `--stats-port`, and like every route it
+answers 503 `model_loading` while the model is still loading.
+
 An Engine-wide failure (an error the Engine's worker cannot attribute to one request) fails every
 queued request and refuses every new one, and the Engine never recovers from it. A single-model
 server then stops on its own and exits with status 2, distinct from startup failures (1), so a
@@ -551,6 +581,7 @@ off.
 | `GET /stats` | the `/v1/load` snapshot plus the ingress peak and every Engine counter since startup (see [Stats](#stats)) |
 | `GET /slots` | per-cell occupancy of the private context cache (see [Slots](#slots)) |
 | `POST /slots/{id}?action=save\|restore\|erase` | save a retained session to a file, restore one, or evict one (see [Slots](#slots)) |
+| `POST /shutdown` | the graceful stop with the Ctrl+Break semantics; registered only when `--admin-token` is set, on the main listener (see [Stop the server](#stop-the-server)) |
 | `GET /props` | llama.cpp-shaped server properties: default sampling, context, lanes, modalities (see [Props](#props)) |
 | `GET /lora-adapters` | the loaded LoRA adapters with their ids and startup scales (see [LoRA adapters and control vectors](#lora-adapters-and-control-vectors)) |
 | `GET /v1` | endpoint index for the announced API base: the model alias and this table |
@@ -1182,9 +1213,9 @@ because requests can explicitly enable thinking. A request overrides this defaul
 integer: `thinking_budget` on Chat Completions and Responses (a NInfer extension, accepted at top
 level), or `thinking:{"type":"enabled","budget_tokens":N}` on Anthropic Messages (a value of at
 least 1024 and below `max_tokens`, per that protocol). A request that does not think receives no
-cap, whatever it sends; an Inkling 2 chat request, whose model opens its thinking blocks itself,
-always takes the cap. Gemma 4 and Flint cannot close their reasoning early: the server refuses the
-flag for them at startup and ignores a request's budget.
+cap, whatever it sends. The models of Inkling 2, Flint and Gemma 4 open their reasoning themselves:
+an Inkling 2 chat request always takes the cap, a Flint one unless it turns thinking off, and a
+Gemma 4 one when it turns thinking on.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -1222,12 +1253,14 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4 and Flint take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
-and a reached budget closes its reasoning with the guidance and its `</think>` token, as Qwen's does.
-Inkling 2 counts the tokens of every thinking block it opens in a response (not their headers and
-end markers); a reached budget closes the open block with the guidance and `<|end_message|>`, and
-the rest of the response can open no thinking block (`<|content_thinking|>` is masked) and runs
-without drafts.
+DeepSeek-V4.1 counts its thinking tokens, and a reached budget closes its reasoning with the
+guidance and its `</think>` token, as Qwen's does. Inkling 2 counts the tokens of every thinking
+block it opens in a response (not their headers and end markers); a reached budget closes the open
+block with the guidance and `<|end_message|>`, and the rest of the response can open no thinking
+block (`<|content_thinking|>` is masked). Flint counts the tokens of the `<think>` block it opens
+and Gemma 4 those of its thought channel (not the channel's name); a reached budget closes the
+block with the guidance and `</think>` (Gemma 4: `<channel|>`), and the rest of the response can
+open no other (`<think>` or `<|channel>` is masked).
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1261,10 +1294,10 @@ because every pass varies a little.
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
 - **Gemma 4, Flint and Inkling 2.** The guard reads the thought channel (Flint: the `<think>`
   block; Inkling 2: its `<|content_thinking|>` blocks, counted across the blocks of one response)
-  the model opens and counts its tokens. Gemma 4 and Flint have no early-close control, so
-  `conclude` stops there as `stop` does; Inkling 2 concludes with the guidance and
-  `<|end_message|>`, as a reached budget does. DeepSeek-V4.1 concludes as Qwen does, with the same
-  guidance and its own `</think>` token.
+  the model opens and counts its tokens, and `conclude` closes it as a reached budget does: Inkling
+  2 with the guidance and `<|end_message|>`, Flint with the guidance and `</think>`, Gemma 4 with
+  the guidance and `<channel|>`. DeepSeek-V4.1 concludes as Qwen does, with the same guidance and
+  its own `</think>` token.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
@@ -2410,7 +2443,9 @@ control vector on one layer 0.1%.
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
 `x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated; `GET /v1/load`,
-`GET /stats` and `GET /metrics` require the key, on `--stats-port` too.
+`GET /stats` and `GET /metrics` require the key, on `--stats-port` too. Registered, `POST /shutdown`
+requires the key like every API route, and its own `--admin-token` on top of it (see
+[Stop the server](#stop-the-server)).
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -2435,6 +2470,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--port N` | listen port | `8080` |
 | `--stats-port N` | also serve `GET /health`, `/stats`, `/v1/load` and `/metrics` on port `N` of the same address, with one worker of their own, so a dashboard or watchdog is never queued behind the connections the request pool serves; the readiness and API-key rules are the main listener's | off |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--admin-token KEY` | the admin credential; register the admin routes, of which `POST /shutdown`, the HTTP form of the Ctrl+Break graceful stop, is the first; the request carries `KEY` as a bearer or `x-api-key` (with `--api-key` set, that key as the other header) (see [Stop the server](#stop-the-server)) | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--rope-yarn` | past the model's native window, YaRN at factor `--max-context` / native instead of plain RoPE, for every family: the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention with its indexer and MTP block, Gemma 4's full-attention blocks (its sliding-window blocks never leave their window); Flint, whose full-attention blocks carry no rotation, and Inkling 2, whose attention carries none, refuse it. Qwen documents the extension for its models; for Gemma 4 it is the same mathematics without a published or measured quality ([Gemma 4](gemma4.md#running)). The `server_start` record's `engine.rope` names the rotation the Engine resolved | off |
@@ -2515,7 +2551,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
-| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`, and the request decodes plainly while its measured rounds commit tokens slower; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp` or `dflash2`; Flint, which has no drafter, and Inkling 2 without it): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
@@ -2957,7 +2993,11 @@ sequence resumes from the longest image it starts with. An image larger than the
 kept, on disk either: Gemma 4 31B's of a 6,434-token prompt takes 3.1 GiB. Where a chat request's
 last message ends, a sequence keeps a snapshot on the device instead of an image, which a repeat of
 the prompt resumes from, and so does the next turn when the template renders what followed
-differently; it goes to an image when another request takes the sequence. Beyond that:
+differently; it goes to an image when another request takes the sequence. A next turn that keeps
+what the template put after that message resumes past it: Gemma 4, Flint and Inkling 2 take the
+sequence back to where the new prompt departs from what it read, when their sliding-window rings
+still hold that position's window; DeepSeek-V4.1, whose images take about 1 KB a position, keeps an
+image where the last message ends and its snapshot where the prompt ends. Beyond that:
 
 - **A document, then another question.** A prompt whose last message holds at least 768 tokens
   also keeps an image inside it, at the last multiple of 256 tokens at least 512 tokens before the
@@ -2968,10 +3008,10 @@ differently; it goes to an image when another request takes the sequence. Beyond
   5,130-token user message: a different question reused 4,608 tokens, and its prompt took about
   480 ms instead of 2,565 ms. With experts in host memory or the artifact's files each prompt step
   copies or reads the experts it routes to, so a checkpoint between two step ends would cost every
-  such prompt one more pass of them; the checkpoint then moves down to the end of a prompt step
-  (Gemma 4, Flint and Inkling 2: every prompt chunk, 2,048 tokens by default, and at the prompt's
-  other kept states; DeepSeek-V4.1: every span, 16,384 tokens with host experts on an RTX 3090),
-  and a prompt with no such end in reach keeps none. On DeepSeek-V4.1 with host experts, a
+  such prompt one more pass of them; the checkpoint then moves down to the end of a prompt step,
+  counted from where the prompt resumes (Gemma 4, Flint and Inkling 2: every prompt chunk, 2,048
+  tokens by default, and at the prompt's other kept states; DeepSeek-V4.1: every span, 16,384
+  tokens with host experts on an RTX 3090), and a prompt with no such end in reach keeps none. On DeepSeek-V4.1 with host experts, a
   checkpoint inside the span had made a 4,808-token prompt take 7.4 s instead of 5.2 s, and a
   different question then 2.0 s instead of 4.6 s. Qwen3.8-Flash-Next keeps the state inside its
   span and needs no move. The prompt that keeps a checkpoint pays for it: Inkling 2's first

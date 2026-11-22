@@ -120,15 +120,16 @@ struct MessageCheckpoint {
     // The checkpoint `at` moved down to the end of a prompt step, for an Engine whose prompt steps
     // each copy or read the experts the step routes to (experts off the GPU): a checkpoint
     // between two step ends would add a step, and a pass of the experts, to every prompt that
-    // keeps one. Steps run from 0, end at each of `frontiers` (sorted, the request's other kept
-    // states) and every `step` tokens after the last end. 0 when no step end other than a
-    // frontier lies at or below `at`, or when that end lies inside a media unit.
+    // keeps one. Steps run from `from` (where the prompt resumes), end at each of `frontiers`
+    // (sorted, the request's other kept states) and every `step` tokens after the last end. 0
+    // when no step end other than a frontier lies above `from` and at or below `at`, or when that
+    // end lies inside a media unit.
     [[nodiscard]] static std::uint32_t on_steps(std::uint32_t at,
                                                 std::span<const std::uint32_t> frontiers,
                                                 std::span<const ContextMediaMark> media,
-                                                std::uint32_t step) {
-        if (at == 0 || step == 0) { return 0; }
-        std::uint32_t position = 0, last = 0;
+                                                std::uint32_t step, std::uint32_t from = 0) {
+        if (at <= from || step == 0) { return 0; }
+        std::uint32_t position = from, last = 0;
         auto next = frontiers.begin();
         for (;;) {
             while (next != frontiers.end() && *next <= position) { ++next; }
@@ -138,7 +139,7 @@ struct MessageCheckpoint {
             last     = end;
             position = end;
         }
-        if (last < kSeparation) { return 0; }
+        if (last < from + kSeparation) { return 0; }
         for (const std::uint32_t other : frontiers) {
             if (other + kSeparation > last && last + kSeparation > other) { return 0; }
         }
@@ -164,7 +165,7 @@ struct ContextImageStoreOptions {
     // Host pages the images may hold, rounded down to whole pages; zero disables the store.
     std::uint64_t host_budget = 0;
     // Of those, the pages pin_reserve() pins at startup; the store pins the rest as images need
-    // them, and pin_ahead() while the worker idles.
+    // them, and pin_ahead() while the worker idles, up to the budget.
     std::uint64_t host_reserve = 0;
     // The disk tier's directory for this profile; empty: none.
     std::filesystem::path disk_dir;
@@ -272,6 +273,10 @@ public:
     [[nodiscard]] bool enabled() const noexcept { return host_budget_ != 0; }
     [[nodiscard]] std::uint64_t host_budget() const noexcept { return host_budget_; }
     [[nodiscard]] std::uint64_t host_used() const noexcept { return host_used_; }
+    // The pinned pages: those the images hold and the free ones.
+    [[nodiscard]] std::uint64_t host_pinned() const noexcept {
+        return std::uint64_t(free_pages_.size()) * kPageBytes + host_used_;
+    }
     [[nodiscard]] std::uint64_t disk_used() const noexcept { return disk_used_; }
     [[nodiscard]] const std::string& profile() const noexcept { return profile_; }
     [[nodiscard]] const std::vector<Image>& images() const noexcept { return images_; }
@@ -282,24 +287,20 @@ public:
 
     // Pins the reserve now; throws when the host cannot pin it.
     void pin_reserve() {
-        const std::uint64_t pinned = std::uint64_t(free_pages_.size()) * kPageBytes + host_used_;
+        const std::uint64_t pinned = host_pinned();
         if (host_reserve_ > pinned) {
             pin_pages(static_cast<std::size_t>((host_reserve_ - pinned) / kPageBytes));
         }
     }
 
-    // Whether the idle worker pins another chunk: the free pages hold less than the reserve and
-    // one more chunk stays within the budget. A failed pin ends idle pinning; take_pages still
-    // pins.
-    [[nodiscard]] bool pins_ahead() const noexcept {
-        const std::uint64_t free_bytes = std::uint64_t(free_pages_.size()) * kPageBytes;
-        return !pin_ahead_failed_ && free_bytes < host_reserve_ &&
-               host_used_ + free_bytes + kPinAheadPages * kPageBytes <= host_budget_;
-    }
+    // Whether the idle worker pins another chunk: the pinned pages hold less than the budget, so
+    // an image stored later takes pinned pages instead of pinning its own while its request
+    // waits. A failed pin ends idle pinning; take_pages still pins.
+    [[nodiscard]] bool pins_ahead() const noexcept { return pages_ahead() != 0; }
 
     void pin_ahead() {
         try {
-            pin_pages(kPinAheadPages);
+            pin_pages(pages_ahead());
         } catch (const std::exception&) { pin_ahead_failed_ = true; }
     }
 
@@ -599,6 +600,14 @@ public:
 
 private:
     static constexpr std::size_t kPinAheadPages = 8;
+
+    // The pages pin_ahead() pins: a chunk, or what is left of the budget.
+    [[nodiscard]] std::size_t pages_ahead() const noexcept {
+        const std::uint64_t pinned = host_pinned();
+        if (pin_ahead_failed_ || pinned >= host_budget_) { return 0; }
+        return static_cast<std::size_t>(
+            std::min<std::uint64_t>(kPinAheadPages, (host_budget_ - pinned) / kPageBytes));
+    }
 
     // Pins `count` more free pages in one allocation.
     void pin_pages(std::size_t count) {

@@ -4,6 +4,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
+#include "ops/common/mma.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -717,12 +718,40 @@ __global__ void kv_post_kernel(KvArgs a) {
 // Heads of 128 values with up to four query heads per key and value head. A tile's 16 keys and
 // values pass through shared memory once for the block; lane l holds dimensions [4 l, 4 l + 4) of
 // the query, and a warp keeps the online softmax of its (row, head) pairs.
-//   Decode (kRows 1): block (row, kv head, split) of four warps, warp h the group's head h.
+//   Decode and verification (kRows 1): block (row group, kv head, split) of four warps a row,
+//   warp 4 i + h row i's head h. A group is one row or, with a.row_group, up to that many
+//   consecutive rows of one sequence (row_group_bounds), for which the tiles pass through shared
+//   memory once; each row reads the tiles of its own split as a group of one row does.
 //   Prompt (kRows 8): block (eight rows, kv head) of eight warps, warp r row r, every head.
 constexpr int kTile = 16;
+constexpr int kSplitTiles = 4; // the fewest tiles a split reads
 
 __device__ __forceinline__ int active_splits(int keys, int splits) {
-    return min(splits, max(1, (keys + kTile - 1) / kTile));
+    return min(splits, max(1, (keys + kSplitTiles * kTile - 1) / (kSplitTiles * kTile)));
+}
+
+// Group g's rows [t0, t1): consecutive rows of one sequence, at most `group_rows` of them, the
+// groups in row order (group_rows 1: row g alone). False: the call has fewer groups.
+__device__ __forceinline__ bool row_group_bounds(const Rows& r, int group_rows, int g, int& t0,
+                                                 int& t1) {
+    if (group_rows <= 1) {
+        t0 = g;
+        t1 = g + 1;
+        return g < r.tokens;
+    }
+    for (int t = 1, begin = 0, count = 0; t <= r.tokens; ++t) {
+        if (t == r.tokens || t - begin == group_rows ||
+            row_sequence(r, t) != row_sequence(r, begin)) {
+            if (count == g) {
+                t0 = begin;
+                t1 = t;
+                return true;
+            }
+            ++count;
+            begin = t;
+        }
+    }
+    return false;
 }
 
 // The sums of 16 per-lane values v[k] over the warp, by halving exchanges: afterwards lanes 2j and
@@ -775,31 +804,94 @@ __device__ __forceinline__ void key_range(const AttentionArgs& a, int t0, int t1
     }
 }
 
-template <int kRows>
-__global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(AttentionArgs a) {
-    constexpr int kWarps = kRows == 1 ? 4 : 8;
+// The far field of a full visit's prompt chunk: for the rows [g, g + kFarRows), the keys [0, end)
+// before the chunk that lie at least `extent` positions before every row's logical position, so
+// every row of the group sees each of them, and none with a relative bias; `end` is a whole number
+// of kFarKeys tiles. Each warp computes it (all lanes taking part) from the group's positions.
+constexpr int kFarRows = 32;
+constexpr int kFarKeys = 32;
+
+__device__ __forceinline__ int far_end(const AttentionArgs& a, int g) {
+    const int t = g + (threadIdx.x & 31);
+    int p       = t < a.rows.tokens ? a.rows.positions[t] : INT_MAX;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { p = min(p, __shfl_xor_sync(0xFFFFFFFFu, p, o)); }
+    const int end = min(a.rows.first, p - a.extent + 1);
+    return end <= 0 ? 0 : end / kFarKeys * kFarKeys;
+}
+
+// The keys [begin, end) that split `split` of the rows [t0, t1) reads, none before `from`; false
+// when the rows use fewer splits (split_rows: as many as their keys need, else one).
+__device__ __forceinline__ bool split_keys(const AttentionArgs& a, int t0, int t1, int from,
+                                           bool split_rows, int split, int& begin, int& end) {
+    int lo = 0, hi = 0;
+    key_range(a, t0, t1, lo, hi);
+    lo               = max(lo, from);
+    const int keys   = hi + 1 - lo;
+    const int active = split_rows ? active_splits(keys, a.splits) : 1;
+    const int chunk  = ((keys + active - 1) / active + kTile - 1) / kTile * kTile;
+    begin            = lo + split * chunk;
+    end              = min(hi + 1, begin + chunk);
+    return split < active;
+}
+
+// kFar: a prompt chunk whose far field far_attention_kernel computed (a.far): its rows start from
+// those states and read the keys after the far field. A separate instantiation keeps the other
+// calls' kernels free of that code.
+template <int kRows, bool kFar = false>
+__global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
+    attention_kernel(AttentionArgs a) {
+    constexpr int kWarps = kRows == 1 ? 4 * kMaxRowGroup : 8;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int group   = a.query_heads / a.kv_heads;
     const int kv_head = blockIdx.y;
-    const int t0      = blockIdx.x * kRows;
-    const int t1      = min(a.rows.tokens, t0 + kRows);
-    const int t       = kRows == 1 ? t0 : t0 + warp;
-    const bool row_ok = t < t1 && (kRows != 1 || warp < group);
+    int t0 = 0, t1 = 0;
+    if constexpr (kRows == 1) {
+        if (!row_group_bounds(a.rows, a.row_group, int(blockIdx.x), t0, t1)) { return; }
+    } else {
+        t0 = blockIdx.x * kRows;
+        t1 = min(a.rows.tokens, t0 + kRows);
+    }
+    const int t       = kRows == 1 ? t0 + warp / 4 : t0 + warp;
+    const int head_w  = kRows == 1 ? warp % 4 : 0;
+    const bool in_row = t < t1;
+    const bool row_ok = in_row && (kRows != 1 || head_w < group);
     const int heads   = kRows == 1 ? 1 : group;
-    const int head0   = kv_head * group + (kRows == 1 ? warp : 0);
-    int lo = 0, hi = 0;
-    key_range(a, t0, t1, lo, hi);
-    const int keys   = hi + 1 - lo;
-    const int active = kRows == 1 || a.uniform ? active_splits(keys, a.splits) : 1;
-    const int split  = int(blockIdx.z);
-    if (split >= active) { return; }
-    const int chunk = ((keys + active - 1) / active + kTile - 1) / kTile * kTile;
-    const int begin = lo + split * chunk;
-    const int end   = min(hi + 1, begin + chunk);
+    const int head0   = kv_head * group + head_w;
+    // A prompt chunk of a full visit with its far field done: the keys after it.
+    int far = 0;
+    if constexpr (kFar) { far = far_end(a, t0 / kFarRows * kFarRows); }
+    const int split = int(blockIdx.z);
+    // The row's keys [begin, end) of its split (every row's, kRows 8), and the tiles [first, last)
+    // the block loads for its rows.
+    int begin = 0, end = 0, first = INT_MAX, last = 0;
+    bool active = false;
+    if constexpr (kRows == 1) {
+        active = in_row && split_keys(a, t, t + 1, far, true, split, begin, end);
+        bool any = false;
+        for (int r = t0; r < t1; ++r) {
+            int b = 0, e = 0;
+            if (split_keys(a, r, r + 1, far, true, split, b, e)) {
+                any = true;
+                if (b < e) {
+                    first = min(first, b);
+                    last  = max(last, e);
+                }
+            }
+        }
+        if (!any) { return; }
+    } else {
+        active = split_keys(a, t0, t1, far, a.uniform, split, begin, end);
+        if (!active) { return; }
+        first = begin;
+        last  = end;
+    }
 
     __shared__ __align__(16) __half k_s[kTile][kD];
     __shared__ __align__(16) __half v_s[kTile][kD];
-    __shared__ float r_s[kWarps][kMaxGroup][kRel];
+    // A decode warp holds one head's relative features; a prompt warp every head's.
+    constexpr int kRelHeads = kRows == 1 ? 1 : kMaxGroup;
+    __shared__ float r_s[kWarps][kRelHeads][kRel];
 
     float q_r[kMaxGroup][4], acc[kMaxGroup][4], m[kMaxGroup], l[kMaxGroup];
 #pragma unroll
@@ -818,7 +910,17 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             q_r[h][1] = q.y * a.scale;
             q_r[h][2] = q.z * a.scale;
             q_r[h][3] = q.w * a.scale;
-            if (lane < kRel && a.r != nullptr) { r_s[warp][h][lane] = a.r[at * kRel + lane]; }
+            if (lane < kRel && a.r != nullptr) { r_s[warp][h % kRelHeads][lane] = a.r[at * kRel + lane]; }
+            if (kFar && far > 0) {
+                const std::int64_t n = std::int64_t(a.rows.tokens) * a.query_heads;
+                const float4 o = reinterpret_cast<const float4*>(a.far + at * kD)[lane];
+                acc[h][0] = o.x;
+                acc[h][1] = o.y;
+                acc[h][2] = o.z;
+                acc[h][3] = o.w;
+                m[h] = a.far[n * kD + 2 * at];
+                l[h] = a.far[n * kD + 2 * at + 1];
+            }
         }
     }
     const int sequence = row_sequence(a.rows, t0);
@@ -829,8 +931,8 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
     const int lane_key = ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) + ((lane & 4) ? 2 : 0) +
                          ((lane & 2) ? 1 : 0);
     const int half = lane & 1;
-    for (int tile = begin; tile < end; tile += kTile) {
-        const int count = min(kTile, end - tile);
+    for (int tile = first; tile < last; tile += kTile) {
+        const int count = min(kTile, last - tile);
         __syncthreads();
         for (int w = threadIdx.x; w < 2 * kTile * (kD / 8); w += blockDim.x) {
             const int matrix = w / (kTile * (kD / 8));
@@ -859,10 +961,10 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             *reinterpret_cast<uint4*>(matrix == 0 ? &k_s[r][c * 8] : &v_s[r][c * 8]) = word;
         }
         __syncthreads();
-        if (!row_ok) { continue; }
+        if (!row_ok || !active || tile < begin || tile >= end) { continue; }
         int distance = 0;
         const bool visible =
-            lane_key < count && (a.uniform || sees(a, t, tile + lane_key, distance));
+            lane_key < min(kTile, end - tile) && (a.uniform || sees(a, t, tile + lane_key, distance));
         const bool biased  = visible && !a.uniform && distance < a.extent;
 #pragma unroll
         for (int h = 0; h < kMaxGroup; ++h) {
@@ -880,7 +982,7 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             if (biased) {
                 const float* row = a.table + std::int64_t(distance) * kRel + 8 * half;
 #pragma unroll
-                for (int c = 0; c < 8; ++c) { bias += r_s[warp][h][8 * half + c] * row[c]; }
+                for (int c = 0; c < 8; ++c) { bias += r_s[warp][h % kRelHeads][8 * half + c] * row[c]; }
             }
             bias += __shfl_xor_sync(0xFFFFFFFFu, bias, 1);
             const float sc     = visible ? dot + bias : -INFINITY;
@@ -909,7 +1011,7 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             }
         }
     }
-    if (!row_ok) { return; }
+    if (!row_ok || !active) { return; }
     const int width = a.query_heads * kD;
 #pragma unroll
     for (int h = 0; h < kMaxGroup; ++h) {
@@ -950,8 +1052,10 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
 
 // Block (head, row): merges the splits of one query head and its sink, thread d the output's
 // dimension d. Every split counts with weight exp(m_s - M), the sink as a key without a value:
-// M = max(max_s m_s, sink), l = sum_s l_s exp(m_s - M) + exp(sink - M).
-constexpr int kCombineThreads = kD; // at least the largest split count
+// M = max(max_s m_s, sink), l = sum_s l_s exp(m_s - M) + exp(sink - M). Thread d also holds the
+// splits d + 128 j, whose weights it sums before the block's sum.
+constexpr int kCombineThreads = kD;
+constexpr int kMaxSplits      = 4 * kCombineThreads;
 
 __global__ void attention_combine_kernel(AttentionArgs a) {
     const int head = blockIdx.x, t = blockIdx.y;
@@ -961,10 +1065,17 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
     int lo = 0, hi = 0;
     key_range(a, t, t + 1, lo, hi);
     const int active = active_splits(hi + 1 - lo, a.splits);
-    __shared__ float weight[kCombineThreads];
+    __shared__ float weight[kMaxSplits];
     __shared__ float max_s, inv_l;
-    const float ms = d < active ? a.partial[rows * kD + 2 * (first + d)] : -INFINITY;
-    const float m  = warp_max(ms);
+    float ms[kMaxSplits / kCombineThreads];
+    float m_local = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < kMaxSplits / kCombineThreads; ++j) {
+        const int sp = d + j * kCombineThreads;
+        ms[j]   = sp < active ? a.partial[rows * kD + 2 * (first + sp)] : -INFINITY;
+        m_local = fmaxf(m_local, ms[j]);
+    }
+    const float m = warp_max(m_local);
     if ((threadIdx.x & 31) == 0) { weight[threadIdx.x >> 5] = m; }
     __syncthreads();
     const float sink =
@@ -975,10 +1086,17 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
         max_s = all;
     }
     __syncthreads();
-    const float w_s = ms != -INFINITY ? expf(ms - max_s) : 0.0f;
-    const float l_s = w_s != 0.0f ? a.partial[rows * kD + 2 * (first + d) + 1] * w_s : 0.0f;
-    const float l   = block_sum(l_s);
-    weight[threadIdx.x] = w_s;
+    float l_s = 0.0f;
+    float w_s[kMaxSplits / kCombineThreads];
+#pragma unroll
+    for (int j = 0; j < kMaxSplits / kCombineThreads; ++j) {
+        const int sp = d + j * kCombineThreads;
+        w_s[j]       = ms[j] != -INFINITY ? expf(ms[j] - max_s) : 0.0f;
+        l_s += w_s[j] != 0.0f ? a.partial[rows * kD + 2 * (first + sp) + 1] * w_s[j] : 0.0f;
+    }
+    const float l = block_sum(l_s);
+#pragma unroll
+    for (int j = 0; j < kMaxSplits / kCombineThreads; ++j) { weight[d + j * kCombineThreads] = w_s[j]; }
     if (threadIdx.x == 0) { inv_l = 1.0f / (l + expf(sink - max_s)); }
     __syncthreads();
     float o = 0.0f;
@@ -1008,6 +1126,204 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
     if ((threadIdx.x & 31) == 0) {
         a.out_q.ds[std::int64_t(t) * (width / 32) + at / 32] =
             make_half2(__float2half(dq), __float2half(sum));
+    }
+}
+
+// The far field's softmax states (far_end): block (group of kFarRows rows, KV head) of two warps
+// per query head of the KV head, warp w head w / 2 over rows 16 (w % 2) .. + 16 of the group. Q
+// (scaled) and the probabilities enter the MMAs as F16, K and V as the attention reads them (F16,
+// or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. Writes (acc, m, l) of
+// each row and head to a.far in attention_workspace_floats(T, query_heads, 1)'s layout.
+constexpr int kFarPad = kD + 8; // halves per shared row: 272 bytes keep the ldmatrix rows apart
+
+__device__ __forceinline__ unsigned half2_bits(float x, float y) {
+    const __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+
+template <int Group>
+__global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs a) {
+    constexpr int kThreads = 64 * Group;
+    constexpr int kWords   = 2 * kFarKeys * (kD / 8); // uint4 words of a K and V tile
+    constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tid4 = lane & 3;
+    const int kv_head = blockIdx.y;
+    const int g       = blockIdx.x * kFarRows;
+    const int end     = far_end(a, g);
+    if (end == 0) { return; }
+    const int head = kv_head * Group + warp / 2;
+    const int r0   = g + 16 * (warp & 1);
+    const int sequence = row_sequence(a.rows, g);
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
+                              std::int64_t(kv_head) * a.head_stride;
+
+    __shared__ __align__(16) __half k_s[2][kFarKeys][kFarPad];
+    __shared__ __align__(16) __half v_s[2][kFarKeys][kFarPad];
+
+    uint4 words[kPer];
+    const auto fetch = [&](int tile) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            words[i]    = make_uint4(0, 0, 0, 0);
+            if (kWords % kThreads != 0 && w >= kWords) { continue; }
+            const int matrix = w / (kFarKeys * (kD / 8));
+            const int rest   = w % (kFarKeys * (kD / 8));
+            const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const int p    = tile * kFarKeys + r;
+            const int slot = a.ring != 0 ? p % a.ring : p;
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
+            if (plane.coding != KvCoding::F16) {
+                const std::int64_t codes_row = std::int64_t(sequence) * plane.code_seq +
+                                               std::int64_t(kv_head) * plane.code_head +
+                                               std::int64_t(slot) * plane.code_row;
+                const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
+                                                std::int64_t(kv_head) * plane.scale_head +
+                                                std::int64_t(slot) * plane.scale_row;
+                words[i] = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+            } else {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                words[i] = *reinterpret_cast<const uint4*>(cache + base +
+                                                            std::int64_t(slot) * kD + c * 8);
+            }
+        }
+    };
+    const auto put = [&](int buffer) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if (kWords % kThreads != 0 && w >= kWords) { continue; }
+            const int matrix = w / (kFarKeys * (kD / 8));
+            const int rest   = w % (kFarKeys * (kD / 8));
+            const int r = rest / (kD / 8), c = rest % (kD / 8);
+            __half* to = matrix == 0 ? &k_s[buffer][r][c * 8] : &v_s[buffer][r][c * 8];
+            *reinterpret_cast<uint4*>(to) = words[i];
+        }
+    };
+
+    // Q's A fragments: rows r0 + gid (+ 8), dimensions 16 ks + 2 tid4 (+ 8).
+    unsigned qf[kD / 16][4];
+#pragma unroll
+    for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = r0 + gid + (i & 1) * 8;
+            const int dim = 16 * ks + 2 * tid4 + (i >> 1) * 8;
+            float2 q      = make_float2(0.0f, 0.0f);
+            if (row < a.rows.tokens) {
+                q = *reinterpret_cast<const float2*>(
+                    a.q + (std::int64_t(row) * a.query_heads + head) * kD + dim);
+            }
+            qf[ks][i] = half2_bits(q.x * a.scale, q.y * a.scale);
+        }
+    }
+    float o[kD / 8][4];
+#pragma unroll
+    for (int n = 0; n < kD / 8; ++n) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f; }
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+
+    const int tiles = end / kFarKeys;
+    fetch(0);
+    put(0);
+    __syncthreads();
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int buffer = tile & 1;
+        if (tile + 1 < tiles) { fetch(tile + 1); }
+        // S = Q K^T over the tile's 32 keys: n-tile j holds keys 8 j .. 8 j + 7.
+        float sc[kFarKeys / 8][4];
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) { sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f; }
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+            for (int jp = 0; jp < kFarKeys / 16; ++jp) {
+                const int key = 8 * (2 * jp + (lane >> 4)) + (lane & 7);
+                const int dim = 16 * ks + ((lane >> 3) & 1) * 8;
+                unsigned b0, b1, b2, b3;
+                ops::ldmatrix_x4(b0, b1, b2, b3, ops::smem_addr(&k_s[buffer][key][dim]));
+                ops::mma_f16(sc[2 * jp][0], sc[2 * jp][1], sc[2 * jp][2], sc[2 * jp][3], qf[ks][0],
+                             qf[ks][1], qf[ks][2], qf[ks][3], b0, b1);
+                ops::mma_f16(sc[2 * jp + 1][0], sc[2 * jp + 1][1], sc[2 * jp + 1][2],
+                             sc[2 * jp + 1][3], qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3], b2, b3);
+            }
+        }
+        // Online softmax of rows gid (elements 0, 1) and gid + 8 (elements 2, 3), over the quad.
+        float top[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+            top[0] = fmaxf(top[0], fmaxf(sc[j][0], sc[j][1]));
+            top[1] = fmaxf(top[1], fmaxf(sc[j][2], sc[j][3]));
+        }
+        float corr[2], sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            top[i] = fmaxf(top[i], __shfl_xor_sync(0xFFFFFFFFu, top[i], 1));
+            top[i] = fmaxf(top[i], __shfl_xor_sync(0xFFFFFFFFu, top[i], 2));
+            const float m_new = fmaxf(m[i], top[i]);
+            corr[i]           = expf(m[i] - m_new);
+            m[i]              = m_new;
+        }
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+            sc[j][0] = expf(sc[j][0] - m[0]);
+            sc[j][1] = expf(sc[j][1] - m[0]);
+            sc[j][2] = expf(sc[j][2] - m[1]);
+            sc[j][3] = expf(sc[j][3] - m[1]);
+            sum[0] += sc[j][0] + sc[j][1];
+            sum[1] += sc[j][2] + sc[j][3];
+        }
+        l[0] = l[0] * corr[0] + sum[0];
+        l[1] = l[1] * corr[1] + sum[1];
+#pragma unroll
+        for (int n = 0; n < kD / 8; ++n) {
+            o[n][0] *= corr[0];
+            o[n][1] *= corr[0];
+            o[n][2] *= corr[1];
+            o[n][3] *= corr[1];
+        }
+        // O += P V: k16 step s over keys 16 s .. 16 s + 15 (n-tiles 2 s and 2 s + 1 of S).
+#pragma unroll
+        for (int s16 = 0; s16 < kFarKeys / 16; ++s16) {
+            const unsigned p0 = half2_bits(sc[2 * s16][0], sc[2 * s16][1]);
+            const unsigned p1 = half2_bits(sc[2 * s16][2], sc[2 * s16][3]);
+            const unsigned p2 = half2_bits(sc[2 * s16 + 1][0], sc[2 * s16 + 1][1]);
+            const unsigned p3 = half2_bits(sc[2 * s16 + 1][2], sc[2 * s16 + 1][3]);
+#pragma unroll
+            for (int n2 = 0; n2 < kD / 16; ++n2) {
+                const int key = 16 * s16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                const int dim = 8 * (2 * n2 + (lane >> 4));
+                unsigned v0, v1, v2, v3;
+                ops::ldmatrix_x4_t(v0, v1, v2, v3, ops::smem_addr(&v_s[buffer][key][dim]));
+                ops::mma_f16(o[2 * n2][0], o[2 * n2][1], o[2 * n2][2], o[2 * n2][3], p0, p1, p2, p3,
+                             v0, v1);
+                ops::mma_f16(o[2 * n2 + 1][0], o[2 * n2 + 1][1], o[2 * n2 + 1][2],
+                             o[2 * n2 + 1][3], p0, p1, p2, p3, v2, v3);
+            }
+        }
+        if (tile + 1 < tiles) { put(buffer ^ 1); }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xFFFFFFFFu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xFFFFFFFFu, l[i], 2);
+    }
+    const std::int64_t n = std::int64_t(a.rows.tokens) * a.query_heads;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int row = r0 + gid + 8 * i;
+        if (row >= a.rows.tokens) { continue; }
+        const std::int64_t at = std::int64_t(row) * a.query_heads + head;
+#pragma unroll
+        for (int nt = 0; nt < kD / 8; ++nt) {
+            *reinterpret_cast<float2*>(a.far + at * kD + 8 * nt + 2 * tid4) =
+                make_float2(o[nt][2 * i], o[nt][2 * i + 1]);
+        }
+        if (tid4 == 0) {
+            a.far[n * kD + 2 * at]     = m[i];
+            a.far[n * kD + 2 * at + 1] = l[i];
+        }
     }
 }
 
@@ -1810,10 +2126,10 @@ std::size_t attention_workspace_floats(int rows, int query_heads, int splits) {
 void attention(const AttentionArgs& args, cudaStream_t stream) {
     const int group = args.kv_heads > 0 ? args.query_heads / args.kv_heads : 0;
     if (group < 1 || group > kMaxGroup || group * args.kv_heads != args.query_heads ||
-        args.splits < 1 || args.splits > kCombineThreads ||
+        args.splits < 1 || args.splits > kMaxSplits ||
         (args.out == nullptr && args.out_q.qs == nullptr) ||
         (args.r == nullptr && args.extent > 0)) {
-        throw std::invalid_argument("inkling2 attention: 1..4 query heads per key head, 1..128 "
+        throw std::invalid_argument("inkling2 attention: 1..4 query heads per key head, 1..512 "
                                     "splits and the relative features of a biased call");
     }
     const int t = args.rows.tokens;
@@ -1832,11 +2148,35 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     }
     if (args.rows.chunk) {
         if (args.splits != 1) { throw std::invalid_argument("inkling2 attention: chunk splits"); }
-        attention_kernel<8><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
+        if (args.far != nullptr) {
+            if (args.window != 0 || args.ring != 0) {
+                throw std::invalid_argument("inkling2 attention: a far field is a full visit's");
+            }
+            const dim3 grid(blocks_for(t, kFarRows), unsigned(args.kv_heads));
+            switch (group) {
+            case 1: far_attention_kernel<1><<<grid, 64, 0, stream>>>(args); break;
+            case 2: far_attention_kernel<2><<<grid, 128, 0, stream>>>(args); break;
+            case 3: far_attention_kernel<3><<<grid, 192, 0, stream>>>(args); break;
+            default: far_attention_kernel<4><<<grid, 256, 0, stream>>>(args); break;
+            }
+            check_launch("far_attention");
+        }
+        if (args.far != nullptr) {
+            attention_kernel<8, true><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(
+                args);
+        } else {
+            attention_kernel<8><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
+        }
         check_launch("attention");
         return;
     }
-    attention_kernel<1><<<dim3(t, args.kv_heads, args.splits), 128, 0, stream>>>(args);
+    if (args.row_group < 1 || args.row_group > kMaxRowGroup ||
+        (args.row_group > 1 && (args.window != 0 || args.ring != 0)) || args.row_groups < 0) {
+        throw std::invalid_argument("inkling2 attention: row groups of 1..4 rows, a full visit's");
+    }
+    const int groups = args.row_group == 1 || args.row_groups == 0 ? t : std::min(t, args.row_groups);
+    attention_kernel<1><<<dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
+                          stream>>>(args);
     check_launch("attention");
     if (args.splits > 1) {
         attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
