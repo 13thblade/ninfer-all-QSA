@@ -444,27 +444,28 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
             std::vector<ImageChunk> chunks;
             qsa_collect_plane_prefix_chunks(*qsa_stream_state, lane, stored.key.position, chunks);
             const std::uint64_t plane_bytes = qsa_image_chunk_bytes(chunks);
-            if (stored.bytes < state_bytes + plane_bytes) {
-                throw std::runtime_error("QSA admission image has no KV part");
+            // The MTP backend-KV half (native qwen3_5 session-snapshot semantics): the image
+            // carries `stored.backend_pages` device pages packed at the pool's page stride, the
+            // committed frontier they cover, and the sequence's valid draft KV. Read them into the
+            // contiguous staging (qsa_copy_image page-splits across the store's 8 MiB pages), then
+            // H2D them into the fresh backend space below.
+            std::uint64_t backend_bytes = 0;
+            if (stored.backend_pages != 0) {
+                const HostKVPageLayout backend_layout =
+                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+                backend_bytes = std::uint64_t(stored.backend_pages) * backend_layout.page_stride;
+            }
+            // Exact, not "at least": an image whose length disagrees with its own key would copy
+            // a shifted plane half into this lane, and nothing downstream could tell.
+            if (stored.bytes != state_bytes + plane_bytes + backend_bytes) {
+                throw std::runtime_error("QSA admission image is not its key's length");
             }
             std::vector<ImageRegion> regions;
             regions.reserve(chunks.size() + 1);
             for (const ImageChunk& chunk : chunks) {
                 regions.push_back(ImageRegion{chunk.data, chunk.bytes});
             }
-            // The MTP backend-KV half (native qwen3_5 session-snapshot semantics): the image
-            // carries `stored.backend_pages` device pages packed at the pool's page stride, the
-            // committed frontier they cover, and the sequence's valid draft KV. Read them into the
-            // contiguous staging (qsa_copy_image page-splits across the store's 8 MiB pages), then
-            // H2D them into the fresh backend space below.
-            if (stored.backend_pages != 0) {
-                const HostKVPageLayout backend_layout =
-                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
-                const std::uint64_t backend_bytes =
-                    std::uint64_t(stored.backend_pages) * backend_layout.page_stride;
-                if (stored.bytes < state_bytes + plane_bytes + backend_bytes) {
-                    throw std::runtime_error("QSA admission image has no MTP part");
-                }
+            if (backend_bytes != 0) {
                 if (stored.mtp_kv_valid > stored.backend_committed_frontier) {
                     throw std::logic_error("QSA stored image has mtp_kv_valid ahead of its frontier");
                 }
