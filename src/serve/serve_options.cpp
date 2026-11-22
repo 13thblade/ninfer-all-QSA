@@ -1927,13 +1927,20 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         // which the catalog's options configure; the server refuses it for the other families
         // once it knows the artifact's.
         options.hybrid_cache_flag  = hybrid_option_flag;
+        // catalog_option is null on the QSA streamed tier (qsa_streamed suppresses every
+        // catalog reason) and on a default Legacy run. std::string has no null assignment, so
+        // leave it empty; refuse_family_options rejects the flag for those families anyway.
         options.catalog_cache_flag =
-            original_cache_selected ? "--use-original-prefix-caching" : catalog_option;
+            original_cache_selected ? "--use-original-prefix-caching"
+                                    : (catalog_option != nullptr ? catalog_option : "");
     } else if (hybrid_option_flag != nullptr) {
+        const std::string catalog = original_cache_selected
+                                        ? std::string("--use-original-prefix-caching")
+                                        : (catalog_option != nullptr ? std::string(catalog_option)
+                                                                     : std::string("the default"));
         throw std::invalid_argument(
             std::string(hybrid_option_flag) + " configures the hybrid prefix cache, and " +
-            (original_cache_selected ? "--use-original-prefix-caching" : catalog_option) +
-            " selects the checkpoint catalog");
+            catalog + " selects the checkpoint catalog");
     }
     if (std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         !file.empty()) {
