@@ -324,7 +324,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                MTP drafts\n"
            "  --qsa-prefill                 Qwen3.8-27B with --qwen38-27b-qsa: run prefill\n"
            "                                on the QSA sparse branch too (default: prefill\n"
-           "                                stays dense). Overrides NINFER_QSA_DENSE_PREFILL\n" +
+           "                                stays dense). With --kv-resident every prefill\n"
+           "                                chunk reads staging, not the decode pool.\n"
+           "                                Overrides NINFER_QSA_DENSE_PREFILL\n" +
            std::string(product::kQsaTopBlocksHelp) +
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"

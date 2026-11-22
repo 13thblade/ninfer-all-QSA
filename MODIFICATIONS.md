@@ -232,10 +232,13 @@ offered under the same Apache-2.0 license.
   blocks, 1 to 65,536; unset or `0` keeps the artifact's own 512 blocks, and the
   value is fixed at startup so a captured graph replays the grid it captured.
 - `--qsa-prefill` (`ninfer-serve` only) sends prefill through the sparse branch
-  as well; it is refused without `--qwen38-27b-qsa`, and
-  `resolved_qsa_prefill()` (`program/planning/startup.cpp`) resolves it ahead of
-  the legacy `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the
-  default because upstream's wide-T QSA kernel is not yet optimised.
+  as well; with `--kv-resident` a sparse prefill reads the shared staging copy
+  of the layer, never the decode pool, and restoring a store image invalidates
+  the lane's residency maps at admission; it is refused without
+  `--qwen38-27b-qsa`, and `resolved_qsa_prefill()`
+  (`program/planning/startup.cpp`) resolves it ahead of the legacy
+  `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the default
+  because upstream's wide-T QSA kernel is not yet optimised.
 - `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
   `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
   resolved to the fully-resident sentinel) fall through to the shared

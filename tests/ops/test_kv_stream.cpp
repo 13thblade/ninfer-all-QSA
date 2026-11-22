@@ -521,6 +521,23 @@ int run_overflow_fallback(KvCacheStorage storage, std::uint32_t seed) {
     check(from_device<std::int32_t>(round_flags.p, 1)[0] == 0,
           "a clean round leaves the device round flag clear");
 
+    // An image restore replaces the host pages at the same logical positions. Start from
+    // the populated map above; the next resolve has to fetch even the old shortlist again.
+    ops::kv_stream_reset(layer.map, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto reset_table = from_device<std::int32_t>(layer.map.table, std::size_t(layer.blocks));
+    const auto reset_slots = from_device<std::int32_t>(layer.map.slot_block, std::size_t(slots));
+    const auto is_free = [](std::int32_t entry) { return entry == -1; };
+    check(std::all_of(reset_table.begin(), reset_table.end(), is_free), "reset evicts every block");
+    check(std::all_of(reset_slots.begin(), reset_slots.end(), is_free), "reset frees every slot");
+    for (std::size_t i = 0; i < layer.host.size(); ++i) {
+        std::memset(layer.host[i]->data(), 0x3c, row_bytes(layer.specs[i]) * kPage * kKvHeads);
+    }
+    sequence.resolve(1, stream);
+    failures += layer.check(label + " after host page replacement", stream);
+    const auto restored = from_device<std::int32_t>(layer.map.table, std::size_t(layer.blocks));
+    for (const auto block : anchor) { check(restored[block] >= 0, "restored block is resident"); }
+
     std::cout << label << ": need=" << control[10] << " placed=" << control[11]
               << " must_keep=" << control[12] << " kept=" << control[13] << '\n';
     CUDA_CHECK(cudaStreamDestroy(stream));

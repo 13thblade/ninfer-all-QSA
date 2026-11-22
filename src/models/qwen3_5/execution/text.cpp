@@ -1933,11 +1933,6 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         auto scope = work_.scope();
         Tensor selected{};
         Tensor counts{};
-        // The dense route reads each part through its own envelope: a segment's own
-        // frontier, or the call's envelope for a single-sequence pass.
-        const ops::CausalAttentionExecutionEnvelope part_envelope =
-            !active_segments_.empty() ? active_segments_[part_index].envelope
-                                      : *active_causal_attention_envelope_;
         // A prefill reads committed prompt columns, so it never shares the streamed pool: the
         // pool's fallback withholds draft columns, which a prefill does not have. Reading the
         // staged layer keeps every prefill column complete, and the pool then serves only decode
@@ -1957,7 +1952,7 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
         bool wide_stream_call = false;
         std::int32_t first_host = 0;
         if (qsa_stream != nullptr) {
-            if (!dense_prefill && W <= static_cast<std::int32_t>(qsa_stream->width)) {
+            if (phase != Phase::Prefill && W <= static_cast<std::int32_t>(qsa_stream->width)) {
                 // Streamed tier: the lane's prefix blocks the host copy does not hold source
                 // from the writers' stream images (the per-lane pinned segment table the
                 // admission's stage built); the host path serves the lane's own blocks.
@@ -1996,8 +1991,8 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 // One stream copy per lane: a prefill starting at position zero is a root
                 // request and begins a fresh sequence, so the lane's residency map starts
-                // empty. A prefill that resumes a catalogued continuation starts past zero
-                // and keeps the map its own decodes filled.
+                // empty. A live continuation keeps its own map; restoring an image has
+                // already invalidated the map at admission.
                 if (first_host == 0) {
                     ops::kv_stream_reset(stream_layer->map, stream);
                     qsa_stream->staged_lane  = -1;
@@ -2006,10 +2001,12 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
                 // stage(): one shared staging layer, filled from this (lane, layer)'s host
                 // copy. A change of lane, layer or lane tenure (or a frontier beyond what is
                 // staged) invalidates the cache, as qwen4_exp's kv_staged does.
-                if (qsa_stream->staged_lane != static_cast<std::int32_t>(lane) ||
+                const bool stage_stale =
+                    qsa_stream->staged_lane != static_cast<std::int32_t>(lane) ||
                     qsa_stream->staged_layer != full_attention_index ||
                     qsa_stream->staged_end < static_cast<std::uint32_t>(first_host) ||
-                    qsa_stream->staged_generation != qsa_stream->lane_generation[lane]) {
+                    qsa_stream->staged_generation != qsa_stream->lane_generation[lane];
+                if (stage_stale) {
                     const std::uint32_t used =
                         (static_cast<std::uint32_t>(first_host) + kPagedKVPageSize - 1U) /
                         static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -2085,6 +2082,9 @@ void TextContext::run_qsa(const QsaIndexerParameters& qsa, const Tensor& hidden,
             // the sparse Op does, and lets attn_merge_output apply the gate once. Prefill is
             // not a captured graph, so switching the route here leaves every decode/verify
             // graph untouched.
+            const auto& part_envelope = !active_segments_.empty()
+                                            ? active_segments_[part_index].envelope
+                                            : *active_causal_attention_envelope_;
             ops::causal_softmax_attention_cached(
                 q_span, call_positions,
                 {dimension(config_.attention->head_dim),

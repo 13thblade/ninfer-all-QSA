@@ -43,6 +43,16 @@ std::uint64_t ProgramImpl::qsa_state_image_bytes() const {
 
 // ---- the lane's retained states ---------------------------------------------------------------
 
+namespace {
+void invalidate_lane_staging(QsaStreamState& stream, std::uint32_t lane) noexcept {
+    if (stream.staged_lane == static_cast<std::int32_t>(lane)) {
+        stream.staged_lane  = -1;
+        stream.staged_layer = -1;
+        stream.staged_end   = 0;
+    }
+}
+} // namespace
+
 QsaLaneRetentionView ProgramImpl::qsa_retention_view(std::uint32_t lane) const {
     QsaLaneRetentionView view;
     if (lane >= max_concurrency) { return view; }
@@ -62,11 +72,7 @@ void ProgramImpl::qsa_end_lane_tenure(std::uint32_t lane) noexcept {
     auto& generation = qsa_stream_state->lane_generation[lane];
     ++generation;
     if (generation == 0) { ++generation; }
-    if (qsa_stream_state->staged_lane == static_cast<std::int32_t>(lane)) {
-        qsa_stream_state->staged_lane  = -1;
-        qsa_stream_state->staged_layer = -1;
-        qsa_stream_state->staged_end   = 0;
-    }
+    invalidate_lane_staging(*qsa_stream_state, lane);
 }
 
 void ProgramImpl::qsa_drop_lane_retention(std::uint32_t lane, bool save_image) noexcept {
@@ -477,6 +483,14 @@ runtime::ContextTransactionReserveStatus ProgramImpl::qsa_reserve_materializatio
             }
             qsa_copy_image(regions, pages, QsaContinuationStore::kHostPageBytes, false,
                            state_bytes / QsaContinuationStore::kHostPageBytes);
+            // The image replaces what these positions mean. Neither a resident block nor the
+            // shared staging copy can serve this lane until refilled from the restored planes.
+            auto& stream = *qsa_stream_state;
+            invalidate_lane_staging(stream, lane);
+            const std::size_t begin = static_cast<std::size_t>(lane) * stream.layers;
+            for (std::uint32_t layer = 0; layer < stream.layers; ++layer) {
+                ops::kv_stream_reset(stream.layer_states[begin + layer].map, device.stream);
+            }
             state_whole = quote.whole;
         }
 
