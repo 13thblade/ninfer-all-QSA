@@ -13,10 +13,9 @@ move without re-quantising. Its encoded rows keep the stored order, and their im
 of the grouped activation. Its values, like every source's, are in the grouped order, so a recipe
 that re-quantises ``ssm_out`` writes grouped columns and no gather.
 
-The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
-them as BF16 words, or as stored blocks -- Q8_0 in Underdog-Saluki and similar releases, Q4_K in
-Unsloth's UD-Q4_K_XL -- whose dequantized values are rounded to BF16: the one place a stored value
-changes.
+The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. A BF16 donor
+can supply them when every control matches the GGUF's BF16 words or reference Q8_0 encoding.
+Otherwise the GGUF supplies its BF16 words or its block values rounded to BF16.
 
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
@@ -33,8 +32,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import sys
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -585,125 +583,77 @@ GDN_CONTROLS_ENV = "NINFER_GDN_CONTROLS_BF16"
 # BF16 release's own BF16 words (verified bit-identical to the FP8 release's unquantized
 # in_proj_a/b, which that release lists in modules_to_not_convert); the env override may point
 # at this asset file OR at a full HF directory holding the same tensors.
-_GDN_ASSET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "assets", "gdn_controls_bf16.safetensors")
-_GDN_CONTROL_KEY = re.compile(r"^blk\.(\d+)\.ssm_(alpha|beta)\.weight$")
-_native_controls_state: list = [None, False]   # [provider | None, probed?]
-_native_sanity_done: list = [False]
+_GDN_ASSET_PATH = Path(__file__).with_name("assets") / "gdn_controls_bf16.safetensors"
 
 
-class _NativeGdnControls:
-    """BF16 GDN controls in grouped head order, VERBATIM (the converter must NOT re-untile),
-    read from a compact asset safetensors (default) or a full FP8 HF release directory.
-    Keys are the official HF names, shared by both sources."""
+def _matching_gdn_controls(gguf: GGUFFile) -> dict[str, LogicalSource]:
+    """Return all donor projections only if their stored representation matches this GGUF."""
+    setting = os.environ.get(GDN_CONTROLS_ENV, "")
+    if setting.strip().lower() in ("off", "none", "0"):
+        return {}
+    source = Path(setting) if setting else _GDN_ASSET_PATH
+    if not source.exists():
+        return {}
 
-    def __init__(self, source: str) -> None:
-        import json
+    controls = {
+        f"blk.{layer}.ssm_{tensor}.weight": f"model.language_model.layers.{layer}.linear_attn.in_proj_{role}.weight"
+        for layer in range(LAYERS) if not full_attention(layer)
+        for tensor, role in (("alpha", "a"), ("beta", "b"))
+    }
+    if any(gguf.info(name).type_id not in (TYPE_BF16, GGML_Q8_0) for name in controls):
+        return {}
 
-        from safetensors import safe_open
+    from safetensors import SafetensorError, safe_open
 
-        self._safe_open = safe_open
-        self._cache: dict = {}
-        if os.path.isfile(source):                       # asset file
-            self.asset = True
-            self._handle = safe_open(source, framework="pt")
-            self._keys = set(self._handle.keys())
-        else:                                            # FP8 HF directory (compat)
-            self.asset = False
-            self.root = source
-            index = os.path.join(source, "model.safetensors.index.json")
-            if not os.path.exists(index):
-                raise ValueError(
-                    f"{GDN_CONTROLS_ENV}: {source} is neither an asset file nor an HF release directory")
-            self.wm = json.load(open(index, encoding="utf-8"))["weight_map"]
-
-    def get(self, layer: int, role: str):
-        key = f"model.language_model.layers.{layer}.linear_attn.in_proj_{role}.weight"
-        if key not in (self._keys if self.asset else self.wm):
-            return None
-        cached = self._cache.get((layer, role))
-        if cached is not None:
-            return cached
-        if self.asset:
-            tensor = self._handle.get_tensor(key)
-        else:
-            with self._safe_open(os.path.join(self.root, self.wm[key]), framework="pt") as handle:
-                tensor = handle.get_tensor(key)
-        tensor = tensor.detach().to("cpu").to(torch.bfloat16)
-        if tuple(tensor.shape) != (GDN_VALUE_HEADS, HIDDEN):
-            raise ValueError(
-                f"{key}: native GDN control is {tuple(tensor.shape)}, expected "
-                f"({GDN_VALUE_HEADS}, {HIDDEN})")
-        self._cache[(layer, role)] = tensor
-        return tensor
-
-
-def _native_gdn_controls():
-    if not _native_controls_state[1]:
-        raw = os.environ.get(GDN_CONTROLS_ENV)
-        if raw is not None and raw.strip().lower() in ("off", "none", "0"):
-            source = None                                  # explicit disable -> original path
-        else:
-            source = raw or (_GDN_ASSET_PATH if os.path.exists(_GDN_ASSET_PATH) else None)
-            if source is None:
-                # The asset is not committed and *.safetensors is gitignored, so a fresh
-                # checkout would otherwise graft nothing and say nothing. Degrading here is
-                # legal but must be visible: the GDN controls then come from the (quantized)
-                # GGUF, which measurably changes generation.
-                print(
-                    f"warning: {GDN_CONTROLS_ENV} is unset and the native BF16 GDN control "
-                    f"asset is missing ({_GDN_ASSET_PATH}); the GDN controls will be taken "
-                    "from the GGUF as stored. Generate the asset with "
-                    "tools/convert/extract_gdn_controls.py or set "
-                    f"{GDN_CONTROLS_ENV}=off to silence this.",
-                    file=sys.stderr,
-                )
-        _native_controls_state[0] = _NativeGdnControls(source) if source else None
-        _native_controls_state[1] = True
-    return _native_controls_state[0]
-
-
-def _bf16_words_to_f32(words):
-    return (words.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-
-
-def _native_matches_release(native, gguf_grouped):
-    """Each native (grouped) row must best-match the same gguf grouped row."""
-    n = native.to(torch.float32).numpy()
-    if gguf_grouped.dtype == np.uint16:
-        g = _bf16_words_to_f32(np.asarray(gguf_grouped))
+    # Group by shard so a compact asset or an HF shard is opened just once.
+    shards: dict[Path, list[tuple[str, str]]] = {}
+    if source.is_dir():
+        index = source / "model.safetensors.index.json"
+        if not index.is_file():
+            return {}
+        with index.open(encoding="utf-8") as stream:
+            try:
+                weight_map = json.load(stream)["weight_map"]
+            except (ValueError, KeyError, TypeError):
+                return {}
+        if not isinstance(weight_map, dict):
+            return {}
+        for name, key in controls.items():
+            if not isinstance(weight_map.get(key), str):
+                return {}
+            shards.setdefault(source / weight_map[key], []).append((name, key))
     else:
-        g = np.asarray(gguf_grouped).astype(np.float32)
-    n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-12)
-    g = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-12)
-    sim = n @ g.T
-    return float((sim.argmax(axis=1) == np.arange(sim.shape[0])).mean()) >= 0.95
+        shards[source] = list(controls.items())
+
+    matched = {}
+    for shard, entries in shards.items():
+        if not shard.is_file():
+            return {}
+        try:
+            with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
+                for name, key in entries:
+                    if key not in keys:
+                        return {}
+                    native = handle.get_tensor(key)
+                    if native.dtype != torch.bfloat16 or tuple(native.shape) != (GDN_VALUE_HEADS, HIDDEN):
+                        return {}
+                    if gguf.info(name).type_id == TYPE_BF16:
+                        reference = native.contiguous().view(torch.uint16).numpy()
+                        stored = gguf.read_bf16_words(name)
+                    else:
+                        reference = quantize_q8_0(native.float().numpy())
+                        stored = gguf.read_blocks(name)
+                    if not np.array_equal(reference, untile(stored, 1)):
+                        return {}
+                    matched[name] = array_source(native, f"{name}[native-BF16-grouped]")
+        except (FileNotFoundError, SafetensorError):
+            return {}
+    return matched
 
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
-    """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, encoded values (Q8_0, Q4_K, ...) rounded to BF16."""
-
-    # Route-B graft: when a native FP8 HF release is configured, copy its BF16 controls straight
-    # into the grouped a_projection/b_projection. They are already grouped (the published GGUF
-    # stores them tiled, which this converter untiles); re-untile would double-permute the heads.
-    provider = _native_gdn_controls()
-    matched = _GDN_CONTROL_KEY.match(tensor)
-    if provider is not None and matched:
-        native = provider.get(int(matched.group(1)), "a" if matched.group(2) == "alpha" else "b")
-        if native is not None:
-            if not _native_sanity_done[0]:
-                gguf_grouped = (
-                    untile(gguf.read_bf16_words(tensor), 1)
-                    if gguf.info(tensor).type_id == TYPE_BF16
-                    else untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1))
-                if not _native_matches_release(native, gguf_grouped):
-                    raise ValueError(
-                        f"{GDN_CONTROLS_ENV}: the native BF16 GDN controls do not match the "
-                        f"release's grouped order at {tensor}; the configured source is not the "
-                        "same model as this GGUF (or is in an unexpected head order).")
-                _native_sanity_done[0] = True
-            return array_source(native.contiguous(), f"{tensor}[native-BF16-grouped]")
+    """Read the GGUF's GDN control in grouped head order, rounded to BF16 for the engine."""
 
     if gguf.info(tensor).type_id != TYPE_BF16:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
@@ -839,6 +789,7 @@ def text_sources(
     BF16 output head is a direct source."""
 
     vocabulary = stored_vocabulary(gguf) if vocabulary is None else vocabulary
+    native_controls = _matching_gdn_controls(gguf)
     encoded = {
         "text/token_embedding": block_source(
             gguf,
@@ -880,7 +831,10 @@ def text_sources(
             tiled_input_columns(),
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            direct[n + role] = gdn_control_source(gguf, g + tensor)
+            name = g + tensor
+            direct[n + role] = (
+                native_controls[name] if native_controls else gdn_control_source(gguf, name)
+            )
         ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")

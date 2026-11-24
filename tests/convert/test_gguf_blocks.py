@@ -210,6 +210,53 @@ def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
     assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))
 
 
+@pytest.mark.parametrize("change", ["none", "scale", "code", "bf16", "unsupported", "missing"])
+def test_gdn_donor_requires_every_stored_byte(tmp_path, monkeypatch, capsys, change):
+    from safetensors.torch import save_file
+
+    monkeypatch.setattr(gguf_blocks, "LAYERS", 1)
+    monkeypatch.setattr(gguf_blocks, "HIDDEN", 32)
+    asset = tmp_path / "donor.safetensors"
+    monkeypatch.setenv(gguf_blocks.GDN_CONTROLS_ENV, str(asset))
+    # Peak 127 gives a Q8_0 scale of exactly 1. Distinct rows detect head-order mistakes.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    codes = np.arange(heads, dtype=np.int8)[:, None].repeat(32, axis=1)
+    codes[:, 0] = 127
+    a = torch.from_numpy(codes).to(torch.bfloat16)
+    b = -a
+    key = "model.language_model.layers.0.linear_attn.in_proj_"
+    native = {key + "a.weight": a, key + "b.weight": b}
+    if change == "missing":
+        del native[key + "b.weight"]
+    save_file(native, str(asset))
+    tiled = np.arange(heads).reshape(16, 3).T.ravel()
+    words = a.view(torch.uint16).numpy()[tiled].copy()
+    blocks = np.empty((heads, 34), dtype=np.uint8)
+    blocks[:, :2] = [0, 0x3C]
+    blocks[:, 2:] = (-codes[tiled]).view(np.uint8)
+    type_b = TYPE_Q8_0
+    if change == "bf16":
+        words[-1, -1] ^= 1
+    if change in ("scale", "code"):
+        blocks[-1, 0 if change == "scale" else -1] ^= 1
+    if change == "unsupported":
+        type_b, blocks = 2, np.zeros((heads, 18), dtype=np.uint8)  # Q4_0
+    path = tmp_path / "controls.gguf"
+    alpha, beta = "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"
+    write_gguf(path, {}, [(alpha, (heads, 32), 30, words.tobytes()),
+                          (beta, (heads, 32), type_b, blocks.tobytes())])
+    with GGUFFile(path) as gguf:
+        match = gguf_blocks._matching_gdn_controls(gguf)
+        if change == "none":
+            assert torch.equal(match[alpha].rows(0, heads), a)
+            assert torch.equal(match[beta].rows(0, heads), b)
+        else:
+            assert match == {}
+        asset.unlink()
+        assert gguf_blocks._matching_gdn_controls(gguf) == {}
+    assert capsys.readouterr() == ("", "")
+
+
 SSM_OUT = "blk.0.ssm_out.weight"
 OUTPUT = "text/layers/0/gdn/output"
 GROUPED = "text/layers/0/gdn/core_output"

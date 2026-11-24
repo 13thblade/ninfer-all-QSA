@@ -284,11 +284,10 @@ offered under the same Apache-2.0 license.
   `gdn_norm_gating_proj`, `gdn_input_proj` and `rmsnorm_rope` kernels reject FP32
   operands. Its parser (`build_parser`) pins the default that packs the indexed
   proposal head, with an explicit opt-out.
-- `qsa_graft_recipe.py` grafts the indexer tensors and the native BF16 GDN
-  controls onto an artifact converted from another quantization; the donor is
-  optional, and `extract_indexer_tensors.py` / `extract_gdn_controls.py` write the
-  manifests under `tools/convert/assets/` that make a graft reproducible. A
-  missing asset warns loudly instead of falling back to a machine-local path.
+- `qsa_graft_recipe.py` grafts the indexer. The shared GGUF converter uses native BF16
+  GDN controls when the whole donor matches the stored BF16 words or Q8_0 bytes,
+  including scales. A missing or incompatible GDN donor silently selects the GGUF controls.
+  The indexer and GDN extraction scripts write manifests under `tools/convert/assets/`.
   Both routes resolve the indexer norms' direct format through
   `qsa_gguf.indexer_direct_format(config)`, so a graft carries the same FP32 norms
   as an artifact converted straight from a QSA GGUF.

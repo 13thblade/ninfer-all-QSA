@@ -6,7 +6,7 @@
 
 支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。
 
-注：引擎内核对 GDN A/B controls 张量仅支持 BF16 精度，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失，因此本仓库的格式转换器从Qwen官方原生精度中剪裁了对应的 BF16 张量并进行嫁接，张量文件见 release。QSA注意力的 indexer 张量也见release，上游对QSA indexer会自动转换成FP32+BF16混合精度，且没有完整的FP32内核，因此本fork直接提供FP32+BF16混合精度版本。转换张量文件默认路径为`tools\convert\assets`。
+引擎以 BF16 存储 GDN A/B。转换时按模型预检全部 96 个控制矩阵：BF16 比较原始位，Q8_0 比较重新编码后的缩放系数和整数码。统一 head 顺序后全部字节相同，才使用原生 BF16 donor；缺少 donor、其他格式或任一不匹配时，静默使用 GGUF 自身的权重。可用 `NINFER_GDN_CONTROLS_BF16` 指定 donor 文件或 HF 目录，设为 `off` 可直接使用 GGUF。QSA注意力的 indexer 张量也见release，上游对QSA indexer会自动转换成FP32+BF16混合精度，且没有完整的FP32内核，因此本fork直接提供FP32+BF16混合精度版本。转换张量文件默认路径为`tools\convert\assets`。
 
 优化了KV缓存前缀复用的策略，并修复了几个相关的bug。
 
@@ -72,7 +72,7 @@ This repository adds support for **Qwen3.8-27B-QSA** to ninfer-all. This model g
 
 It supports the ViT and MTP of Qwen3.8-27B, and YaRN for contexts up to 1M. The script that grafts QSA attention onto any GGUF Qwen3.8-27B and converts it to the ninfer format lives in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point.
 
-Note: the engine's kernels accept only BF16 for the GDN A/B control tensors; upstream's converter dequantizes lower-precision models to BF16, which for some quantizations (Q4_K, Q8, …) both costs extra space and loses accuracy. This fork's converter instead cuts the corresponding BF16 tensors out of Qwen's official native-precision model and grafts them in; the tensor file is provided in the release. The QSA attention indexer tensors are also provided in the release: upstream converts the QSA indexer to a mixed FP32+BF16 precision automatically and has no full FP32 kernel, so this fork ships the FP32+BF16 mixed-precision version directly. The conversion tensors' default directory is `tools/convert/assets`.
+The engine stores GDN A/B controls in BF16. The converter uses the native BF16 donor only when all 96 controls match the GGUF byte for byte in the same head order (BF16 words or re-encoded Q8_0 scales and codes). A missing donor, another format or any mismatch silently selects the GGUF weights for the whole model. `NINFER_GDN_CONTROLS_BF16` accepts a donor file or HF directory; set it to `off` to use the GGUF directly. The QSA attention indexer tensors are also provided in the release: upstream converts the QSA indexer to a mixed FP32+BF16 precision automatically and has no full FP32 kernel, so this fork ships the FP32+BF16 mixed-precision version directly. The conversion tensors' default directory is `tools/convert/assets`.
 
 Optimized the KV cache prefix reuse strategy and fixed several related bugs.
 
