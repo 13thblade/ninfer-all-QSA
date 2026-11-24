@@ -21,7 +21,17 @@ struct KVEntitlementShape {
     std::uint32_t capacity           = 0; // --max-context, each sequence's ceiling
     std::uint32_t draft_window       = 0;
     SpeculativeBackend backend       = SpeculativeBackend::None;
+    std::uint32_t verify_tail_tokens = 0; // Extra positions touched by a full-width QSA verify.
 };
+
+// Prefill produces the first output. Each later output may need its own verify call, even
+// when no draft is accepted. Leave room for every column that call can physically write.
+[[nodiscard]] constexpr std::uint32_t
+context_output_budget(const KVEntitlementShape& shape, std::uint32_t prompt_tokens) noexcept {
+    if (prompt_tokens == 0 || prompt_tokens > shape.capacity) { return 0; }
+    const std::uint32_t room = shape.capacity - prompt_tokens;
+    return 1U + room - std::min(room, shape.verify_tail_tokens);
+}
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -46,7 +56,7 @@ kv_page_entitlement(const KVEntitlementShape& shape, std::uint32_t prompt_tokens
 
 // The largest output whose entitlement, beside `headroom` pages of each pool left free for the
 // prefix cache's copies, fits one lane's share of each pool (`*_share_pages` = pool pages / lanes),
-// clamped to the remaining context `capacity - prompt + 1`. A prompt that leaves no output beside
+// clamped to the context output budget. A prompt that leaves no output beside
 // the headroom is sized without it. One that alone overruns a lane's share can never run beside
 // full-share lanes; it keeps the remaining context rather than an arbitrary cut. Zero only for an
 // empty or over-long prompt.
@@ -54,8 +64,8 @@ kv_page_entitlement(const KVEntitlementShape& shape, std::uint32_t prompt_tokens
 concurrent_output_budget(const KVEntitlementShape& shape, std::uint32_t main_share_pages,
                          std::uint32_t backend_share_pages, std::uint32_t prompt_tokens,
                          KVPageEntitlement headroom) noexcept {
-    if (prompt_tokens == 0 || prompt_tokens > shape.capacity) { return 0; }
-    const std::uint32_t remaining = shape.capacity - prompt_tokens + 1U;
+    const std::uint32_t remaining = context_output_budget(shape, prompt_tokens);
+    if (remaining == 0) { return 0; }
     const auto fits = [&](std::uint32_t output) {
         const KVPageEntitlement need = kv_page_entitlement(shape, prompt_tokens, output);
         return std::uint64_t{need.main_pages} + headroom.main_pages <= main_share_pages &&

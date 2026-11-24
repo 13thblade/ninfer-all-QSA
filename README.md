@@ -43,6 +43,8 @@ ninfer-serve model.ninfer --max-context 262144\
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
 
+QSA 配合 MTP 时，每条请求为完整验证批次留出尾部位置数，取 MTP 与已启用的 n-gram 草稿窗口中的较大值。接近上下文上限时会提前正常结束生成。合法提示词仍可取得 prefill 生成的首个 token。
+
 ## 实测
 
 单卡 RTX 3090 Ti 24 GB、`Qwen3.8-27B-QSA-UD-Q4_K_M.ninfer`、int8 KV、`--qwen38-27b-qsa`、`--qsa-prefill`、`--max-context 262144`、`--qsa-top-blocks 512`、`--kv-resident 8192`、**MTP 草稿开启（draft-tokens 3）、ngram 草稿关闭**、贪心解码；`--wddm-evictable-budget` 开启、`--vision-residency overlay`、`--prefill-chunk 1024`、`--kv-headroom-mib 0`、`--kv-capacity auto`（显式设置--kv-headroom-mib时须显式设置--kv-capacity auto）。Decode速度基于真实代码任务测试得出。
@@ -106,6 +108,8 @@ ninfer-serve model.ninfer --max-context 262144\
   --qwen38-27b-qsa --qsa-prefill --qsa-top-blocks 1024 --kv-resident 16384 \
   --spec mtp --draft-tokens 3 --ngram-draft-tokens 0
 ```
+
+With QSA and MTP, each request leaves room at the end of the context for a full verification batch. The margin in tokens is the larger of the MTP and enabled n-gram draft windows. Generation can end early at this boundary. A valid prompt can still produce its first token from prefill.
 
 ## Measurements
 

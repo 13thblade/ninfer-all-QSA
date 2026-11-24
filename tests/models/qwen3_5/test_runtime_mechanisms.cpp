@@ -624,6 +624,18 @@ void test_concurrent_output_budget() {
     const KVEntitlementShape plain{.capacity = 2048, .backend = SpeculativeBackend::None};
     const KVEntitlementShape mtp{
         .capacity = 2048, .draft_window = 4, .backend = SpeculativeBackend::Mtp};
+    // An accepted span may be just one token per round. Even that last verify must fit;
+    // a valid prompt always gets its first token from prefill.
+    constexpr KVEntitlementShape qsa_mtp{
+        .capacity = 262144, .draft_window = 3, .backend = SpeculativeBackend::Mtp,
+        .verify_tail_tokens = 3};
+    static_assert(q36::detail::context_output_budget(qsa_mtp, 262140) == 2);
+    static_assert(q36::detail::context_output_budget(qsa_mtp, 262141) == 1);
+    static_assert(q36::detail::context_output_budget(qsa_mtp, 262144) == 1);
+    constexpr KVEntitlementShape qsa_copy{
+        .capacity = 262144, .draft_window = 3, .backend = SpeculativeBackend::Mtp,
+        .verify_tail_tokens = 8};
+    static_assert(q36::detail::concurrent_output_budget(qsa_copy, 4096, 4096, 262136, {}) == 1);
     const KVEntitlementShape dflash{
         .capacity = 2048, .draft_window = 8, .backend = SpeculativeBackend::DFlash};
     // Issue #178: one lane, --max-context = --kv-capacity = 229,376 (3,584 pages), DFlash2 (no

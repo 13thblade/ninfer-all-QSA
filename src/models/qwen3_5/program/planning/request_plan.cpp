@@ -233,15 +233,16 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 
 KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
     return KVEntitlementShape{
-        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend};
+        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend,
+        .verify_tail_tokens = qsa_indexer_state && speculative_backend == SpeculativeBackend::Mtp
+                                  ? widest_verify_window() : 0U};
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
     // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
     // not compete for the pool up front: the remaining context stays the budget.
     if (context_cache.kv_lease_growth) {
-        return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
-                                                              : capacity - prompt_tokens + 1U;
+        return context_output_budget(kv_entitlement_shape(), prompt_tokens);
     }
     // Each lane's fair share of every pool admission reserves from, at the pools' fixed physical
     // extent: an overlay Vision window's transient loan is not a reason to shrink the budget.
@@ -403,7 +404,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
     base->summary.requested_output_tokens = options.requested_output_tokens;
     const std::uint32_t capacity_output =
-        capacity - base->summary.prompt_tokens + static_cast<std::uint32_t>(1);
+        context_output_budget(kv_entitlement_shape(), base->summary.prompt_tokens);
     base->summary.effective_output_tokens =
         std::min(options.requested_output_tokens, capacity_output);
     base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output

@@ -847,6 +847,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                        mtp_minimum_adaptive_window(draft_window), draft_window);
     }
     const std::uint32_t width = verify_window + 1;
+    if (qsa_indexer_state && width > capacity - maximum_frontier) {
+        throw std::logic_error("QSA MTP verification exceeds its planned context budget");
+    }
 
     const auto started = Clock::now();
     try {
