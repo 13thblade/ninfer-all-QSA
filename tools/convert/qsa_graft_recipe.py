@@ -171,6 +171,14 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
         check_donor(donor, block_count=target.kv.get("qwen35.block_count"))
         indexer_sources = qsa_gguf.sources(donor, dtype=indexer_dtype)
 
+    # Pack the base before registering the extra logical parameters.
+    qwen3_8_27b_gguf(model, recipe, sources)
+    attach_indexer(model, recipe, indexer_sources)
+
+
+def attach_indexer(model, recipe, indexer_sources) -> None:
+    """Attach the learned indexer to an already configured dense 27B recipe."""
+    indexer_dtype = qsa_gguf.indexer_direct_format(model.config)
     # A donor without a per-token key norm (Prefrontal-AI's long-16k-1M-heavy run) supplies
     # four tensors per layer; registration and the parameter list follow whatever the source
     # has, and the artifact's missing binding is what selects the Op's pool-then-norm path.
@@ -182,10 +190,7 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
         for role in roles:
             recipe.add_parameter(qsa_gguf.parameter_name(layer, role))
 
-    # Text tower, MTP block, vision and DFlash2 come from the target.
-    qwen3_8_27b_gguf(model, recipe, sources)
-
-    # ... and the indexer parameters are filled from the asset or the donor. Both
+    # The indexer parameters are filled from the asset or the donor. Both
     # un-fold the stored 1 + w norms, so the bytes match the official path.
     formats: dict[str, str] = {}
     for name, source in indexer_sources.items():
@@ -201,4 +206,4 @@ def graft_qsa_indexer(model, recipe, sources) -> None:
 
 configure = graft_qsa_indexer
 
-__all__ = ["check_donor", "configure", "donor_path", "graft_qsa_indexer", "has_indexer"]
+__all__ = ["attach_indexer", "check_donor", "configure", "donor_path", "graft_qsa_indexer", "has_indexer"]

@@ -22,6 +22,7 @@ import argparse
 from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 import json
 import time
@@ -188,14 +189,14 @@ def _add_dflash2_head_uses(recipe, params) -> None:
             recipe.policies[(name, "dflash2/final_hidden")] = policy
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def conversion_parser(description: str, *, with_dflash2: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", required=True, help="QUASAR safetensors directory")
-    parser.add_argument(
-        "--dflash2",
-        required=True,
-        help="reference v3 artifact to graft the dflash2 draft from",
-    )
+    parser.set_defaults(dflash2=None)
+    if with_dflash2:
+        parser.add_argument(
+            "--dflash2", required=True, help="reference v3 artifact to graft the dflash2 draft from"
+        )
     parser.add_argument("--out", required=True, help="output .ninfer path")
     parser.add_argument(
         "--q8-scope",
@@ -222,8 +223,10 @@ def main() -> None:
         type=int,
         help="split the artifact into files of at most this many bytes (default: one file)",
     )
-    args = parser.parse_args()
+    return parser
 
+
+def convert(args: argparse.Namespace, *, indexer_asset: Path | None = None) -> None:
     out = Path(args.out)
     report_path = Path(str(out) + ".conversion.json")
     if out.exists() or report_path.exists():
@@ -234,21 +237,30 @@ def main() -> None:
     model = build_model(base, components=("text", "vision", "mtp"))
     recipe = Recipe(model)
     apply_quasar_recipe(model, recipe, {"quantized": base}, args.q8_scope)
+    if indexer_asset is not None:
+        from tools.convert import qsa_gguf
+        from tools.convert.qsa_graft_recipe import attach_indexer
+        from tools.convert.ternary import HIDDEN, LAYERS
+
+        config = model.config
+        attention_layers = tuple(
+            i for i, kind in enumerate(config["layer_types"]) if kind == "full_attention"
+        )
+        if (
+            "num_experts" in config
+            or config["hidden_size"] != HIDDEN
+            or config["num_hidden_layers"] != LAYERS
+            or attention_layers != qsa_gguf.qsa_layers()
+        ):
+            raise ValueError("the QSA indexer requires the dense Qwen3.8-27B attention layout")
+        indexer = qsa_gguf.sources_from_asset(indexer_asset, qsa_gguf.indexer_direct_format(config))
+        attach_indexer(model, recipe, indexer)
     if args.proposal:
         add_official_proposal(
             recipe, ranking=args.ranking, rows=args.proposal_rows)
-    _add_dflash2_head_uses(recipe, model.parameters)
+    if args.dflash2:
+        _add_dflash2_head_uses(recipe, model.parameters)
     prepared = recipe.prepare(device=args.device, rows_per_chunk=args.rows_per_chunk)
-
-    # Read the grafted dflash2 payload while the reference is still open.
-    dflash2_artifact_id = None
-    with Artifact(args.dflash2) as official:
-        dflash2_artifact_id = official.artifact_id.hex()
-        graft = _collect_dflash2(official)
-        dflash2_data = {
-            graft["id_map"][old_id]: official.read_object(old_id)
-            for old_id in graft["old_ids"]
-        }
 
     resources = [
         ResourceSpec(key, len(value)) for key, value in model.resources.items()
@@ -257,32 +269,48 @@ def main() -> None:
         resources
         + [job.spec for job in prepared.weights]
         + [spec for spec, _ in prepared.auxiliaries]
-        + graft["specs"]
     )
     components = dict(model.components)
-    components["dflash2"] = graft["component"]
     bindings = dict(prepared.bindings)
-    bindings.update(graft["bindings"])
-    uses = list(prepared.uses) + graft["uses"]
+    uses = list(prepared.uses)
     provenance = {
         "model": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 (compressed-tensors nvfp4-pack-quantized)",
-        "dflash2_source": str(args.dflash2),
-        "dflash2_artifact_id": dflash2_artifact_id,
         "q8_scope": args.q8_scope,
         "method": (
             "import_encoded (nvfp4, bit-exact) for quantised Linear projections; "
             "grouped_absmax q8_g32_fp16 for MTP head (scope=%s) + shared lm_head; "
-            "cast_direct bf16 for GDN a/b (48-row, upcast); source-format otherwise; "
-            "dflash2 grafted verbatim" % args.q8_scope
+            "cast_direct bf16 for GDN a/b (48-row, upcast); source-format otherwise" % args.q8_scope
         ),
     }
+    dflash2_data = {}
+    if args.dflash2:
+        with Artifact(args.dflash2) as official:
+            graft = _collect_dflash2(official)
+            specs.extend(graft["specs"])
+            components["dflash2"] = graft["component"]
+            bindings.update(graft["bindings"])
+            uses.extend(graft["uses"])
+            dflash2_data = {
+                graft["id_map"][old_id]: official.read_object(old_id)
+                for old_id in graft["old_ids"]
+            }
+            provenance["dflash2_source"] = str(args.dflash2)
+            provenance["dflash2_artifact_id"] = official.artifact_id.hex()
+            provenance["method"] += "; dflash2 grafted verbatim"
+    if indexer_asset is not None:
+        with indexer_asset.open("rb") as asset:
+            digest = hashlib.file_digest(asset, "sha256").hexdigest()
+        provenance["qsa_indexer"] = {
+            "asset": indexer_asset.name,
+            "sha256": digest,
+            "tensors": len(indexer),
+            "gdn_controls": "QUASAR checkpoint",
+        }
     if args.proposal:
         provenance["proposal"] = {
             "rows": args.proposal_rows,
             "ranking": str(args.ranking),
-            "method": ("indexed proposal head gathered from the QUASAR output "
-                       "head, grouped_absmax; dflash2/final_hidden head uses "
-                       "declared for the grafted dflash2 component"),
+            "method": "indexed proposal head gathered from the QUASAR output head, grouped_absmax",
         }
 
     report = {
@@ -351,6 +379,10 @@ def main() -> None:
     base.close()
     print(f"wrote {out} ({report['payload_bytes']} payload bytes, {len(specs)} objects) in {report['seconds']:.1f}s")
     print("formats:", report["formats"])
+
+
+def main() -> None:
+    convert(conversion_parser(__doc__).parse_args())
 
 
 if __name__ == "__main__":

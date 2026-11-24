@@ -88,6 +88,12 @@ of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFEREN
 PATH`: it imports the NVFP4 codes verbatim, keeps the BF16 parameters, and takes the DFlash2 draft
 from a reference v3 artifact.
 
+For the QSA variant with the QUASAR text tower, Vision, MTP and indexed proposal head, run
+`python -m tools.convert.quasar_nvfp4_qsa --model DIR --out MODEL.ninfer`. It loads the
+long-16k-1M-heavy indexer from `tools/convert/assets` by default. `--indexer-asset PATH`
+selects an extracted indexer. The driver sets `NINFER_GDN_CONTROLS_BF16=off` and derives
+the GDN A/B weights from the QUASAR checkpoint.
+
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
