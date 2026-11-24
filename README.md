@@ -6,7 +6,7 @@
 
 支持Qwen3.8-27B的ViT和MTP，允许使用YaRN扩展上下文到1M。把任意 GGUF 格式的 Qwen3.8-27B 嫁接QSA注意力并转成 ninfer 格式的脚本位于本仓库 `tools/convert/`，一键入口是 `tools/convert/convert_qsa27b.py`。
 
-引擎以 BF16 存储 GDN A/B。转换时按模型预检全部 96 个控制矩阵：BF16 比较原始位，Q8_0 比较重新编码后的缩放系数和整数码。统一 head 顺序后全部字节相同，才使用原生 BF16 donor；缺少 donor、其他格式或任一不匹配时，静默使用 GGUF 自身的权重。可用 `NINFER_GDN_CONTROLS_BF16` 指定 donor 文件或 HF 目录，设为 `off` 可直接使用 GGUF。QSA注意力的 indexer 张量也见release，上游对QSA indexer会自动转换成FP32+BF16混合精度，且没有完整的FP32内核，因此本fork直接提供FP32+BF16混合精度版本。转换张量文件默认路径为`tools\convert\assets`。
+引擎以 BF16 存储 GDN A/B controls，上游的格式转换器对较低精度的模型会反量化成 BF16，这对一些量化精度（如Q4_K\Q8等）不仅会额外占用空间，还会造成损失。转换时按模型预检全部 96 个控制矩阵：Q8_0 比较重新编码后的缩放系数和整数码。统一 head 顺序后全部字节相同，才使用原生 BF16 donor；缺少 donor、其他格式或任一不匹配时，静默使用 GGUF 自身的权重。可用 `NINFER_GDN_CONTROLS_BF16` 指定 donor 文件或 HF 目录，设为 `off` 可直接使用 GGUF。QSA注意力的 indexer 张量也见release，上游对QSA indexer会自动转换成FP32+BF16混合精度，且没有完整的FP32内核，因此本fork直接提供FP32+BF16混合精度版本。转换张量文件默认路径为`tools\convert\assets`。
 
 优化了KV缓存前缀复用的策略，并修复了几个相关的bug。
 
@@ -14,7 +14,10 @@
 
 旧版 indexer 张量仍提供，但不再推荐，该张量仅经过16~64k上下文、约43.6M数据集训练，在工具调用等需要精确schema的场景下会有较高频率出错的问题。旧版QSA indexer张量提供者原仓库在：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-用户可自行对照两版差异。
+开箱即用的模型文件在：www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-13thblade
+已嫁接好新版张量，kuraneko1/higa2515仓库的旧版模型不建议直接使用，无论v1或v2版本，由于训练尚不充分，在工具调用等需精确复述的场景下出错概率较高。
+
+用户可自行对照版本差异。
 
 后续计划：
 1. 使多并发支持CUDA graph；
@@ -72,13 +75,16 @@ This repository adds support for **Qwen3.8-27B-QSA** to ninfer-all. This model g
 
 It supports the ViT and MTP of Qwen3.8-27B, and YaRN for contexts up to 1M. The script that grafts QSA attention onto any GGUF Qwen3.8-27B and converts it to the ninfer format lives in this repository under `tools/convert/`, with `tools/convert/convert_qsa27b.py` as the one-shot entry point.
 
-The engine stores GDN A/B controls in BF16. The converter uses the native BF16 donor only when all 96 controls match the GGUF byte for byte in the same head order (BF16 words or re-encoded Q8_0 scales and codes). A missing donor, another format or any mismatch silently selects the GGUF weights for the whole model. `NINFER_GDN_CONTROLS_BF16` accepts a donor file or HF directory; set it to `off` to use the GGUF directly. The QSA attention indexer tensors are also provided in the release: upstream converts the QSA indexer to a mixed FP32+BF16 precision automatically and has no full FP32 kernel, so this fork ships the FP32+BF16 mixed-precision version directly. The conversion tensors' default directory is `tools/convert/assets`.
+The engine stores GDN A/B controls in BF16. Upstream's format converter dequantizes lower-precision models to BF16, which for some quantization levels (such as Q4_K and Q8) both takes extra space and loses information. The converter prechecks all 96 control matrices against the model: for Q8_0 it compares the re-encoded scales and integer codes. Only when every byte matches after unifying the head order does it use the native BF16 donor; a missing donor, another format or any mismatch silently selects the GGUF weights instead. `NINFER_GDN_CONTROLS_BF16` accepts a donor file or HF directory; set it to `off` to use the GGUF directly. The QSA attention indexer tensors are also provided in the release: upstream converts the QSA indexer to a mixed FP32+BF16 precision automatically and has no full FP32 kernel, so this fork ships the FP32+BF16 mixed-precision version directly. The conversion tensors' default directory is `tools/convert/assets`.
 
 Optimized the KV cache prefix reuse strategy and fixed several related bugs.
 
 QSA indexer tensors trained on 16k–1M contexts over a ~352M-token dataset are now provided (the Qwen3.8-27B weights were frozen during training, so in principle they graft onto any Qwen3.8-27B model). They greatly improve context information recall and sharply cut the frequency of tool-call failures, and are now the default. The upstream repository of the new QSA indexer tensors: https://github.com/Prefrontal-AI/latent-sparse-attention
 
 The older indexer tensors remain available but are no longer recommended; they were trained only on 16k–64k contexts over a ~43.6M-token dataset and fail relatively often in scenarios that need a precise schema, such as tool calls. The upstream repository of the old QSA indexer tensors: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
+
+Ready-to-use model files are available at: www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-13thblade
+These files already have the new tensors grafted in. The old models in the kuraneko1/higa2515 repositories are not recommended for direct use, in either v1 or v2: because their training is not yet sufficient, they have a high error rate in scenarios that need faithful reproduction, such as tool calls.
 
 Users can compare the two versions themselves.
 
