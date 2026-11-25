@@ -11,6 +11,12 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
     const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
     const auto epilogue =
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    if (tokens == 512 || tokens == 1024) {
+        launch_nvfp4_a16_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>, K>>(
+            p, output, epilogue, stream);
+        return;
+    }
     if constexpr (K == 6144) {
         if (tokens <= 8) {
             launch_nvfp4_a16_sliced_k_mma<

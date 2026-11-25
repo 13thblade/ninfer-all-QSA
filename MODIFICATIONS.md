@@ -16,7 +16,7 @@ authoritative record.
 | Upstream commit | `baef81615` (merged through 22 November 2026; the fork previously tracked `8f029b0ca`, before that `87c35b6d4`) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
-| Scope | 35 files added, 89 modified relative to the tracked upstream commit; no upstream file deleted |
+| Scope | 36 files added, 97 modified relative to the tracked upstream commit; no upstream file deleted |
 
 The model weights and GGUF conversion are by higa2515
 (https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF); the QSA llama.cpp port
@@ -25,6 +25,19 @@ The fork's additions and modifications are Copyright (c) 2026 13thblade,
 offered under the same Apache-2.0 license.
 
 ## Changes by module
+
+### NVFP4 W4A16 fused prefill
+
+The fused SwiGLU, attention input and residual-add projections select dedicated
+MMA tiles at exactly 512 and 1024 tokens. The GDN input projection selects a new
+tile at 1024 tokens. These schedules apply on every GPU that runs the corresponding
+W4A16 path and use its existing BF16 operands, FP32 accumulation and fused outputs.
+
+On a QUASAR Qwen3.8-27B prompt of 4162 tokens, the combined schedules improved
+median paired prefill throughput by 10.91% (512) and 9.88% (1024) on an unlocked
+RTX 3090 Ti. On the same card at stock tensor throughput, the corresponding gains
+were 1.57% and 0.00%. At 1024, two of six stock pairs were 0.76% slower and four
+tied at the CLI's reporting precision. Measurements cover one GPU model.
 
 ### `ops` — QSA sparse attention and the block indexer
 
@@ -496,9 +509,9 @@ cold -0.015738 / resumed -0.013672) and longrun (14/14 at `prefill=33`) match
 the pre-merge numbers. No source change was needed; the merge is exactly the
 two parents' tree.
 
-## Files
+## Selected files
 
-### Added (32)
+### Added
 
 Root (1)
 
@@ -578,7 +591,7 @@ tools/convert (6)
 - `tools/convert/qsa_gguf.py`
 - `tools/convert/qsa_graft_recipe.py`
 
-### Modified (87)
+### Modified
 
 Root (1)
 
@@ -700,6 +713,13 @@ src/models/qwen3_5/state (3)
 src/models/qwen4_exp (1)
 
 - `src/models/qwen4_exp/executor.cpp`
+
+NVFP4 W4A16 fused projections (4)
+
+- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu`
+- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu`
+- `src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu`
+- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu`
 
 src/ops/kv_stream (1)
 
