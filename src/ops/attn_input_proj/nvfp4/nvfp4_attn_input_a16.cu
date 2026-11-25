@@ -59,7 +59,7 @@ void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
             p, output, epilogue, stream);
         return;
     }
-    if (tokens == 1024) {
+    if (tokens == 1024 || tokens == 2048 || tokens == 4096) {
         launch_nvfp4_a16_mma<
             Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 256, 64, 64, 32, 1, 2>, 5120>>(
             p, output, epilogue, stream);

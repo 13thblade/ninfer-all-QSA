@@ -53,11 +53,12 @@ void nvfp4_linear_swiglu_a16_mma_launch(const Tensor& x, const Weight& weight, T
         launch_nvfp4_a16_mma<Instance>(operands, output, SwiGluRowMajorMmaEpilogue{}, stream,
                                       SwiGluRowMajorMmaRows<Instance>{});
     };
-    if (x.ne[1] <= 64) {
+    const auto tokens = x.ne[1];
+    if (tokens <= 64) {
         launch.template operator()<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>();
-    } else if (x.ne[1] <= 96) {
+    } else if (tokens <= 96) {
         launch.template operator()<Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
-    } else if (x.ne[1] == 512 || x.ne[1] == 1024) {
+    } else if (tokens == 512 || tokens == 1024 || tokens == 2048 || tokens == 4096) {
         launch.template operator()<Nvfp4A16MmaSchedule<64, 256, 64, 64, 32, 1, 2>>();
     } else {
         launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>();

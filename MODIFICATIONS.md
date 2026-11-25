@@ -29,15 +29,25 @@ offered under the same Apache-2.0 license.
 ### NVFP4 W4A16 fused prefill
 
 The fused SwiGLU, attention input and residual-add projections select dedicated
-MMA tiles at exactly 512 and 1024 tokens. The GDN input projection selects a new
-tile at 1024 tokens. These schedules apply on every GPU that runs the corresponding
-W4A16 path and use its existing BF16 operands, FP32 accumulation and fused outputs.
+MMA tiles at 512, 1024, 2048 and 4096 tokens. The GDN input projection selects
+its wide tile at 1024, 2048 and 4096 tokens. These schedules apply on every GPU
+that runs the corresponding W4A16 path and use its existing BF16 operands, FP32
+accumulation and fused outputs.
 
 On a QUASAR Qwen3.8-27B prompt of 4162 tokens, the combined schedules improved
 median paired prefill throughput by 10.91% (512) and 9.88% (1024) on an unlocked
 RTX 3090 Ti. On the same card at stock tensor throughput, the corresponding gains
 were 1.57% and 0.00%. At 1024, two of six stock pairs were 0.76% slower and four
 tied at the CLI's reporting precision. Measurements cover one GPU model.
+
+On streamed QSA with the QUASAR NVFP4 weights, BF16 KV and 4096 resident
+positions, the same-card unlocked comparison at 16,404 prompt tokens gave
+1620 to 1750 tok/s for chunk 2048 and 1650 to 1800 tok/s for chunk 4096
+(three runs per schedule and width). The larger tiles use the existing
+MMA instantiations. The chunk workspace was 295 MiB and 585 MiB respectively.
+At 65,556 tokens, the median of two requests reached 1255 tok/s at chunk 1024,
+1405 at 2048 and 1500 at 4096. With the previous schedule at the same 4096
+width the median was 1400 tok/s.
 
 ### `ops` — QSA sparse attention and the block indexer
 
@@ -58,8 +68,11 @@ tied at the CLI's reporting precision. Measurements cover one GPU model.
   call's budget (`split_count(top_blocks)`). Wider calls use upstream's group-6/12
   tensor-core policy from `dev/qwen4-dense` at `40bbc0218` and index each query
   with the actual selection stride. The split reduction also serves 18 query heads.
-  A narrow window does not pay for
-  the widest accepted one.
+  The FP64 oracle covers 24 queries with distinct 1024-block selections.
+  Tensor-core and SIMT reductions can produce different greedy continuations.
+  In a single 4162-token sparse-prefill request on an RTX 3090 Ti with BF16
+  KV and three MTP drafts, the same build ran at 1560 vs 1310 prefill tok/s
+  and accepted 33.7% vs 40.5% of drafts (tensor cores vs SIMT).
 - `src/ops/launcher/rope.cu` launches the interleaved three-axis rotation the
   indexer and the text attention share under QSA.
 
