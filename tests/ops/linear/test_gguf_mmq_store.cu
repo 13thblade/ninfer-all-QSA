@@ -54,10 +54,14 @@ const TypeCase kCases[] = {
     {QType::GGUF_Q4_0, gguf::GgmlType::Q4_0, "q4_0", {0}},
     {QType::GGUF_Q5_0, gguf::GgmlType::Q5_0, "q5_0", {0}},
     {QType::GGUF_Q2_0, gguf::GgmlType::Q2_0, "q2_0", {0}},
+    {QType::GGUF_PTQ1_0, gguf::GgmlType::PTQ1_0, "ptq1_0", {26}},
 };
 
 // IQ1_M has the routed-expert matrix kernel only, so it is not among the dense cases above.
 const TypeCase kIq1m = {QType::GGUF_IQ1_M, gguf::GgmlType::IQ1_M, "iq1_m", {}};
+// NVFP4 (four UE4M3 scales, then 32 bytes of E2M1 pairs a 64-value block) runs the async
+// comparisons only.
+const TypeCase kNvfp4 = {QType::GGUF_NVFP4, gguf::GgmlType::NVFP4, "nvfp4", {}};
 
 void check(cudaError_t status, const char* label) {
     if (status != cudaSuccess) {
@@ -87,6 +91,12 @@ std::vector<std::uint8_t> make_weight(const TypeCase& c, int rows, int k, std::u
         for (const int offset : c.half_fields) {
             const std::uint16_t bits = half_bits(scale(rng));
             std::memcpy(base + offset, &bits, sizeof(bits));
+        }
+        if (c.type == gguf::GgmlType::NVFP4) {
+            // Finite UE4M3 scales from 0.125 to 0.234375 (exponent field 4).
+            for (int s = 0; s < 4; ++s) {
+                base[s] = static_cast<std::uint8_t>(0x20 | (byte(rng) & 0x07));
+            }
         }
         if (c.type == gguf::GgmlType::IQ1_M) {
             // The FP16 scale is spread over the top nibbles of the four scale words (bytes 48-55).
@@ -371,6 +381,11 @@ const AsyncCase kAsyncCases[] = {
      dense_async_offered<GGML_TYPE_IQ4_XS>, moe_async_offered<GGML_TYPE_IQ4_XS>},
     {gguf::GgmlType::IQ1_M, nullptr, "gguf_moe_matrix/iq1_m", nullptr,
      moe_async_offered<GGML_TYPE_IQ1_M>},
+    {gguf::GgmlType::NVFP4, "gguf_matrix/nvfp4", "gguf_moe_matrix/nvfp4",
+     dense_async_offered<GGML_TYPE_NVFP4>, moe_async_offered<GGML_TYPE_NVFP4>},
+    // Dense products only: two 28-byte blocks a step, staged in 8-byte copies.
+    {gguf::GgmlType::PTQ1_0, "gguf_matrix/ptq1_0", nullptr, dense_async_offered<GGML_TYPE_PTQ1_0>,
+     nullptr},
 };
 
 std::int64_t row_bytes_of(const TypeCase& c, int k) {
@@ -528,6 +543,12 @@ std::map<int, int> offered_tiles(const TypeCase& c, const char* key, Offer offer
 
 // Eight experts with 8 to 1,024 pairs each, every column tile at a full and a partial width.
 void compare_moe_widths(const TypeCase& c, const AsyncCase& a) {
+    if (a.moe_key == nullptr) { return; }
+    // sm_70's routed matrix kernel covers only the formats with a dense one (not IQ1_M).
+    if (!gguf::moe_matrix_supported(c.type, 640, 2560, false)) {
+        std::cout << "NOTE: " << c.name << " has no routed matrix kernel on this device\n";
+        return;
+    }
     const auto offered =
         offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns, 0); });
     for (const int pairs : {64, 128, 192, 256, 384, 512, 1024, 4096, 8192}) {
@@ -660,10 +681,12 @@ int main() {
 
         for (const AsyncCase& a : kAsyncCases) {
             const TypeCase& c =
-                a.type == kIq1m.type
-                    ? kIq1m
-                    : *std::find_if(std::begin(kCases), std::end(kCases),
-                                    [&](const TypeCase& t) { return t.type == a.type; });
+                a.type == kIq1m.type    ? kIq1m
+                : a.type == kNvfp4.type ? kNvfp4
+                                        : *std::find_if(std::begin(kCases), std::end(kCases),
+                                                        [&](const TypeCase& t) {
+                                                            return t.type == a.type;
+                                                        });
             const bool q4k = a.type == gguf::GgmlType::Q4_K;
             if (a.dense_key == nullptr) {
                 compare_moe_widths(c, a);

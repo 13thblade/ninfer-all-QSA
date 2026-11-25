@@ -460,8 +460,9 @@ struct HybridExpertOptions {
     ExpertDirect direct = ExpertDirect::Auto;
     // Host experts: at most this many bytes pinned in host memory, in the artifact's order; the
     // rest are read from the artifact's files as disk experts are. Unset (default): as many as fit
-    // the host's available memory and, on Windows, what the GPU's shared memory segment can still
-    // lock (about half the RAM) less 4 GiB.
+    // the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment
+    // can still lock (about half of Windows' memory) less 4 GiB. A value replaces that segment
+    // estimate; the available memory and the first part the host refuses still end the block.
     std::optional<std::uint64_t> host_bytes;
 };
 
@@ -668,6 +669,9 @@ struct EngineOptions {
     // the KV format its release trained with, Flint its F16 cache and DeepSeek-V4.1 its only one
     // (BFloat16 names both); the other families keep kv_cache. options() report the storage.
     bool kv_cache_automatic = false;
+    // Inkling 2 only: which keys and values the three passes of its looped core keep
+    // (LoopKvCache). Anything but PerPass is lossy and never the default.
+    LoopKvCache loop_kv = LoopKvCache::PerPass;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

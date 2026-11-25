@@ -24,6 +24,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/contract/rope_scaling.h"
+#include "runtime/engine/bad_words_rewind.h"
 #include "runtime/engine/context_image_store.h"
 #include "runtime/engine/session_slots.h"
 #include "runtime/engine/diagnostics.h"
@@ -32,6 +33,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -62,6 +64,16 @@ std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
 
 double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
+}
+
+// --loop-kv's spelling.
+const char* loop_kv_name(LoopKvCache mode) {
+    switch (mode) {
+    case LoopKvCache::PerPass: return "per-pass";
+    case LoopKvCache::LastFull: return "last-full";
+    case LoopKvCache::LastAll: return "last-all";
+    }
+    return "per-pass";
 }
 
 bool request_error(const std::exception_ptr& error) {
@@ -115,15 +127,19 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         }
     }
     // A speculative round verifies what a context lookup, the release's DSpark drafter (--spec
-    // dspark, the artifact's `dspark` component) or a standalone DSpine drafter (--spec dspine
-    // --draft-model) proposes.
+    // dspark, the artifact's `dspark` component), incoai's DFlash2 drafter (--spec dflash2, the
+    // artifact's `dflash2` component) or a standalone DSpine drafter (--spec dspine
+    // --draft-model) proposes. DSpark and DFlash2 are block drafters: a block of drafts a round
+    // for one decoding request.
     const SpeculativeOptions& speculative = options.speculative;
-    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
-    const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
-    if (speculative.backend != SpeculativeBackend::None && !dspine && !dspark) {
-        throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), a "
-                                    "DSpine drafter (--spec dspine --draft-model) or by context "
-                                    "lookup (--lookup-ngram)");
+    const bool dspine  = speculative.backend == SpeculativeBackend::DSpine;
+    const bool dspark  = speculative.backend == SpeculativeBackend::DSpark;
+    const bool dflash2 = speculative.backend == SpeculativeBackend::DFlash2;
+    const bool block   = dspark || dflash2;
+    if (speculative.backend != SpeculativeBackend::None && !dspine && !block) {
+        throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), its "
+                                    "DFlash2 drafter (--spec dflash2), a DSpine drafter (--spec "
+                                    "dspine --draft-model) or by context lookup (--lookup-ngram)");
     }
     const std::uint32_t lookup_drafts =
         speculative.lookup_ngram == 0 ? 0
@@ -133,17 +149,17 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                          speculative.draft_tokens > 7))) {
         throw std::invalid_argument("Inkling 2 verifies 1 to 7 drafts a round (--draft-tokens)");
     }
-    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !dspark) ||
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !block) ||
         speculative.draft_confidence.has_value() ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
-        speculative.ngram_archive_bytes != 0 ||
+        speculative.mtp_attention_window != 0 ||
+        (speculative.ngram_draft_tokens != 0 && !dflash2) || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
-        (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !dspark)) {
+        (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !block)) {
         throw std::invalid_argument("Inkling 2 has no --draft-confidence, n-gram copy proposals or "
                                     "archive, --mtp-attention-window or proposal head, "
-                                    "--adaptive-mtp only with --spec dspark and --draft-min-p only "
-                                    "with --spec dspine or dspark");
+                                    "--adaptive-mtp only with --spec dspark or dflash2 and "
+                                    "--draft-min-p only with --spec dspine, dspark or dflash2");
     }
     (void)models::inkling2::kv_format(options.kv_cache); // refuses, by name, one it does not store
     const auto& hybrid = options.hybrid_experts;
@@ -172,6 +188,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         throw std::invalid_argument("--spec dspark: the artifact holds no Inkling 2 DSpark drafter "
                                     "(convert with --components text,dspark)");
     }
+    if (dflash2 && !models::inkling2::has_dflash2(reader)) {
+        throw std::invalid_argument("--spec dflash2: the artifact holds no Inkling 2 DFlash2 "
+                                    "drafter (convert with --components text,dflash2)");
+    }
     inspect.complete();
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
@@ -179,7 +199,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     .experts           = options.expert_residency,
                                     .expert_host_bytes = options.hybrid_experts.host_bytes,
                                     .vision            = vision,
-                                    .dspark   = dspark};
+                                    .dspark   = dspark,
+                                    .dflash2  = dflash2};
     if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
@@ -231,18 +252,22 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
+    executor.loop_kv       = options.loop_kv;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
-    if (dspark) {
+    executor.dflash2       = dflash2;
+    if (block) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.
-        const std::uint32_t block  = model->dspark_config()->block_size;
+        const std::uint32_t size   = dspark ? model->dspark_config()->block_size
+                                            : model->dflash2_config()->block_size;
         const std::uint32_t drafts = speculative.draft_tokens != 0 ? speculative.draft_tokens
-                                                                   : block - 1;
-        if (drafts > block - 1) {
-            throw std::invalid_argument("Inkling 2: --spec dspark verifies 1 to " +
-                                        std::to_string(block - 1) +
+                                                                   : size - 1;
+        if (drafts > size - 1) {
+            throw std::invalid_argument(std::string("Inkling 2: --spec ") +
+                                        (dspark ? "dspark" : "dflash2") + " verifies 1 to " +
+                                        std::to_string(size - 1) +
                                         " drafts a round (--draft-tokens), its block less the "
                                         "anchor");
         }
@@ -313,6 +338,17 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (executor.loop_kv != LoopKvCache::PerPass) {
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Warning,
+            "Inkling 2: --loop-kv %s: the core's earlier passes read the last pass's keys and "
+            "values of %s, which only the last pass keeps (lossy: the output differs from the "
+            "model's and with how the tokens are split into calls)",
+            loop_kv_name(executor.loop_kv),
+            executor.loop_kv == LoopKvCache::LastFull
+                ? "its full-attention layers"
+                : "its full-attention layers and the rings of its windowed layers");
+    }
     if (model->expert_parallel()) {
         std::string ranges;
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
@@ -326,17 +362,18 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
+        const std::string pinned_end = pinned_block_end_note(model->storage_stats());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Inkling 2: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
-            "expert sources in the files %.0f MiB",
+            "expert sources in the files %.0f MiB%s",
             options.expert_residency == ExpertResidency::Disk ? "artifact files"
             : model->expert_file_bytes() > 0                 ? "pinned host memory and artifact files"
                                                              : "pinned host memory",
             double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
             double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
             double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
-            double(model->expert_file_bytes()) / 1048576);
+            double(model->expert_file_bytes()) / 1048576, pinned_end.c_str());
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Inkling 2: missing experts %s; cache seeded %s",
@@ -377,12 +414,31 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            double(drafter.device_bytes()) / 1048576.0,
                            double(instance->executor->memory().drafter_bytes) / 1048576.0);
     }
+    if (dflash2 && speculative.ngram_draft_tokens != 0) {
+        // --spec dflash2 turns n-gram copy proposals on by default (the Qwen3.5-core models');
+        // Inkling 2 drafts with the drafter and context lookup only, as Gemma 4 does.
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2 drafts with its drafter and context lookup (--lookup-ngram); "
+                           "n-gram copy proposals (--ngram-draft-tokens) are not available for it");
+    }
+    if (dflash2) {
+        const auto& dc = *model->dflash2_config();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2: DFlash2 drafter, %u layers over a block of %u, up to %u "
+                           "drafts a round for one decoding request%s; ring of %u positions, "
+                           "ring and workspace %.1f MiB",
+                           dc.num_hidden_layers, dc.block_size,
+                           speculative.draft_tokens != 0 ? speculative.draft_tokens
+                                                         : dc.block_size - 1,
+                           lookup_drafts != 0 ? " where no context lookup matches" : "",
+                           dc.sliding_window,
+                           double(instance->executor->memory().drafter_bytes) / 1048576.0);
+    }
     if (dspark) {
         const auto& dc = *model->dspark_config();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Inkling 2: DSpark drafter, %u layers over a block of %u, up to %u "
-                           "drafts a round for one decoding request%s; its head table and "
-                           "contexts %.0f MiB",
+                           "drafts a round for one decoding request%s; its contexts %.1f MiB",
                            dc.num_hidden_layers, dc.block_size,
                            speculative.draft_tokens != 0 ? speculative.draft_tokens
                                                          : dc.block_size - 1,
@@ -533,6 +589,15 @@ struct Inkling2Core::Request {
     // the sequence goes back to that many tokens after it.
     std::optional<std::size_t> hold_fed;
     bool stop_rewind = false;
+    // Banned words (bad_words) with rewinds: the tokens its sequence had read before the generated
+    // token where a banned word's hold begins, and the purpose of the draw that took that token,
+    // whose logits the slot's hold_logits keep. words_rewind: a rewind to that generated token
+    // which a speculative round completes once it commits; redrawing: the deferred draw is the
+    // rewind's.
+    std::optional<std::size_t> words_fed;
+    std::int32_t words_purpose = 0;
+    std::optional<std::uint32_t> words_rewind;
+    bool redrawing = false;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -540,8 +605,8 @@ struct Inkling2Core::Request {
     std::uint32_t prefill_counted = 0;
     Clock::time_point prefill_counted_at;
     SpeculativeStats speculative; // an Engine with --lookup-ngram only
-    // With --adaptive-mtp: how far its DSpark drafts survive, position by position.
-    runtime::MtpAdaptiveSignal spark_signal;
+    // With --adaptive-mtp: how far its block drafter's drafts survive, position by position.
+    runtime::MtpAdaptiveSignal block_signal;
 };
 
 struct Inkling2Core::Impl {
@@ -586,21 +651,22 @@ struct Inkling2Core::Impl {
     const std::uint32_t drafts;       // drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const bool dspine;                // --spec dspine: the drafter proposes where no lookup does
-    // --spec dspark: the drafts the DSpark drafter proposes a round where no lookup does (0 is
-    // off), and its block's positions.
-    const std::uint32_t spark_drafts, spark_block;
+    const SpeculativeBackend backend; // --spec
+    // --spec dspark or dflash2: the drafts the block drafter proposes a round where no lookup does
+    // (0 is off), and its block's positions.
+    const std::uint32_t block_drafts, block_width;
     // --draft-min-p: a drafter's round verifies through its first draft at or below this
     // probability.
     const float draft_floor;
-    // --adaptive-mtp with --spec dspark: the drafts of a lone request's round, from how far its
+    // --adaptive-mtp with a block drafter: the drafts of a lone request's round, from how far its
     // drafts survive and the round times measured at each width; and the width of the round
     // running (0 when it is not the controller's).
-    std::optional<runtime::MtpAdaptiveBatchController> spark_controller;
-    std::uint32_t spark_round_width = 0;
+    std::optional<runtime::MtpAdaptiveBatchController> block_controller;
+    std::uint32_t block_round_width = 0;
     // With the controller: whether a lone request's rounds beat plain decode steps, timed as they
     // run, and the request it times.
-    std::optional<runtime::SpeculationGate> spark_gate;
-    std::uint64_t spark_gate_cohort = 0;
+    std::optional<runtime::SpeculationGate> block_gate;
+    std::uint64_t block_gate_cohort = 0;
     const DiagnosticObserver diagnostics;
 
     mutable std::mutex queue_mutex;
@@ -647,6 +713,8 @@ struct Inkling2Core::Impl {
     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
     // sampled together afterwards, side by side.
     DeviceBuffer saved_logits, deferred_logits;
+    // The logits that drew the token where a banned word's hold begins, one row per sequence.
+    DeviceBuffer hold_logits;
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
@@ -673,10 +741,11 @@ struct Inkling2Core::Impl {
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram),
           dspine(options.speculative.backend == SpeculativeBackend::DSpine),
-          spark_drafts(i.executor->dspark_block() == 0      ? 0U
+          backend(options.speculative.backend),
+          block_drafts(i.executor->block_drafts() == 0      ? 0U
                        : options.speculative.draft_tokens != 0 ? options.speculative.draft_tokens
-                                                               : i.executor->dspark_block()),
-          spark_block(i.executor->dspark_block() + 1),
+                                                               : i.executor->block_drafts()),
+          block_width(i.executor->block_drafts() + 1),
           draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
@@ -684,10 +753,10 @@ struct Inkling2Core::Impl {
               options.decode_rounds_per_prefill != 0
                   ? options.decode_rounds_per_prefill
                   : std::max<std::uint32_t>(1, i.executor->options().prefill_chunk / 64)) {
-        if (spark_drafts != 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
-            spark_controller.emplace();
-            spark_controller->reset(spark_drafts, 1);
-            spark_gate.emplace();
+        if (block_drafts != 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+            block_controller.emplace();
+            block_controller->reset(block_drafts, 1);
+            block_gate.emplace();
         }
         if (reuse_prefixes) {
             // The host tier's budget, sized here once the weights are loaded when it is
@@ -698,10 +767,14 @@ struct Inkling2Core::Impl {
                 sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             auto* executor            = i.executor.get();
             const auto* spine_model   = i.model->dspine();
+            // An image holds the caches the --loop-kv mode keeps, so the mode names its profile.
             const std::string profile = context_image_profile(
                 "inkling2", i.model->info().artifact_id, kv_cache, executor->image_bytes(0),
                 executor->image_bytes(1),
-                spine_model != nullptr ? "-dspine" + spine_model->artifact_hex() : std::string());
+                (spine_model != nullptr ? "-dspine" + spine_model->artifact_hex() : std::string()) +
+                    (options.loop_kv != LoopKvCache::PerPass
+                         ? std::string("-loop-") + loop_kv_name(options.loop_kv)
+                         : std::string()));
             store.configure(
                 context_image_store_options(cache, budget, budget, profile), profile,
                 [executor](std::uint32_t position) { return executor->image_bytes(position); },
@@ -725,6 +798,7 @@ struct Inkling2Core::Impl {
             vocab_rows      = static_cast<std::size_t>(instance.executor->logits(1).ne[0]);
             saved_logits    = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
             deferred_logits = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
+            hold_logits     = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -870,14 +944,35 @@ struct Inkling2Core::Impl {
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
     void schedule_mask(Request& r) {
         const auto grammar = r.output.grammar_state();
+        if (grammar) { allow_rewinds(r); }
         r.mask = grammar ? runtime::GrammarMaskJob::start(*grammar, mask_words()) : nullptr;
+    }
+
+    // Banned words: whether the request may take its output back to where a banned word began
+    // once its next round has read its positions (OutputSession::allow_bad_words_rewind). Before
+    // the prompt, the first token's hold is the prompt's end, which the sequence can return to.
+    void allow_rewinds(Request& r) {
+        if (r.branches || !r.decoding) {
+            r.output.allow_bad_words_rewind(!r.branches);
+            return;
+        }
+        const auto& executor = *instance.executor;
+        const std::uint32_t at    = executor.position(r.slot);
+        const std::uint32_t ahead = std::max<std::uint32_t>(
+            drafts + 1, static_cast<std::uint32_t>(r.feed.size()));
+        const auto from =
+            r.words_fed ? static_cast<std::uint32_t>(*r.words_fed) : at;
+        r.output.allow_bad_words_rewind(from <= at &&
+                                        at + ahead - from <= executor.rewind_reach(r.slot, from));
     }
 
     // After a structured request's accepted tokens: one that decodes plainly starts its next mask
     // now, a step ahead; one that speculates fills its round's columns during the verification.
+    // A request whose token waits for a rewind's draw needs that token's mask.
     void next_mask(const std::shared_ptr<Request>& request) {
         Request& r = *request;
-        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+        if (r.constrained && active(request) &&
+            (r.awaiting_sample || !(drafts > 0 && r.mask_cost.speculates()))) {
             schedule_mask(r);
         } else {
             r.mask.reset();
@@ -1405,15 +1500,14 @@ struct Inkling2Core::Impl {
         if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.enabled      = true;
-            r.speculative.backend      = dspine         ? SpeculativeBackend::DSpine
-                                         : spark_drafts != 0 ? SpeculativeBackend::DSpark
-                                                             : SpeculativeBackend::None;
+            r.speculative.backend      = dspine || block_drafts != 0 ? backend
+                                                                     : SpeculativeBackend::None;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
-            if (spark_controller) {
+            if (block_controller) {
                 r.speculative.adaptive = true;
                 r.speculative.rounds_per_window.assign(drafts, 0);
-                r.spark_signal.reset();
+                r.block_signal.reset();
             }
         }
         r.prefill_start        = Clock::now();
@@ -1731,6 +1825,7 @@ struct Inkling2Core::Impl {
         result.finish_reason                   = reason;
         result.matched_stop_string             = r.output.matched_stop_string();
         result.thinking                        = r.output.thinking_stats();
+        result.bad_words                       = r.output.bad_words_stats();
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
@@ -2079,7 +2174,7 @@ struct Inkling2Core::Impl {
         // The first token's mask began with the request; when it is not done yet, the prompt's
         // last logits wait for it instead of the engine thread.
         if (r.branches) {
-            accept(request, r.branch_token, &r.branch_record);
+            accept(request, r.branch_token, &r.branch_record, Draws{});
             return;
         }
         if (!mask_ready(r)) {
@@ -2092,7 +2187,9 @@ struct Inkling2Core::Impl {
         runtime::RawTokenLogprob logprob;
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
-        accept(request, token, row.logprobs ? &logprob : nullptr);
+        const Tensor logits = executor.logits(1);
+        accept(request, token, row.logprobs ? &logprob : nullptr,
+               Draws{.logits = &logits, .purpose = ops::kSamplePurposePrefill});
         next_mask(request);
     }
 
@@ -2100,16 +2197,83 @@ struct Inkling2Core::Impl {
         return slots.at(request->slot).request == request;
     }
 
+    // Where the logits that drew a round's tokens are: token i's in column `column + i` of
+    // `logits`, drawn for `purpose`. A banned word's hold keeps its token's.
+    struct Draws {
+        const Tensor* logits = nullptr;
+        std::size_t column   = 0;
+        std::int32_t purpose = ops::kSamplePurposeDecode;
+    };
+
     // Applies the output policy to a sampled token: publishes what it accepts, then either
     // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
-                const runtime::RawTokenLogprob* logprob) {
+                const runtime::RawTokenLogprob* logprob, const Draws& draws) {
         if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
                                         : std::span<const runtime::RawTokenLogprob>{},
-                     true);
+                     true, draws);
         check_capacity(request);
+    }
+
+    // Banned words: the round's token `index` begins a hold. The request keeps the logits that
+    // drew it and how many tokens its sequence had read before it.
+    void keep_words_hold(Request& r, std::uint32_t index, bool committed, const Draws& draws) {
+        if (draws.logits == nullptr) {
+            throw std::logic_error("a banned word's hold began without the logits of its token");
+        }
+        const std::size_t bytes  = vocab_rows * sizeof(__nv_bfloat16);
+        const std::size_t stride = static_cast<std::size_t>(draws.logits->ne[0]) *
+                                   sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(draws.logits->data) + (draws.column + index) * stride,
+            bytes, cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+        r.words_fed     = slots[r.slot].fed.size() + (committed ? 0 : 1) + index;
+        r.words_purpose = draws.purpose;
+    }
+
+    // Banned words: takes the request back to the state before generated token `words_rewind`,
+    // the hold's, and draws that position again from the hold's logits once the grammar's mask,
+    // which bans the dropped token there, is ready (next_mask). A speculative round calls it once
+    // it has committed the tokens before the hold.
+    void complete_words_rewind(Request& r) {
+        const std::uint32_t to = *r.words_rewind;
+        r.words_rewind.reset();
+        auto& executor = *instance.executor;
+        Slot& slot     = slots[r.slot];
+        if (!r.words_fed || to > r.generated.size() || slot.fed.size() < *r.words_fed) {
+            throw std::logic_error("banned-word rewind without the hold it returns to");
+        }
+        const std::size_t back_to = *r.words_fed;
+        const std::span<const TokenId> dropped(r.generated.data() + to, r.generated.size() - to);
+        if (r.penalties) {
+            runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                        std::size_t(r.slot) * domain,
+                                    dropped, executor.head_stream());
+        }
+        r.budget->release(static_cast<std::uint32_t>(dropped.size()));
+        r.generated.resize(to);
+        if (r.hold_fed && *r.hold_fed > back_to) { r.hold_fed.reset(); }
+        if (slot.fed.size() > back_to) {
+            const auto tokens = static_cast<std::uint32_t>(slot.fed.size() - back_to);
+            if (!executor.rewind(r.slot, tokens)) {
+                throw std::logic_error("Inkling 2 could not return to a banned word's hold");
+            }
+            slot.fed.resize(back_to);
+            r.position -= tokens;
+        }
+        r.feed.clear();
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(saved_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes, bytes,
+            cudaMemcpyDeviceToDevice, executor.head_stream()));
+        r.awaiting_sample  = true;
+        r.awaiting_purpose = r.words_purpose;
+        r.redrawing        = true;
+        r.mask.reset();
     }
 
     // A turn that ended at a stop string: the sequence goes back to what it had read before the
@@ -2138,7 +2302,8 @@ struct Inkling2Core::Impl {
     // `committed`: the sequence has read what the tokens follow; a speculative round, which has
     // yet to read its anchor, commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed,
+                         const Draws& draws) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -2170,6 +2335,25 @@ struct Inkling2Core::Impl {
         // read, or will have once the round commits, this many tokens before it.
         if (accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted) {
             r.hold_fed = slots[r.slot].fed.size() + (committed ? 0 : 1) + *decision.stop_hold_after;
+        }
+        if (!decision.bad_words_hold_alive) { r.words_fed.reset(); }
+        if (decision.bad_words_hold_after) {
+            keep_words_hold(r, *decision.bad_words_hold_after, committed, draws);
+        }
+        if (decision.bad_words_rewind) {
+            // A banned word was completed: the output stands at its hold again.
+            r.words_rewind = *decision.bad_words_rewind;
+            if (committed) {
+                // The draw counted the round's token, which the output did not take.
+                if (r.penalties) {
+                    runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                                std::size_t(r.slot) * domain,
+                                            tokens.subspan(accepted),
+                                            instance.executor->head_stream());
+                }
+                complete_words_rewind(r);
+            }
+            return accepted;
         }
         if (decision.finished()) {
             if (decision.stop_cut) {
@@ -2217,7 +2401,7 @@ struct Inkling2Core::Impl {
     }
 
     // A key of the request that restarts the width controller's and the gate's choices.
-    [[nodiscard]] static std::uint64_t spark_cohort(const Request& r) noexcept {
+    [[nodiscard]] static std::uint64_t block_cohort(const Request& r) noexcept {
         return (1469598103934665603ULL ^
                 (static_cast<std::uint64_t>(r.slot) << 32U |
                  static_cast<std::uint32_t>(r.admitted.time_since_epoch().count()))) *
@@ -2228,9 +2412,9 @@ struct Inkling2Core::Impl {
     // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
     // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
     // one) sets the same bounds here.
-    // The DSpark drafter drafts for one request at a time.
+    // A block drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
-        if (spark_drafts != 0) { return decoding == 1 ? drafts : 0U; }
+        if (block_drafts != 0) { return decoding == 1 ? drafts : 0U; }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
 
@@ -2245,12 +2429,12 @@ struct Inkling2Core::Impl {
         return found;
     }
 
-    // The drafter's proposals of `steps` drafts for each request of `rows` (DSpine's at once,
-    // DSpark's a block each, at most its drafts), each cut after its first draft at or below the
-    // floor.
+    // The drafter's proposals of `steps` drafts for each request of `rows` (DSpine's and DFlash2's
+    // at once, DSpark's a block each, a block drafter's at most its drafts), each cut after its
+    // first draft at or below the floor.
     std::vector<std::vector<TokenId>> drafter_proposals(
         const std::vector<std::shared_ptr<Request>>& rows, std::uint32_t steps) {
-        if (spark_drafts != 0) { steps = std::min(steps, spark_drafts); }
+        if (block_drafts != 0) { steps = std::min(steps, block_drafts); }
         std::vector<std::uint32_t> sequences;
         std::vector<std::int32_t> anchors;
         for (const auto& request : rows) {
@@ -2323,16 +2507,16 @@ struct Inkling2Core::Impl {
                     looked_up.push_back(1);
                     continue;
                 }
-                if (dspine || (spark_drafts != 0 && request->position + spark_block <= max_context)) {
-                    if (spark_gate && decoding == 1 && !dspine) {
-                        const std::uint64_t cohort = spark_cohort(*request);
-                        if (cohort != spark_gate_cohort) {
-                            spark_gate->reset();
-                            spark_gate_cohort = cohort;
+                if (dspine || (block_drafts != 0 && request->position + block_width <= max_context)) {
+                    if (block_gate && decoding == 1 && !dspine) {
+                        const std::uint64_t cohort = block_cohort(*request);
+                        if (cohort != block_gate_cohort) {
+                            block_gate->reset();
+                            block_gate_cohort = cohort;
                         }
                         gated        = request;
                         gated_tokens = request->generated.size();
-                        if (!spark_gate->speculates()) {
+                        if (!block_gate->speculates()) {
                             batch.push_back(request);
                             continue;
                         }
@@ -2352,22 +2536,22 @@ struct Inkling2Core::Impl {
         // they survive and the round times it has measured at each width; a new request restarts
         // its probe. It measures the rounds that verify all the drafts it picked.
         bool measured = false;
-        spark_round_width = 0;
+        block_round_width = 0;
         if (!drafting.empty()) {
             std::uint32_t width = steps;
-            if (spark_controller && drafting.size() == 1 && batch.empty() && speculative.empty()) {
+            if (block_controller && drafting.size() == 1 && batch.empty() && speculative.empty()) {
                 const Request& r     = *drafting.front();
                 const auto budget    = r.output.model_token_budget_remaining(r.budget->remaining());
                 const std::uint32_t room = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                     {static_cast<std::uint64_t>(budget),
                      static_cast<std::uint64_t>(max_context - r.position), 1U << 20}));
                 const std::uint32_t available = std::min(steps, room > 0 ? room - 1U : 0U);
-                const std::uint64_t cohort               = spark_cohort(r);
-                const runtime::MtpAdaptiveSignal* signal = &r.spark_signal;
+                const std::uint64_t cohort               = block_cohort(r);
+                const runtime::MtpAdaptiveSignal* signal = &r.block_signal;
                 width = std::clamp<std::uint32_t>(
-                    spark_controller->select({&signal, 1}, {&available, 1}, {&room, 1}, cohort), 1,
+                    block_controller->select({&signal, 1}, {&available, 1}, {&room, 1}, cohort), 1,
                     steps);
-                spark_round_width = width;
+                block_round_width = width;
             }
             auto drafted = drafter_proposals(drafting, width);
             for (std::size_t j = 0; j < drafting.size(); ++j) {
@@ -2375,7 +2559,7 @@ struct Inkling2Core::Impl {
                     batch.push_back(drafting[j]);
                     continue;
                 }
-                measured = spark_round_width != 0 && drafted[j].size() == width;
+                measured = block_round_width != 0 && drafted[j].size() == width;
                 proposals.push_back(std::move(drafted[j]));
                 speculative.push_back(drafting[j]);
                 looked_up.push_back(0);
@@ -2400,21 +2584,22 @@ struct Inkling2Core::Impl {
                    std::span(&logprob, 1));
             try {
                 if (!mask_usable(request)) { continue; }
-                accept(request, token, row.logprobs ? &logprob : nullptr);
+                const Tensor logits = instance.executor->logits(1);
+                accept(request, token, row.logprobs ? &logprob : nullptr, Draws{.logits = &logits});
                 next_mask(request);
             } catch (...) { fail(request, std::current_exception()); }
         }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
         if (measured && batch.empty() && deferred.empty() && alone.empty()) {
-            spark_controller->observe_execution(1, spark_round_width, seconds(start, Clock::now()));
+            block_controller->observe_execution(1, block_round_width, seconds(start, Clock::now()));
         }
-        spark_round_width = 0;
+        block_round_width = 0;
         // A step of the gated request alone: a round, a plain step it chose, or the plain step
         // after a drafter that proposed nothing, all at the cost of its mode.
         if (gated && deferred.empty() && alone.empty() && batch.size() + speculative.size() == 1) {
             const std::size_t now_tokens = gated->generated.size();
-            spark_gate->observe(
+            block_gate->observe(
                 static_cast<std::uint32_t>(now_tokens > gated_tokens ? now_tokens - gated_tokens : 0),
                 seconds(start, Clock::now()));
         }
@@ -2458,11 +2643,13 @@ struct Inkling2Core::Impl {
             sample(rows, purpose, sampled, logprobs, &source);
             for (std::size_t j = 0; j < group.size(); ++j) {
                 group[j]->awaiting_sample = false;
-                if (purpose == ops::kSamplePurposeDecode && drafts > 0) {
+                if (purpose == ops::kSamplePurposeDecode && drafts > 0 && !group[j]->redrawing) {
                     ++group[j]->speculative.fallback_steps;
                 }
+                group[j]->redrawing = false;
                 try {
-                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
+                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr,
+                           Draws{.logits = &source, .column = j, .purpose = purpose});
                     next_mask(group[j]);
                 } catch (...) { fail(group[j], std::current_exception()); }
             }
@@ -2518,7 +2705,9 @@ struct Inkling2Core::Impl {
             if (drafts > 0) { ++now[b]->speculative.fallback_steps; }
             try {
                 if (!mask_usable(now[b])) { continue; }
-                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr,
+                       Draws{.logits = source ? &*source : &logits,
+                             .column = source ? b : columns[b]});
                 next_mask(now[b]);
             } catch (...) { fail(now[b], std::current_exception()); }
         }
@@ -2588,6 +2777,7 @@ struct Inkling2Core::Impl {
         for (std::size_t j = 0; j < b; ++j) {
             if (!batch[j]->constrained) { continue; }
             const std::size_t own = std::min<std::size_t>(draft_extents[j], k);
+            allow_rewinds(*batch[j]);
             column_masks[j] = runtime::GrammarMaskJob::start(
                 *batch[j]->output.grammar_state(), mask_words(),
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
@@ -2769,10 +2959,10 @@ struct Inkling2Core::Impl {
                 ++r.speculative.ngram_rounds;
                 r.speculative.ngram_drafted_tokens += draft_extents[j];
                 r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
-            } else if (spark_round_width != 0) {
-                r.spark_signal.observe(draft_extents[j], std::uint32_t(drafts_n));
-                ++r.speculative.rounds_per_window[spark_round_width - 1];
-                if (spark_controller->transitioned()) { ++r.speculative.window_transitions; }
+            } else if (block_round_width != 0) {
+                r.block_signal.observe(draft_extents[j], std::uint32_t(drafts_n));
+                ++r.speculative.rounds_per_window[block_round_width - 1];
+                if (block_controller->transitioned()) { ++r.speculative.window_transitions; }
             }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
@@ -2785,27 +2975,33 @@ struct Inkling2Core::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records, false);
+                    taken = accept(request, run_tokens, records, false,
+                                   Draws{.logits = &logits, .column = std::size_t(starts[j])});
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
                 }
             }
-            // The tokens counted as sampled: those taken, or the first when none was.
-            kept[j] = std::max<std::uint32_t>(taken, 1);
-            if (kept[j] < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
+            // The tokens counted as sampled: those taken, or the first when none was. A rewind to
+            // a banned word's hold feeds the tokens taken before it and counts only those.
+            const bool rewound = r.words_rewind.has_value();
+            kept[j] = rewound ? taken + 1 : std::max<std::uint32_t>(taken, 1);
+            const std::uint32_t counted = rewound ? taken : kept[j];
+            if (counted < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
                 // The acceptance counted the whole run; the request keeps only its prefix.
                 const std::size_t at = std::size_t(r.slot) * domain * sizeof(std::int32_t);
                 CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(token_counts.p) + at,
                                            static_cast<const std::byte*>(counts_backup.p) + at,
                                            std::size_t(domain) * sizeof(std::int32_t),
                                            cudaMemcpyDeviceToDevice, stream));
-                const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w, DType::I32,
-                                 {static_cast<std::int32_t>(kept[j])});
-                Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
-                                      std::size_t(r.slot) * domain,
-                                  DType::I32, {static_cast<std::int32_t>(domain)});
-                ops::increment_token_counts(ids, row_counts, stream);
+                if (counted > 0) {
+                    const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w,
+                                     DType::I32, {static_cast<std::int32_t>(counted)});
+                    Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
+                                          std::size_t(r.slot) * domain,
+                                      DType::I32, {static_cast<std::int32_t>(domain)});
+                    ops::increment_token_counts(ids, row_counts, stream);
+                }
             }
         }
         executor.commit(sequences, kept);
@@ -2819,8 +3015,12 @@ struct Inkling2Core::Impl {
             r.position += kept[j];
             if (r.stop_rewind) { rewind_to_hold(r); }
             try {
+                if (r.words_rewind) { complete_words_rewind(r); }
                 check_capacity(batch[j]);
-            } catch (...) { fail(batch[j], std::current_exception()); }
+            } catch (...) {
+                fail(batch[j], std::current_exception());
+                continue;
+            }
             if (r.constrained) { next_mask(batch[j]); }
         }
     }
@@ -3044,6 +3244,9 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         throw std::invalid_argument(
             "structured output requires an Engine started with structured_output");
     }
+    if (!options.execution.bad_words.empty() && !impl_->structured_output) {
+        throw std::invalid_argument("bad_words require an Engine started with structured_output");
+    }
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + impl_->pending_timeout;
     }
@@ -3140,7 +3343,7 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
+        options.execution.structured_output, options.execution.bad_words);
     // Strict tool arguments bring a grammar without a structured final format.
     if (request->output.grammar_state() && !impl_->structured_output) {
         throw std::invalid_argument(

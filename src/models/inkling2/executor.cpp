@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -19,7 +20,9 @@
 #include "models/inkling2/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
+#include "ninfer/ops/moe_expert_prefetch.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
@@ -159,6 +162,9 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
+    // The visit whose caches this one reads and writes (--loop-kv: a core layer's last pass), or
+    // -1: its own. A visit that uses another's owns no caches or checkpoint.
+    int store = -1;
     // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized full visit has none;
     // its rows live in its code and scale planes.
     KvArea k, v;
@@ -186,23 +192,22 @@ struct SparkLayer {
 
 // The DSpark drafter (Model::dspark()): its layers, the taps it reads, every sequence's ring of
 // recurrent-head contexts ([sequences][kR][hidden] FP32, position p in slot p % kR) and its
-// checkpoint, the head's table of the recurrent correction (M BF16 [vocab][256], c FP32 [vocab],
-// prepared once), and a round's device state.
+// checkpoint, the recurrent head's weights (its output M BF16 [vocab][256] and bias c FP32 [vocab]
+// fold the release's head in), and a round's device state.
 struct Spark {
     const DSparkConfig* config = nullptr;
     std::vector<SparkLayer> layers;
-    const float *fuse = nullptr, *context_norm = nullptr, *final_norm = nullptr,
+    const float *mix = nullptr, *context_norm = nullptr, *final_norm = nullptr,
                 *mask_embedding = nullptr, *joint = nullptr, *joint_bias = nullptr,
-                *hidden_out = nullptr, *hidden_out_bias = nullptr;
-    const __nv_bfloat16* markov_embed = nullptr;
+                *markov_out_bias = nullptr;
+    const __nv_bfloat16 *markov_embed = nullptr, *markov_out = nullptr;
     // tap_after[v]: the stored tap (0..taps - 2) visit v's output is, or -1; the last tap is the
     // final hidden.
     std::vector<int> tap_after;
     int taps = 0, block = 0, window = 0;
-    DeviceBuffer contexts, contexts_kept, table_m, table_c, state, prev, drafts, confidence;
+    DeviceBuffer contexts, contexts_kept, state, prev, drafts, confidence;
     std::unique_ptr<PinnedHostBuffer> host;
     std::unique_ptr<CudaCompletionEvent> copied;
-    bool prepared = false;
     std::uint64_t bytes = 0; // beside the caches (in kv_bytes)
 };
 
@@ -254,6 +259,17 @@ struct Executor::Impl {
     std::uint64_t history_bytes = 0;
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+    // A one-row decode call's read-ahead of each visit's likely experts into L2
+    // (ops/moe_expert_prefetch.h): while visit v's experts run, visit v + 1's router guesses from
+    // v's MoE input on guess_stream; visit v + 1 reads the guessed experts there once its
+    // projections are done, beside its attention. guess_budget experts a visit (0: off), only in
+    // the layers whose guessed experts fit it (guess_layer). Calls of several rows read none: two
+    // guesses a row or fewer slowed DSpark decode on an RTX 4090 by about 3%.
+    int guess_budget = 0;
+    std::vector<char> guess_layer;
+    cudaStream_t guess_stream = nullptr;
+    cudaEvent_t guess_fork = nullptr, guess_done = nullptr;
+    DeviceBuffer guess_logits, guess_ids;
 
     struct ExpertPeer {
         cudaStream_t stream = nullptr;
@@ -286,6 +302,10 @@ struct Executor::Impl {
     std::map<std::uint32_t, GraphEntry> graphs;
     std::vector<std::uint32_t> verify_widths;
     std::unique_ptr<dspine::Runtime> spine;
+    // The spine drafter's tap of each visit's output state (-1: none), and of the final norm's
+    // rows (DFlash2's last tap; -1 for DSpine).
+    std::vector<int> spine_tap_after;
+    int spine_final_tap = -1;
     std::unique_ptr<Spark> spark;
     // The vision tower and its buffers: an image's patches, a span's rows.
     std::unique_ptr<VisionTower> tower;
@@ -306,14 +326,26 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 executor: at most 7 drafts a round");
         }
         if (options.dspark &&
-            (!model.dspark() || options.dspine || options.draft_tokens == 0 ||
+            (!model.dspark() || options.dspine || options.dflash2 || options.draft_tokens == 0 ||
              options.draft_tokens + 1 > model.dspark_config()->block_size)) {
             throw std::invalid_argument("inkling2 executor: DSpark drafting needs the model's "
+                                        "drafter and 1 to its block less one drafts a round");
+        }
+        if (options.dflash2 &&
+            (!model.dflash2() || options.dspine || options.draft_tokens == 0 ||
+             options.draft_tokens + 1 > model.dflash2_config()->block_size)) {
+            throw std::invalid_argument("inkling2 executor: DFlash2 drafting needs the model's "
                                         "drafter and 1 to its block less one drafts a round");
         }
         stream = device.stream;
         const int device_id = device.rank(0).device;
         kvfmt = kv_format(o.kv_cache);
+        // Where a device's copies queue behind one another whatever their streams
+        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for a missing host
+        // or disk expert can hold back the copies that end it, so those placements run eager. Experts on
+        // the device capture their graphs as everywhere else.
+        if (!model.expert_banks().empty() && serialized_copy_queue()) { options.cuda_graphs = false; }
+
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -362,6 +394,7 @@ struct Executor::Impl {
         }
         const auto schedule  = config.visits();
         const int sequences  = int(options.sequences);
+        const std::vector<int> stores = loop_stores(schedule);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
         // Bytes of one full visit's K and V rows of one slot: F16 halves, or a quantized row's
         // codes and scales.
@@ -375,7 +408,9 @@ struct Executor::Impl {
                 : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
         {
             std::size_t needed = 0;
-            for (const auto& [layer, pass] : schedule) {
+            for (std::size_t v = 0; v < schedule.size(); ++v) {
+                const std::uint32_t layer = schedule[v].first;
+                if (stores[v] >= 0) { continue; }
                 needed += config.full_attention[layer]
                               ? std::size_t(global_slots) * full_slot_bytes
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
@@ -387,6 +422,10 @@ struct Executor::Impl {
             if (options.dspine) {
                 needed += dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
                                                          spine_options());
+            }
+            if (options.dflash2) {
+                needed += dspine::Runtime::planned_bytes(*model.dflash2_config(), *model.dflash2(),
+                                                         DType::FP32, spine_options());
             }
             if (options.dspark) { needed += spark_planned_bytes(); }
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -416,11 +455,16 @@ struct Executor::Impl {
             p.restart      = config.core(layer) && layer == config.core_start && pass > 0;
             p.control      = config.core(layer) && pass > 0;
             p.start        = layer % config.block_size == 0;
+            p.store        = stores[v];
             p.slots        = p.full ? global_slots : ring;
             p.ring         = p.full ? 0 : ring;
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
+            if (p.store >= 0) {
+                visits.push_back(std::move(p));
+                continue;
+            }
             if (p.full && kvfmt.quantized()) {
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
@@ -474,15 +518,20 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
         }
         // A full visit's decode or verification row splits its keys so that one row's blocks
-        // number about 32 per multiprocessor, at most 512 (the combine's capacity); the kernel
-        // uses fewer while the keys are short (active_splits). Every row of every call splits
-        // alike, so a verification row computes what a decode step at its position computes. On
-        // an RTX 3090 after 120K tokens 32 (328 splits) decoded at 67.1 tok/s, 16 at 66.7, 64
-        // (512) at 67.0 but 1.2% slower after 32K, and 128 splits at 65.5; 2 a multiprocessor
-        // decoded 4-40% slower.
-        const int sms         = device.multiprocessor_count();
+        // number about two per multiprocessor on tensor cores, at most 512 (the combine's
+        // capacity); the kernel uses fewer while the keys are short (active_splits). Every row of
+        // every call splits alike, so a verification row computes what a decode step at its
+        // position computes. On an RTX 3090 (82 multiprocessors, 8 KV heads) the tensor-core
+        // kernel read 114,754 MXFP8 keys in 294 us with 20 splits, 297 with 30, 328 with 21 (some
+        // multiprocessors three blocks), 349 with 41 and 434 with 10; four verification rows took
+        // 689 us with 20, 688 with 10 and 694 with 30; after 32,070 keys 20 splits took 94 us and
+        // 41 took 110. Volta's SIMT kernel keeps about 32 blocks a multiprocessor.
+        const int sms = device.multiprocessor_count();
+        const int kv_divisor = std::max(1, kv_heads);
         decode_splits_full =
-            std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
+            ops::kBuildVolta && ops::device_tier(device.rank(0).device) == ops::DeviceTier::Volta
+                ? std::clamp((32 * sms + kv_divisor - 1) / kv_divisor, 1, 512)
+                : std::clamp(2 * sms / kv_divisor, 1, 512);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
@@ -494,7 +543,7 @@ struct Executor::Impl {
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         if (options.dspark) { plan_spark(device_id, sequences); }
         for (VisitPlan& p : visits) {
-            if (!p.full) { continue; }
+            if (!p.full || p.store >= 0) { continue; }
             if (p.k_codes.p != nullptr) {
                 for (KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
                     sequence_areas.push_back(area);
@@ -522,20 +571,50 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            if (workspace_bytes + launch_reserve() + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
-                    " MiB for the CUDA graphs need more than the " +
+                    " MiB and " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading need more than the " +
                     std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --max-concurrency, --max-context or the "
                     "prompt chunk");
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
-        if (options.dspine) { make_spine(); }
+        if (options.dspine || options.dflash2) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        plan_guess();
+    }
+
+    void plan_guess() {
+        if (model.expert_residency() != ExpertResidency::Device || model.expert_parallel() ||
+            bf16_rows) {
+            return;
+        }
+        const int width         = int(config.moe_intermediate_size);
+        const auto expert_bytes = [&](const LayerPlan& p) {
+            return std::size_t(2 * width) * std::size_t(p.gate_up_row_bytes) +
+                   std::size_t(hidden) * std::size_t(p.down_row_bytes);
+        };
+        std::size_t smallest = 0;
+        for (const LayerPlan& p : layers) {
+            const std::size_t b = expert_bytes(p);
+            smallest            = smallest == 0 ? b : std::min(smallest, b);
+        }
+        const int device_id = device.rank(0).device;
+        guess_budget        = ops::moe_prefetch_budget(device_id, smallest);
+        if (guess_budget == 0) { return; }
+        guess_layer.assign(layers.size(), 0);
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            guess_layer[l] = ops::moe_prefetch_budget(device_id, expert_bytes(layers[l])) > 0;
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&guess_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_done, cudaEventDisableTiming));
+        guess_logits = DeviceBuffer(std::size_t(config.num_experts) * 4);
+        guess_ids    = DeviceBuffer(visits.size() * std::size_t(guess_budget) * 4);
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -679,8 +758,9 @@ struct Executor::Impl {
     // ---- Drafters --------------------------------------------------------------------------------
 
     [[nodiscard]] dspine::RuntimeOptions spine_options() const {
-        const dspine::Config& c    = model.dspine()->config();
-        const std::uint32_t window = dspine::ring_capacity(c, options.max_context);
+        const std::uint32_t window =
+            options.dflash2 ? model.dflash2_config()->sliding_window
+                            : dspine::ring_capacity(model.dspine()->config(), options.max_context);
         dspine::RuntimeOptions o;
         o.sequences       = options.sequences;
         o.kept_states     = options.checkpoints ? 1 : 0;
@@ -705,7 +785,9 @@ struct Executor::Impl {
     // its head as FP32 logits before the soft cap, as Gemma 4's does, on rank 0. Its vocabulary
     // is the head's stored rows (config.vocab_size): the scored rows come from the head, the
     // padding rows past them are zero. No token of a sequence reaches those, since the
-    // tokenizer's domain lies within the scored rows.
+    // tokenizer's domain lies within the scored rows. A DSpine drafter's target layer v is visit
+    // v's output; DFlash2's (as the release captures them) is visit v's input, the output of the
+    // visit before it, and the last one, visit_count(), the final norm's rows.
     void make_spine() {
         dspine::Target target;
         target.hidden = std::uint32_t(hidden);
@@ -754,16 +836,35 @@ struct Executor::Impl {
                                              std::size_t(rows - vocab) * 4, std::size_t(n), on));
             }
         };
+        spine_tap_after.assign(visits.size(), -1);
+        if (options.dflash2) {
+            spine = std::make_unique<dspine::Runtime>(*model.dflash2_config(), *model.dflash2(),
+                                                      std::move(target), spine_options());
+            for (std::size_t v = 1; v < visits.size(); ++v) {
+                const int tap = spine->tap_of(std::uint32_t(v));
+                if (tap < 0) { continue; }
+                // A visit's input is the state the visit before it leaves, unless the visit
+                // restarts the core from the prelude's output.
+                if (visits[v].restart) {
+                    throw std::invalid_argument("inkling2 DFlash2: a tap outside the implemented "
+                                                "visits");
+                }
+                spine_tap_after[v - 1] = tap;
+            }
+            spine_final_tap = spine->tap_of(std::uint32_t(visits.size()));
+            return;
+        }
         spine = std::make_unique<dspine::Runtime>(*model.dspine(), std::move(target),
                                                   spine_options());
+        for (std::size_t v = 0; v < visits.size(); ++v) {
+            spine_tap_after[v] = spine->tap_of(std::uint32_t(v));
+        }
     }
 
-    // Tap `v` of the DSpine drafter, when it reads that visit's output: rows [first, first + n)
-    // of the state h [T][H] into feature columns [0, n).
-    void store_tap(std::size_t v, const float* h, int first, int n) {
-        if (!spine || n <= 0) { return; }
-        const int tap = spine->tap_of(std::uint32_t(v));
-        if (tap < 0) { return; }
+    // The drafter's tap `tap` (none when negative): rows [first, first + n) of the state h [T][H]
+    // into feature columns [0, n).
+    void store_tap(int tap, const float* h, int first, int n) {
+        if (!spine || n <= 0 || tap < 0) { return; }
         spine->store_tap(std::uint32_t(tap),
                          Tensor(const_cast<float*>(h) + std::int64_t(first) * hidden, DType::FP32,
                                 {hidden, n}),
@@ -817,7 +918,6 @@ struct Executor::Impl {
         }
         bytes += (options.checkpoints ? 2 : 1) * std::size_t(options.sequences) * kR *
                  config.hidden_size * 4;
-        bytes += std::size_t(config.unpadded_vocab_size) * (dc.markov_rank * 2 + 4);
         return bytes;
     }
 
@@ -846,23 +946,25 @@ struct Executor::Impl {
             }
             d->tap_after[v - 1] = j;
         }
-        d->fuse            = fp32(model, dw.fuse, int(dc.num_hidden_layers + 1) * d->taps);
+        d->mix             = fp32(model, dw.mix, int(dc.num_hidden_layers + 1) * d->taps);
         d->context_norm    = fp32(model, dw.context_norm, hidden);
         d->final_norm      = fp32(model, dw.final_norm, hidden);
         d->mask_embedding  = fp32(model, dw.mask_embedding, hidden);
         const int rank     = int(dc.markov_rank);
         d->joint           = fp32(model, dw.joint, 3 * rank * (2 * rank + 2 * hidden));
         d->joint_bias      = fp32(model, dw.joint_bias, 3 * rank);
-        d->hidden_out      = fp32(model, dw.hidden_out, hidden * rank);
-        d->hidden_out_bias = fp32(model, dw.hidden_out_bias, hidden);
-        {
-            const Tensor t = weight_tensor(model.weight(dw.markov_embed).view,
-                                           {std::int32_t(rank), std::int32_t(config.vocab_size)});
+        d->markov_out_bias = fp32(model, dw.markov_out_bias, vocab);
+        const auto bf16_rows = [&](WeightId id, const char* what) {
+            const Tensor t = weight_tensor(model.weight(id).view,
+                                           {std::int32_t(rank), std::int32_t(vocab)});
             if (t.dtype != DType::BF16) {
-                throw std::invalid_argument("inkling2 DSpark: the Markov embedding must be BF16");
+                throw std::invalid_argument(std::string("inkling2 DSpark: the Markov ") + what +
+                                            " must be BF16");
             }
-            d->markov_embed = static_cast<const __nv_bfloat16*>(t.data);
-        }
+            return static_cast<const __nv_bfloat16*>(t.data);
+        };
+        d->markov_embed = bf16_rows(dw.markov_embed, "embedding");
+        d->markov_out   = bf16_rows(dw.markov_out, "output");
         const int q = query_heads * kD, w = int(dc.intermediate_size);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
         for (std::uint32_t i = 0; i < dc.num_hidden_layers; ++i) {
@@ -914,49 +1016,13 @@ struct Executor::Impl {
             d->contexts_kept = DeviceBuffer(contexts);
             d->bytes += contexts;
         }
-        d->table_m = DeviceBuffer(std::size_t(vocab) * rank * 2);
-        d->table_c = DeviceBuffer(std::size_t(vocab) * 4);
         d->state   = DeviceBuffer(std::size_t(rank) * 4);
         d->prev    = DeviceBuffer(4);
         d->drafts  = DeviceBuffer(std::size_t(d->block) * 4);
         d->confidence = DeviceBuffer(std::size_t(d->block) * 4);
-        d->bytes += d->table_m.bytes + d->table_c.bytes;
         d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8);
         d->copied = std::make_unique<CudaCompletionEvent>(device);
         spark = std::move(d);
-    }
-
-    // The head's products of the recurrent correction (M = head hidden_out, c = head bias), from
-    // the head's decoded rows in FP32, once.
-    void prepare_spark() {
-        Spark& d = *spark;
-        if (d.prepared) { return; }
-        const int rank = int(d.config->markov_rank), cols = rank + 1;
-        workspace->reset();
-        auto scope   = workspace->scope();
-        auto* inputs = static_cast<float*>(workspace->alloc_bytes(std::size_t(cols) * hidden * 4).data);
-        kernels::spark_head_inputs(d.hidden_out, d.hidden_out_bias, hidden, rank, inputs, stream);
-        const std::size_t free = workspace->capacity() - workspace->used() - (2u << 20);
-        int chunk = int(std::min<std::size_t>(8192, free / (std::size_t(hidden + cols) * 4 + 4)));
-        chunk     = chunk / 256 * 256;
-        if (chunk < 256) { throw std::runtime_error("inkling2 DSpark: no workspace for the table"); }
-        auto* ids  = static_cast<std::int32_t*>(workspace->alloc_bytes(std::size_t(chunk) * 4).data);
-        auto* rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(chunk) * hidden * 4).data);
-        auto* out  = static_cast<float*>(workspace->alloc_bytes(std::size_t(chunk) * cols * 4).data);
-        std::vector<std::int32_t> host(chunk);
-        for (int first = 0; first < vocab; first += chunk) {
-            const int n = std::min(chunk, vocab - first);
-            for (int i = 0; i < n; ++i) { host[i] = first + i; }
-            CUDA_CHECK(cudaMemcpyAsync(ids, host.data(), std::size_t(n) * 4, cudaMemcpyHostToDevice,
-                                       stream));
-            table_rows(head, ids, n, rows, hidden, stream);
-            kernels::gemm_f32(cols, n, hidden, inputs, rows, out, stream);
-            kernels::spark_table(out, n,
-                                 static_cast<__nv_bfloat16*>(d.table_m.p) + std::int64_t(first) * rank,
-                                 static_cast<float*>(d.table_c.p) + first, stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
-        d.prepared = true;
     }
 
     // The drafter's caches of rows [0, c.spark_rows) of a call, from its taps: each layer's
@@ -974,7 +1040,7 @@ struct Executor::Impl {
         for (int j = 0; j + 1 < d.taps; ++j) { ma.taps[j] = c.spark_taps + std::int64_t(j) * c.plane; }
         ma.taps[d.taps - 1] = c.ffn_f32;
         ma.tap_count        = d.taps;
-        ma.fuse             = d.fuse;
+        ma.mix              = d.mix;
         for (int l = 0; l < contexts; ++l) { ma.norm[l] = d.layers[l].context_norm; }
         ma.norm[contexts] = d.context_norm;
         ma.context_count  = contexts;
@@ -1130,8 +1196,17 @@ struct Executor::Impl {
                               head_in.rows);
             vector_f32(head_in.base, head, k, base + vocab, vocab);
         }
+        // Each step's candidates: the kSparkCandidates largest head products of its row.
+        constexpr int count = kernels::kSparkCandidates;
+        auto* candidate_ids = static_cast<std::int32_t*>(
+            workspace->alloc_bytes(std::size_t(k) * count * 4).data);
+        auto* candidate_values = static_cast<float*>(
+            workspace->alloc_bytes(std::size_t(k) * count * 4).data);
+        kernels::spark_candidates(base + vocab, vocab, vocab, k, candidate_ids, candidate_values,
+                                  workspace->alloc_bytes(kernels::spark_candidates_bytes(k)).data,
+                                  stream);
         auto* scratch = static_cast<float*>(
-            workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4).data);
+            workspace->alloc_bytes(kernels::spark_step_floats() * 4).data);
         CUDA_CHECK(cudaMemsetAsync(d.state.p, 0, d.state.bytes, stream));
         CUDA_CHECK(cudaMemcpyAsync(d.prev.p, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
         kernels::SparkStepArgs sa;
@@ -1144,11 +1219,10 @@ struct Executor::Impl {
         sa.slots        = kR;
         sa.positions    = rows.positions;
         sa.sequences    = rows.sequences;
-        sa.base         = base;
-        sa.vocab_stride = vocab;
-        sa.m            = static_cast<const __nv_bfloat16*>(d.table_m.p);
-        sa.c            = static_cast<const float*>(d.table_c.p);
-        sa.vocab        = vocab;
+        sa.candidate_ids    = candidate_ids;
+        sa.candidate_values = candidate_values;
+        sa.m            = d.markov_out;
+        sa.c            = d.markov_out_bias;
         sa.hidden_size  = hidden;
         sa.cap          = config.logit_softcap;
         sa.state        = static_cast<float*>(d.state.p);
@@ -1157,7 +1231,6 @@ struct Executor::Impl {
         sa.confidence   = static_cast<float*>(d.confidence.p);
         sa.joint        = scratch;
         sa.logits       = scratch + 3 * dc.markov_rank;
-        sa.partials     = sa.logits + vocab;
         for (int i = 1; i <= k; ++i) {
             sa.row = i;
             kernels::spark_step(sa, stream);
@@ -1183,7 +1256,6 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 draft: a block needs a committed token before it "
                                         "and room in the context");
         }
-        prepare_spark();
         back(sequence, first + std::uint32_t(b));
         std::vector<std::int32_t> tokens(b, 0), pos(b), seq(b, std::int32_t(sequence));
         tokens[0] = anchor;
@@ -1222,16 +1294,18 @@ struct Executor::Impl {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + unbacked() + launch_reserve() > free) {
             throw InsufficientMemory("Inkling 2: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                std::to_string(unbacked() >> 20) +
-                " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
+                std::to_string(unbacked() >> 20) + " MiB for the growing caches and " +
+                std::to_string(launch_reserve() >> 20) +
+                " MiB kept free for CUDA graphs and kernel loading after workspace allocation");
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
+        transport.top_k           = config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.keep_free_bytes = launch_reserve() + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -1271,11 +1345,6 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
-        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
-        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         for (auto& p : layers) {
             if (p.delivery_layer < 0) { continue; }
             const auto l       = std::size_t(p.delivery_layer);
@@ -1289,6 +1358,17 @@ struct Executor::Impl {
 
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    // Without graphs the device still keeps room for the kernels CUDA loads at their first
+    // launch (lazy module loading): a prompt or reply reaches kernels that startup never
+    // launched, and with every byte given to the expert cache that load fails ("out of memory").
+    static constexpr std::size_t kKernelReserve = std::size_t(64) << 20;
+
+    // What the device keeps free beside the planned memory: the CUDA graphs' reserve where this run
+    // captures them (graphs are off for --no-cuda-graph, and for host or disk experts where a
+    // device's copies queue behind one another), else the kernels' reserve.
+    [[nodiscard]] std::size_t launch_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : kKernelReserve;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     // ---- Growing caches --------------------------------------------------------------------------
@@ -1369,7 +1449,9 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + launch_reserve()) {
+            delivery->shrink_cache(need + launch_reserve() - free);
+        }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
@@ -1393,8 +1475,41 @@ struct Executor::Impl {
                                                    : std::size_t(512) << 20;
     }
 
+    // The visit whose caches each visit of `schedule` uses (VisitPlan::store): -1, its own, or
+    // with --loop-kv the core layer's last pass for an earlier pass of a full-attention core layer
+    // (LastFull) or of any core layer (LastAll).
+    [[nodiscard]] std::vector<int>
+    loop_stores(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& schedule) const {
+        std::vector<int> out(schedule.size(), -1);
+        if (options.loop_kv == LoopKvCache::PerPass) { return out; }
+        if (config.num_passes < 2) {
+            throw std::invalid_argument("Inkling 2: --loop-kv needs a looped core; this model runs "
+                                        "its layers once");
+        }
+        std::map<std::uint32_t, int> last; // a core layer's last-pass visit
+        for (std::size_t v = 0; v < schedule.size(); ++v) {
+            const auto [layer, pass] = schedule[v];
+            if (config.core(layer) && pass + 1 == config.num_passes) { last[layer] = int(v); }
+        }
+        for (std::size_t v = 0; v < schedule.size(); ++v) {
+            const auto [layer, pass] = schedule[v];
+            const bool shared =
+                config.full_attention[layer] || options.loop_kv == LoopKvCache::LastAll;
+            if (config.core(layer) && pass + 1 < config.num_passes && shared) {
+                out[v] = last.at(layer);
+            }
+        }
+        return out;
+    }
+
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (guess_stream != nullptr) {
+            ninfer::wait_for_stream(guess_stream);
+            cudaStreamDestroy(guess_stream);
+            cudaEventDestroy(guess_fork);
+            cudaEventDestroy(guess_done);
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1597,6 +1712,18 @@ struct Executor::Impl {
                            config.up_cap, middle, on);
     }
 
+    // The same middles as the down product's vector activation `act` (vector_activation_bytes of
+    // width x pairs).
+    void situ_q8(const float* gu, int pairs, const float* pair_scale, void* act,
+                 cudaStream_t on) const {
+        const int width = int(config.moe_intermediate_size);
+        auto* base      = static_cast<std::byte*>(act);
+        const std::size_t scales = gguf::vector_activation_scales_offset(width, pairs);
+        kernels::situ_q8(gu, 2 * std::int64_t(width), pairs, width, pair_scale, config.gate_cap,
+                         config.up_cap, reinterpret_cast<std::int8_t*>(base),
+                         reinterpret_cast<half2*>(base + scales), on);
+    }
+
     // A BF16 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows `gu`, their
     // SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
     void bf16_experts(const void* const* tables, const gguf::MoeRouting& routing, int max_active,
@@ -1654,8 +1781,7 @@ struct Executor::Impl {
             rows.f32 = gu;
             gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
                                      rows, chunk, on);
-            situ(gu, pairs, pair_scale, middle, on);
-            gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, on);
+            situ_q8(gu, pairs, pair_scale, act2, on);
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
@@ -1813,6 +1939,33 @@ struct Executor::Impl {
                     column_stride, row);
     }
 
+    // product() for a layer's projections of one call: with q8_1 inputs those of one block type
+    // and row size share a launch (ops::detail::gguf_vector_project).
+    struct Projection {
+        const Weight* w;
+        const void* xq;
+        const __nv_bfloat16* x;
+        float* out;
+        int column_stride;
+        int row;
+    };
+    void products(std::span<const Projection> list, int t) {
+        if (std::any_of(list.begin(), list.end(), [](const Projection& p) { return p.xq == nullptr; })) {
+            for (const Projection& p : list) {
+                product(*p.w, p.xq, p.x, t, p.out, p.column_stride, p.row);
+            }
+            return;
+        }
+        std::vector<ops::detail::GgufVectorProduct> queued(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            queued[i].weight            = list[i].w;
+            queued[i].activation        = list[i].xq;
+            queued[i].out.f32           = list[i].out + list[i].row;
+            queued[i].out.column_stride = list[i].column_stride;
+        }
+        ops::detail::gguf_vector_project(queued, t, stream);
+    }
+
     static constexpr std::size_t kStagingRegions = 4;
 
     // Tokens, positions, and when given sequences and branch starts, to the device.
@@ -1878,6 +2031,8 @@ struct Executor::Impl {
         int spark_rows    = 0;
         // A call of at most kernels::kSplitRows rows: the split depth mixes' scratch.
         float* split = nullptr;
+        bool guess   = false; // a decode call that reads its visits' guessed experts ahead
+        bool guessed = false; // the guess stream has work of this call to join
     };
 
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
@@ -1953,14 +2108,15 @@ struct Executor::Impl {
     }
 
     // The output's mix: the final norm into the MoE input's BF16 or q8_1 rows.
-    // With the DSpark drafter its FP32 rows too (the drafter's last tap), in the MoE input's.
+    // With the DSpark or DFlash2 drafter its FP32 rows too (the drafter's last tap), in the MoE
+    // input's.
     kernels::MixArgs output_mix_args(Call& c) {
         kernels::MixArgs m = mix_args(c, output_mix, 1);
         m.norm[0]          = final_norm;
         std::int64_t unused = 0;
         float* none         = nullptr;
         set_outputs(c, m.out, m.out_q, none, unused, c.ffn_bf16, c.ffn_q, 0,
-                    spark ? c.ffn_f32 : nullptr);
+                    spark || spine_final_tap >= 0 ? c.ffn_f32 : nullptr);
         return m;
     }
 
@@ -2179,11 +2335,14 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
+        std::vector<Projection> qkv;
         for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            qkv.push_back({&lp.query[i], input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
+        qkv.push_back({&lp.key, input_q(c, ki), bf16_in(ki), kv, 2 * kvd, 0});
+        qkv.push_back({&lp.value, input_q(c, vi), bf16_in(vi), kv, 2 * kvd, kvd});
+        products(qkv, t);
+        if (guesses(c, v)) { read_ahead(c, v); }
         kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
@@ -2196,32 +2355,31 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
-        {
-            kernels::QueryArgs qa;
-            qa.qgr             = qgr;
-            qa.stride          = lp.query_rows;
-            qa.relative_column = 2 * q_floats;
-            qa.tokens          = t;
-            qa.heads           = query_heads;
-            qa.query_clip      = lp.query_clip;
-            qa.relative_clip   = lp.relative_clip;
-            qa.qk_clip         = config.qk_clip;
-            qa.rel_clip        = config.relative_clip;
-            qa.log_scale       = lp.full;
-            qa.alpha           = config.log_scale_alpha;
-            qa.floor           = float(config.log_scale_floor);
-            qa.positions       = c.rows.positions;
-            qa.q_out           = q;
-            qa.r_out           = r;
-            kernels::query_post(qa, stream);
-        }
-        // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
-        // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A full visit of an
-        // mxfp8 run has kv_post encode its rows into its planes; one of rk8v4 or rk4v4 stages
-        // them as F16 (one slot per row) for kv_store to encode.
+        kernels::QueryArgs qa;
+        qa.qgr             = qgr;
+        qa.stride          = lp.query_rows;
+        qa.relative_column = 2 * q_floats;
+        qa.tokens          = t;
+        qa.heads           = query_heads;
+        qa.query_clip      = lp.query_clip;
+        qa.relative_clip   = lp.relative_clip;
+        qa.qk_clip         = config.qk_clip;
+        qa.rel_clip        = config.relative_clip;
+        qa.log_scale       = lp.full;
+        qa.alpha           = config.log_scale_alpha;
+        qa.floor           = float(config.log_scale_floor);
+        qa.positions       = c.rows.positions;
+        qa.q_out           = q;
+        qa.r_out           = r;
+        // K and V into the cache, in the launch that also writes Q: a prompt chunk's sliding visit
+        // attends over the staging ring (the window before the chunk comes over from the
+        // sequence's ring, the chunk's keys land there, and the window that ends the chunk's kept
+        // rows goes back). A full visit of an mxfp8 run encodes its rows into its planes there;
+        // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
+        // The caches are the visit's own, or (--loop-kv) the core's last pass's (`kvp`).
+        const VisitPlan& kvp = vp.store >= 0 ? visits[std::size_t(vp.store)] : vp;
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
-        const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
+        const std::int64_t seq_offset   = std::int64_t(c.sequence) * kvp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
         const bool quantized = vp.full && kvfmt.quantized();
         KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
@@ -2232,15 +2390,15 @@ struct Executor::Impl {
                 plane.scales  = static_cast<std::uint8_t*>(scales.p);
                 plane.code_row  = kv_code_bytes(coding);
                 plane.scale_row = kv_scale_bytes(coding);
-                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
-                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
+                plane.code_head  = std::int64_t(kvp.slots) * plane.code_row;
+                plane.scale_head = std::int64_t(kvp.slots) * plane.scale_row;
                 plane.code_seq  = plane.code_head * kv_heads;
                 plane.scale_seq = plane.scale_head * kv_heads;
                 plane.coding    = coding;
                 return plane;
             };
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+            k_view = view(kvp.k_codes, kvp.k_scales, kvfmt.key.coding);
+            v_view = view(kvp.v_codes, kvp.v_scales, kvfmt.value.coding);
         }
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
@@ -2271,13 +2429,13 @@ struct Executor::Impl {
             ka.ring        = 0;
             ka.row_slots   = true;
         } else if (staging) {
-            keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
-            keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
+            keep.src_k           = static_cast<const __half*>(kvp.k.p) + seq_offset;
+            keep.src_v           = static_cast<const __half*>(kvp.v.p) + seq_offset;
             keep.dst_k           = static_cast<__half*>(staging_k.p);
             keep.dst_v           = static_cast<__half*>(staging_v.p);
-            keep.src_head_stride = vp.head_stride;
+            keep.src_head_stride = kvp.head_stride;
             keep.dst_head_stride = stage_stride;
-            keep.src_ring        = vp.ring;
+            keep.src_ring        = kvp.ring;
             keep.dst_ring        = prefill_ring;
             keep.begin           = std::max(0, c.first - window);
             keep.end             = c.first;
@@ -2288,13 +2446,13 @@ struct Executor::Impl {
             ka.head_stride = stage_stride;
             ka.ring        = prefill_ring;
         } else {
-            ka.k_cache     = static_cast<__half*>(vp.k.p);
-            ka.v_cache     = static_cast<__half*>(vp.v.p);
-            ka.seq_stride  = vp.seq_stride;
-            ka.head_stride = vp.head_stride;
-            ka.ring        = vp.ring;
+            ka.k_cache     = static_cast<__half*>(kvp.k.p);
+            ka.v_cache     = static_cast<__half*>(kvp.v.p);
+            ka.seq_stride  = kvp.seq_stride;
+            ka.head_stride = kvp.head_stride;
+            ka.ring        = kvp.ring;
         }
-        kernels::kv_post(ka, stream);
+        kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
@@ -2364,14 +2522,17 @@ struct Executor::Impl {
             aa.out_q       = attn_q.rows;
             kernels::attention(aa, stream);
         }
-        if (staging && c.kept > 0) {
+        // A ring another pass shares takes back only the last pass's window: an earlier pass's
+        // rows past position `first + kept - ring` would land in the slots of the window before
+        // the chunk, which the next pass still copies in.
+        if (staging && c.kept > 0 && vp.store < 0) {
             kernels::RingCopyArgs back = keep;
             std::swap(back.src_head_stride, back.dst_head_stride);
             std::swap(back.src_ring, back.dst_ring);
             back.src_k = static_cast<const __half*>(staging_k.p);
             back.src_v = static_cast<const __half*>(staging_v.p);
-            back.dst_k = static_cast<__half*>(vp.k.p) + seq_offset;
-            back.dst_v = static_cast<__half*>(vp.v.p) + seq_offset;
+            back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
+            back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
             back.begin = std::max(0, c.first + c.kept - window);
             back.end   = c.first + c.kept;
             kernels::ring_copy(back, stream);
@@ -2414,6 +2575,7 @@ struct Executor::Impl {
         ra.cur     = s.buffers[s.cur];
         ra.hidden  = hidden;
         ra.mix.split = c.split;
+        if (v + 1 < visits.size() && guesses(c, v + 1)) { guess(c, v + 1); }
         experts(lp, c, ra);
         const bool last = v + 1 == visits.size();
         if (last) {
@@ -2427,6 +2589,49 @@ struct Executor::Impl {
             const auto [begin, end] = kept_history(c);
             kernels::keep_products(ra, begin, end, stream);
         }
+    }
+
+    // Whether visit v of call c reads its guessed experts ahead.
+    [[nodiscard]] bool guesses(const Call& c, std::size_t v) const {
+        return c.guess && v > 0 && guess_layer[visits[v].layer] != 0;
+    }
+
+    // Visit v's router on the MoE input of the visit before (c.ffn_f32, which the main stream does
+    // not rewrite before read_ahead(v) waits for this): its guess_budget best experts.
+    void guess(Call& c, std::size_t v) {
+        const LayerPlan& lp = layers[visits[v].layer];
+        const int e         = int(config.num_experts);
+        CUDA_CHECK(cudaEventRecord(guess_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(guess_stream, guess_fork, 0));
+        auto* logits = static_cast<float*>(guess_logits.p);
+        kernels::gemm_f32(e, 1, hidden, lp.router, c.ffn_f32, logits, guess_stream);
+        ops::moe_guess_experts(logits, lp.router_bias, 1, e, guess_budget,
+                               static_cast<std::int32_t*>(guess_ids.p) + v * guess_budget,
+                               guess_stream);
+        CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
+        c.guessed = true;
+    }
+
+    // Visit v's guessed experts into L2 on the guess stream, beside the main stream's attention;
+    // the main stream may then rewrite the MoE input the guess read.
+    void read_ahead(Call& c, std::size_t v) {
+        const LayerPlan& lp = layers[visits[v].layer];
+        const int e         = int(config.num_experts);
+        const int width     = int(config.moe_intermediate_size);
+        CUDA_CHECK(cudaEventRecord(guess_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(guess_stream, guess_fork, 0));
+        const auto* const* tables = static_cast<const void* const*>(lp.tables.p);
+        ops::ExpertPrefetch pf;
+        pf.tables[0]   = tables + 2 * e;
+        pf.bytes[0]    = std::int64_t(2 * width) * lp.gate_up_row_bytes;
+        pf.tables[1]   = tables + 3 * e;
+        pf.bytes[1]    = std::int64_t(hidden) * lp.down_row_bytes;
+        pf.projections = 2;
+        pf.experts     = e;
+        pf.ids         = static_cast<const std::int32_t*>(guess_ids.p) + v * guess_budget;
+        pf.count       = guess_budget;
+        ops::moe_expert_prefetch(pf, guess_stream);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
     }
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
@@ -2468,9 +2673,17 @@ struct Executor::Impl {
                                               const_cast<std::int32_t*>(routing.tiles),
                                               routing.tile_capacity};
         }
-        kernels::route(route, stream);
+        // The vector route's fixed-point sums start from zero in the route launch.
         const bool vector = c.q8;
-        const void* act   = vector ? c.ffn_q.base : nullptr;
+        unsigned long long* fixed = nullptr;
+        if (vector && !model.expert_parallel()) {
+            fixed = static_cast<unsigned long long*>(
+                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
+            route.zero       = fixed;
+            route.zero_count = std::int64_t(t) * hidden;
+        }
+        kernels::route(route, stream);
+        const void* act = vector ? c.ffn_q.base : nullptr;
         if (model.expert_parallel()) {
             experts_parallel(p, c.ffn_bf16, act, ids, weights, pair_scale, t, ra);
             return;
@@ -2493,16 +2706,11 @@ struct Executor::Impl {
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width,
                                   p.down_aligned16};
         const int max_active = std::min(pairs, e);
-        auto* middle = static_cast<__nv_bfloat16*>(
-            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
-            auto* fixed = static_cast<unsigned long long*>(
-                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
-            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
+            void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2511,8 +2719,7 @@ struct Executor::Impl {
             const auto compute = [&](const gguf::MoeRouting& part) {
                 gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
                                          rows, chunk, stream);
-                situ(gu, pairs, pair_scale, middle, stream);
-                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                situ_q8(gu, pairs, pair_scale, act2, stream);
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };
@@ -2540,6 +2747,8 @@ struct Executor::Impl {
             ra.fixed = fixed;
             return;
         }
+        auto* middle = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (delivery) { delivery->await(stream); }
         if (p.bf16) {
             auto* rows = static_cast<float*>(
@@ -2742,9 +2951,12 @@ struct Executor::Impl {
                 workspace->alloc_bytes(kernels::mix_split_floats(t, hidden) * 4).data);
         }
         embed(c, images);
+        c.guess = guess_budget > 0 && t == 1 && !c.chunk && c.q8;
         for (std::size_t v = 0; v < visits.size(); ++v) {
             visit(c, v);
-            store_tap(v, c.states.buffers[c.states.cur], tap_first, tap_rows);
+            if (spine) {
+                store_tap(spine_tap_after[v], c.states.buffers[c.states.cur], tap_first, tap_rows);
+            }
             if (spark && spark->tap_after[v] >= 0) {
                 CUDA_CHECK(cudaMemcpyAsync(c.spark_taps + std::int64_t(spark->tap_after[v]) * c.plane,
                                            c.states.buffers[c.states.cur],
@@ -2752,7 +2964,13 @@ struct Executor::Impl {
                                            stream));
             }
         }
+        if (c.guessed) {
+            // The last read-ahead joins the main stream (a captured graph ends joined).
+            CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
+        }
         if (spark) { spark_inject(c); }
+        if (spine) { store_tap(spine_final_tap, c.ffn_f32, tap_first, tap_rows); }
     }
 
     // ---- Decode ----------------------------------------------------------------------------------
@@ -2800,7 +3018,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
@@ -2924,7 +3147,6 @@ struct Executor::Impl {
 
     void warm_up() {
         if (spine) { spine->prepare(stream); }
-        if (spark) { prepare_spark(); }
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
         forward(0, prompt, 1);
         if (spine) {
@@ -2986,10 +3208,13 @@ struct Executor::Impl {
         return visits.size() * kR * std::size_t(slot_floats) * 4;
     }
 
-    // Every cache a sequence's state holds: the visits', then the DSpark drafter's layers'.
+    // Every cache a sequence's state holds: the visits' own (not those another visit's stand
+    // for), then the DSpark drafter's layers'.
     [[nodiscard]] std::vector<const VisitPlan*> cache_plans() const {
         std::vector<const VisitPlan*> out;
-        for (const VisitPlan& p : visits) { out.push_back(&p); }
+        for (const VisitPlan& p : visits) {
+            if (p.store < 0) { out.push_back(&p); }
+        }
         if (spark) {
             for (const SparkLayer& l : spark->layers) { out.push_back(&l.cache); }
         }
@@ -3143,6 +3368,14 @@ struct Executor::Impl {
     // A position's state lies in the rings while the sequence has written fewer positions past it
     // than the sliding rings hold beyond the window and a round's drafts, and than the histories
     // hold beyond the convolutions' three earlier inputs and a round's drafts.
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t drafts = std::int64_t(options.draft_tokens);
+        const std::int64_t slack  = std::min<std::int64_t>(std::int64_t(ring) - window - drafts,
+                                                           kR - (kTaps - 1) - drafts);
+        return slack > 0 ? std::uint32_t(slack) : 0;
+    }
+
     bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
         const std::uint32_t at = positions.at(sequence);
         const std::int64_t drafts = std::int64_t(options.draft_tokens);
@@ -3276,13 +3509,9 @@ void Executor::draft(std::span<const std::uint32_t> sequences,
     impl_->draft(sequences, anchors, k, drafts, confidence);
 }
 
-std::uint32_t Executor::dspark_block() const noexcept {
-    return impl_->spark ? std::uint32_t(impl_->spark->block - 1) : 0;
-}
-
-void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-                     std::span<float> confidence) {
-    impl_->spark_draft(sequence, anchor, drafts, confidence);
+std::uint32_t Executor::block_drafts() const noexcept {
+    if (impl_->spark) { return std::uint32_t(impl_->spark->block - 1); }
+    return impl_->spine && impl_->spine->dflash2() ? impl_->spine->block_size() - 1 : 0;
 }
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
@@ -3291,6 +3520,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+    return impl_->rewind_reach(sequence, position);
 }
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {

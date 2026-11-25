@@ -309,6 +309,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.kv_cache_automatic       = options.kv_cache_automatic;
+    engine_options.loop_kv                  = options.loop_kv;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);
@@ -793,6 +794,10 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prepared.thinking_budget                = request_options.execution.thinking.budget;
         }
         if (!prepared.enable_thinking) {
+            // A reply that does not reason refuses an answer-now request.
+            if (request_options.execution.thinking.answer_now) {
+                request_options.execution.thinking.answer_now->mark_answering();
+            }
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
             prepared.effective_thinking_budget.reset();
@@ -952,6 +957,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
+    outcome.bad_words           = result.bad_words;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 

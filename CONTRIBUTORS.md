@@ -26,6 +26,8 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [CommanderTurtle](https://github.com/CommanderTurtle) | System One `box` questions: normalized bounding boxes read as four coordinate distributions, and images kept through the digits of a long label | [#362](https://github.com/iamwavecut/ninfer-all/pull/362) |
 | [fakezeta](https://github.com/fakezeta) | Qwen3.8-27B GGUFs with a condensed vocabulary: token tables and output heads padded to whole 128-row tiles, and the tokenizer, configuration ids and proposal ranking moved to the condensed ids | [#359](https://github.com/iamwavecut/ninfer-all/pull/359) |
 | [lededev](https://github.com/lededev) | The `sm_89` FP8 fast prompt kernel with a shared split-merge route, and the HTTP graceful stop (`POST /shutdown` behind `--admin-token`) | [#333](https://github.com/iamwavecut/ninfer-all/pull/333), [#414](https://github.com/iamwavecut/ninfer-all/pull/414) |
+| [cedrik-fuoco](https://github.com/cedrik-fuoco) | The CUDA Graph reserve of Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 charged only where the graphs run, and the Inkling 2 Mini field report on an 8 GB RTX 3070 Ti under Windows 11 | [#467](https://github.com/iamwavecut/ninfer-all/pull/467) |
+| [hksdpc255](https://github.com/hksdpc255) | The built-in device profiles compiled by Clang with libstdc++ | [#474](https://github.com/iamwavecut/ninfer-all/pull/474) |
 
 ## Work carried from other forks
 
@@ -49,6 +51,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [13thblade/ninfer-all-nvfp4](https://github.com/13thblade/ninfer-all-nvfp4) (13thblade) | NVFP4 weights on GPUs without FP4 tensor cores: the wide W4A16 kernels and the W4A8 int8 routes (`--nvfp4-w4a8-int`, `--nvfp4-w4a16`) with their tensor-parallel shares, and the integer E2M1/E4M3 expansions of the NVFP4 and FP8 KV caches |
 | [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (AshAlliants) | the prefill stall budget (`--prefill-stall-budget-ms`) |
 | [ahostbr](https://github.com/ahostbr) | the DeepSeek-V4.1 prefill proposals behind the decoder blocks' prompt tail, the IQ1_M matrix route of routed experts and the Engram rows read once and ahead ([#238](https://github.com/iamwavecut/ninfer-all/issues/238), [#239](https://github.com/iamwavecut/ninfer-all/issues/239), [#240](https://github.com/iamwavecut/ninfer-all/issues/240)) |
+| [uos1231234](https://github.com/uos1231234) | the Inkling 2 Mini field report on two Tesla T10s without peer access, with its retrieval benchmark runner ([#436](https://github.com/iamwavecut/ninfer-all/issues/436)) |
 | [CommanderTurtle/decisive-ninfer](https://github.com/CommanderTurtle/decisive-ninfer) (CommanderTurtle) | the first `/v1/decision` and `/v1/systemone` adapters for NInfer, proposed upstream as [Neroued/ninfer#387](https://github.com/Neroued/ninfer/pull/387), which inspired the typed decisions here |
 
 ## Pull requests to Neroued/ninfer ported here

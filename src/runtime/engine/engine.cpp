@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "text/bad_words.h"
 #include "text/structured_output.h"
 
 #include "artifact/reader.h"
@@ -139,6 +140,11 @@ EngineOptions with_family_attention(EngineOptions options) {
     }
     if (options.kv_cache == KvCacheStorage::Mxfp8 && !inkling2) {
         throw std::invalid_argument("--kv-dtype mxfp8 applies to Inkling2ForCausalLM artifacts");
+    }
+    // Only Inkling 2 runs layers more than once a token.
+    if (options.loop_kv != LoopKvCache::PerPass && !inkling2) {
+        throw std::invalid_argument("--loop-kv applies to Inkling2ForCausalLM artifacts, the one "
+                                    "family with a looped core");
     }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
@@ -337,6 +343,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
+    resolved.execution.bad_words = text::normalize_bad_words(options.execution.bad_words);
     resolved.execution.logprobs                = options.execution.logprobs;
     resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
     resolved.execution.speculative_drafting    = options.execution.speculative_drafting;
@@ -554,6 +561,11 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = gemma->frontend.sampling_defaults();
+            // options() reports whether decode runs in CUDA Graphs, here and for the families
+            // below as for the Qwen3.5 path: an executor turns them off where a replayed graph
+            // could wait on expert copies queued behind it (host or disk experts on Windows and
+            // WSL2).
+            options.use_cuda_graph = gemma->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Gemma4Core>(*gemma, device, options);
@@ -567,6 +579,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = flint->frontend.sampling_defaults();
+            options.use_cuda_graph = flint->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<FlintCore>(*flint, device, options);
@@ -580,6 +593,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = inkling->frontend.sampling_defaults();
+            options.use_cuda_graph = inkling->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Inkling2Core>(*inkling, device, options);
@@ -593,6 +607,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = deepseek->frontend.sampling_defaults();
+            options.use_cuda_graph = deepseek->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<DeepSeekV41Core>(*deepseek, device, options);
@@ -606,6 +621,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = flash->frontend.sampling_defaults();
+            options.use_cuda_graph = flash->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Qwen4ExpCore>(*flash, device, options);

@@ -341,6 +341,27 @@ int run_tests() {
                               "CLI accepted an invalid --qsa-top-blocks");
         }
     }
+    {
+        // --loop-kv: per-pass by default; the lossy modes only when named.
+        const auto loop = [&](std::vector<std::string> tail) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            return parse(args).loop_kv;
+        };
+        failures += check(loop({}) == ninfer::LoopKvCache::PerPass &&
+                              loop({"--loop-kv", "last-full"}) == ninfer::LoopKvCache::LastFull &&
+                              loop({"--loop-kv", "last-all"}) == ninfer::LoopKvCache::LastAll &&
+                              loop({"--loop-kv", "last-all", "--loop-kv", "per-pass"}) ==
+                                  ninfer::LoopKvCache::PerPass,
+                          "CLI did not preserve --loop-kv");
+        failures += check(ninfer::cli::usage_text("ninfer-cli").find("--loop-kv") !=
+                              std::string::npos,
+                          "CLI help omits --loop-kv");
+        for (const auto* value : {"last_loop", "", "full"}) {
+            failures += check(rejects([&] { (void)loop({"--loop-kv", value}); }),
+                              "CLI accepted an invalid --loop-kv");
+        }
+    }
     for (const auto* share : {"0", "0.25", "1"}) {
         const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-residency", "host", "--expert-dma-share", share,
@@ -937,6 +958,10 @@ int run_tests() {
             (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});
         }),
         "raw JSON output should be rejected");
+    const auto banned = parse({"ninfer", "model.ninfer", "--prompt", "x", "--bad-word", "<message",
+                               "--bad-word", " <think"});
+    failures += check(banned.bad_words == std::vector<std::string>{"<message", " <think"},
+                      "CLI --bad-word collects its words in order");
     failures += launch_configuration_tests();
     return failures == 0 ? 0 : 1;
 }

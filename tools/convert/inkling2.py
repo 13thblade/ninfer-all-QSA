@@ -16,28 +16,37 @@ matrix (UD-Q8_K_XL's attention projections, token table, head and last four laye
 its words and multiplies BF16 inputs. Other BF16 and F32 tensors (sink and dynamic-tap projections,
 router, convolutions, clips, the distance tables, mixing queries, norms, controllers, expert
 scales) become FP32, exactly, as do Q8_0 ones, whose values d * q FP32 holds (IsValorum's APEX
-GGUFs store the sink and dynamic-tap projections in Q8_0).
+GGUFs store the sink and dynamic-tap projections in Q8_0); other block formats (Q4_K in some GGUFs)
+become the FP32 values of their blocks.
 
 The GGUFs come in two layouts that convert to the same artifact: llama.cpp's (`inkling2_loop`, 24
 blocks, a block's four message queries in `blk.N.loop_msg_query` and its controllers
-`loop_{q,k,v,ffn}_ctrl_*`) and the earlier one of Unsloth's root files (`inkling2`, 48 unrolled
-blocks in its metadata, the queries in the global `loop_res_query` and `loop_kv_res_query` and the
-controllers `loop_{attn,k,v,mlp}_*`).
+`loop_{q,k,v,ffn}_ctrl_*`) and the earlier one of Unsloth's root files, now in its `Old_Support/`
+(`inkling2`, 48 unrolled blocks in its metadata, the queries in the global `loop_res_query` and
+`loop_kv_res_query` and the controllers `loop_{attn,k,v,mlp}_*`).
 
 The release's vision tower forms the `vision` component beside `text` (`--components text,vision`,
 `--source vision=mmproj-BF16.gguf`, projector `inkling2v`): a ViT with a class row, learned
 position rows resized to each image and 2D-rotated heads, then 2x2 patch merging and a two-layer
 projector, its vectors FP32 and its matrices BF16 or, from a quantized mmproj such as ggml-org's
 `mmproj-Inkling-2-Mini-Q8_0.gguf`, the GGUF's block rows as stored. The release's DSpark drafter
-(`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`, llama.cpp
+in llama.cpp's layout (`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`,
 architecture `dflash`) forms the `dspark` component: three blocks over the target's tapped hidden
 states, each with its own context projections, and a recurrent Markov head that corrects the
-target's head.
+target's head, its output folded with the release's head by llama.cpp's converter. The earlier
+layout of Unsloth's `dspark-Inkling-2-Mini-Q8_0_Old.gguf`, which stores the unfolded output, is
+refused. incoai's DFlash2 drafter (`--components text,dflash2`, `--source dflash2=DIR`, the
+safetensors directory of incoai/Inkling-2-Mini-DFlash2) forms the `dflash2` component: five
+sliding-window layers over the anchor and seven masks with a dynamic grouped convolution around
+each branch, a context ring projected from the target's tapped states, the target's head and a
+candidate selector; its projections become Q8_G32 rows (grouped absmax), its convolution and
+selector projections, norms and codebooks stay BF16.
 
     python -m tools.convert --model HF_DIR --recipe inkling2_gguf \\
         --source gguf=Inkling-2-Mini-UD-IQ4_XS.gguf \\
         --source vision=mmproj-BF16.gguf --source dspark=dspark-Inkling-2-Mini-Q8_0.gguf \\
-        --components text,vision,dspark --out inkling-2-mini-UD-IQ4_XS.ninfer
+        --source dflash2=Inkling-2-Mini-DFlash2 \\
+        --components text,vision,dspark,dflash2 --out inkling-2-mini-UD-IQ4_XS.ninfer
 
 `HF_DIR` holds the release's `config.json`, `tokenizer.json`, `tokenizer_config.json`,
 `chat_template.jinja` and `generation_config.json` (no weights are read from it).
@@ -54,18 +63,25 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import (GGML_MXFP4, GGML_Q8_0, bf16_source, block_source, dequantize_q8_0,
+from .gguf_blocks import (GGML_MXFP4, bf16_source, block_source, dequantize_blocks,
                           mxfp4_as_q8_0)
-from .methods import cast_direct, import_encoded
+from .methods import cast_direct, grouped_absmax, import_encoded
 from .resources import _dump_json, token_domain
 from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
+from .sources.safetensors import SafetensorsSource, tensor_source
 from .ternary import rows
 
 ARCHITECTURES = ("Inkling2LoopForConditionalGeneration",)
 TEXT_ARCHITECTURE = "Inkling2ForCausalLM"
 VISION_ARCHITECTURE = "Inkling2VisionModel"
 DSPARK_ARCHITECTURE = "Inkling2DSpark"
+DFLASH2_ARCHITECTURE = "Inkling2DFlash2"
+# The DFlash2 projections that stay BF16 (the convolutions' coefficients and the selector's
+# projection, as the Qwen-core recipe keeps them); its other projections become Q8_G32 rows.
+DFLASH2_BF16 = ("/attention_conv/kernel_projection", "/mlp_conv/kernel_projection",
+                "/candidate_selector/hidden_projection")
+DFLASH2_Q8 = "q8_g32_fp16"
 RESOURCES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -277,16 +293,15 @@ def _load_resources(root: Path, vocab: int, overrides: dict):
 
 
 def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
-    """F32 as stored, BF16 and F16 widened exactly, Q8_0 blocks decoded exactly."""
+    """FP32 values: F32 as stored, BF16 and F16 widened exactly, and the ggml blocks of any stored
+    format decoded by `dequantize_blocks` (MiniPlus stores its sink and dynamic-tap projections in
+    Q8_0, other quantizers in Q4_K)."""
 
     info = gguf.info(tensor)
-    if info.type_id == GGML_Q8_0:
-        values = dequantize_q8_0(gguf.read_blocks(tensor))
-    elif info.type_name in ("F32", "BF16", "F16"):
+    if info.type_name in ("F32", "BF16", "F16"):
         values = gguf.read_direct(tensor).astype(np.float32)
     else:
-        raise ValueError(f"{tensor}: expected a float or Q8_0 vector or matrix, found "
-                         f"{info.type_name}")
+        values = dequantize_blocks(info.type_id, gguf.read_blocks(tensor)).numpy()
     if values.size != int(np.prod(shape)):
         raise ValueError(f"{tensor}: stored {info.shape}, expected {shape}")
     return array_source(torch.from_numpy(np.ascontiguousarray(values.reshape(shape))), tensor)
@@ -407,6 +422,14 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
     """The `dspark` component's config from the release's mtp_config, checked against the drafter
     GGUF's metadata."""
 
+    kv, f = dspark.kv, "dflash."
+    if kv.get("general.architecture") != "dflash":
+        raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
+    if "dspark_fuse.weight" in dspark.tensors:
+        raise ValueError(f"{dspark.path}: the earlier DSpark drafter layout (Unsloth's "
+                         "dspark-Inkling-2-Mini-Q8_0_Old.gguf), which stores the Markov head's "
+                         "output unfolded; convert from llama.cpp's layout, Unsloth's "
+                         "dspark-Inkling-2-Mini-Q8_0.gguf")
     raw = source.get("mtp_config")
     if not isinstance(raw, dict) or raw.get("markov_head_type") != "rnn_hidden":
         raise ValueError("config.json has no mtp_config with a recurrent Markov head")
@@ -434,9 +457,7 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
     out["target_layer_ids"] = list(targets)
     if out["num_attention_heads"] % out["num_key_value_heads"]:
         raise ValueError("drafter query heads must be a multiple of its key/value heads")
-    kv, f = dspark.kv, "dflash."
-    if kv.get("general.architecture") != "dflash":
-        raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
+    # llama.cpp's sliding window counts the anchor's own position too.
     expected = {
         "block_count": out["num_hidden_layers"], "embedding_length": config["hidden_size"],
         "feed_forward_length": out["intermediate_size"],
@@ -444,10 +465,8 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
         "attention.head_count_kv": out["num_key_value_heads"],
         "attention.key_length": out["head_dim"], "attention.value_length": out["head_dim"],
         "rope.dimension_count": out["head_dim"], "block_size": out["block_size"],
-        "dspark.markov_rank": out["markov_rank"], "sample_from_anchor": False,
-        "has_confidence_head": False, "attention.causal": False,
-        "attention.sliding_window": out["sliding_window_size"],
-        "vocab_size": config["vocab_size"], "vocab_size_unpadded": config["unpadded_vocab_size"],
+        "sample_from_anchor": False, "has_confidence_head": False, "has_markov_context": True,
+        "attention.sliding_window": out["sliding_window_size"] + 1,
     }
     for key, value in expected.items():
         if kv.get(f + key) != value:
@@ -471,10 +490,123 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
     return out
 
 
+def dflash2_config(source: dict, config: dict) -> dict:
+    """The `dflash2` component's config from incoai's release config, its fields flat. Its taps
+    name visit v's input for v below the visits and the final norm's rows at the visit count, as
+    the release captures them for DSpark; num_target_layers counts those tap positions."""
+
+    def fixed(scope, key, expected, where):
+        if scope.get(key, expected) != expected:
+            raise ValueError(f"{where}.{key} is {scope.get(key)!r}, expected {expected!r}")
+
+    if source.get("architectures") != ["DFlash2DraftModel"] or source.get("model_type") != "qwen3":
+        raise ValueError("--source dflash2 must be a DFlash2DraftModel (qwen3) directory")
+    for key, expected in (("hidden_act", "silu"), ("attention_bias", False),
+                          ("is_causal", False), ("hidden_size", config["hidden_size"]),
+                          ("vocab_size", config["vocab_size"])):
+        if source.get(key) != expected:
+            raise ValueError(f"dflash2.{key} is {source.get(key)!r}, expected {expected!r}")
+    total = len(visits(config))
+    if source.get("num_target_layers") != total:
+        raise ValueError(f"dflash2.num_target_layers is {source.get('num_target_layers')!r}, the "
+                         f"model has {total} layer visits")
+    out = {"architectures": [DFLASH2_ARCHITECTURE], "model_type": "inkling2_dflash2"}
+    for key in ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "vocab_size", "sliding_window"):
+        out[key] = _int(source.get(key), f"dflash2.{key}")
+    if source.get("layer_types") != ["sliding_attention"] * out["num_hidden_layers"]:
+        raise ValueError("dflash2.layer_types: every layer must slide (the release's)")
+    out["rms_norm_eps"] = _real(source.get("rms_norm_eps"), "dflash2.rms_norm_eps")
+    rope = source.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError("dflash2.rope_parameters: only the default rotation is implemented")
+    out["rope_theta"] = _real(rope.get("rope_theta", source.get("rope_theta")),
+                              "dflash2.rope_theta")
+    draft = source.get("dflash_config")
+    if not isinstance(draft, dict):
+        raise ValueError("dflash2: config.json has no dflash_config")
+    for key in ("block_size", "conv_kernel_size", "conv_group_size", "selector_rank",
+                "selector_top_k", "mask_token_id"):
+        out[key] = _int(draft.get(key), f"dflash_config.{key}")
+    for scope, where in ((source, "dflash2"), (draft, "dflash_config")):
+        fixed(scope, "sample_from_anchor", False, where)
+        fixed(scope, "input_embedding_scale", 1.0, where)
+        fixed(scope, "output_multiplier", 1.0, where)
+    # The release caps the candidates' scores after the selector's correction.
+    cap = draft.get("final_logit_softcapping")
+    if cap in (None, 0, 0.0):
+        out["selector_softcap"] = 0.0
+    else:
+        if draft.get("selector_softcap_mode") != "after_correction":
+            raise ValueError("dflash_config.selector_softcap_mode must be after_correction")
+        out["selector_softcap"] = _real(cap, "dflash_config.final_logit_softcapping")
+    taps = draft.get("target_layer_ids")
+    if (not isinstance(taps, list) or len(taps) < 2 or taps != sorted(set(taps))
+            or any(type(v) is not int or not 0 < v <= total for v in taps) or taps[-1] != total):
+        raise ValueError("dflash_config.target_layer_ids must name layer visits in order after the "
+                         "first, the last the final hidden state")
+    out["target_layer_ids"] = list(taps)
+    out["num_target_layers"] = total + 1
+    if out["mask_token_id"] >= config["unpadded_vocab_size"]:
+        raise ValueError("dflash_config.mask_token_id lies outside the scored vocabulary")
+    if out["selector_top_k"] > config["unpadded_vocab_size"]:
+        raise ValueError("dflash_config.selector_top_k exceeds the scored vocabulary")
+    return out
+
+
+def _dflash2(model, store: SafetensorsSource, drafter: dict) -> None:
+    """incoai's drafter as stored (BF16): the projections, the norms, the convolutions' bases
+    [side][tap][hidden] and the selector's codebooks [vocab][rank]."""
+
+    from .model import Parameter
+
+    h, d = drafter["hidden_size"], drafter["head_dim"]
+    q, kv = drafter["num_attention_heads"] * d, drafter["num_key_value_heads"] * d
+    inner, rank, vocab = drafter["intermediate_size"], drafter["selector_rank"], drafter["vocab_size"]
+    taps, conv = len(drafter["target_layer_ids"]), drafter["conv_kernel_size"]
+    coefficients = 2 * conv * (h // drafter["conv_group_size"])
+
+    def add(name, tensor, shape, inputs=()):
+        info = store.describe(tensor)
+        if info.dtype != "BF16":
+            raise ValueError(f"{tensor}: stored {info.dtype}, expected BF16")
+        model.add(Parameter(name, shape, tensor_source(store, tensor, shape),
+                            inputs=tuple(inputs), residency="dflash2"))
+
+    n = "dflash2/"
+    add(n + "feature_projection", "fc.weight", (h, taps * h), (n + "target_features",))
+    add(n + "context_norm", "hidden_norm.weight", (h,))
+    add(n + "final_norm", "norm.weight", (h,))
+    add(n + "candidate_selector/hidden_projection", "candidate_selector.hidden_projection.weight",
+        (rank, h), (n + "final_hidden",))
+    for role in ("predecessor_codebook", "successor_codebook"):
+        add(n + "candidate_selector/" + role, "candidate_selector." + role, (vocab, rank))
+    for i in range(drafter["num_hidden_layers"]):
+        g, p = f"layers.{i}.", f"{n}layers/{i}/"
+        a = p + "attention/"
+        add(p + "input_norm", g + "input_layernorm.weight", (h,))
+        add(p + "post_attention_norm", g + "post_attention_layernorm.weight", (h,))
+        add(a + "query_norm", g + "self_attn.q_norm.weight", (d,))
+        add(a + "key_norm", g + "self_attn.k_norm.weight", (d,))
+        add(a + "query", g + "self_attn.q_proj.weight", (q, h), (p + "attention_input",))
+        add(a + "key", g + "self_attn.k_proj.weight", (kv, h), (p + "attention_input",))
+        add(a + "value", g + "self_attn.v_proj.weight", (kv, h), (p + "attention_input",))
+        add(a + "output", g + "self_attn.o_proj.weight", (h, q), (a + "output_input",))
+        add(p + "mlp/gate", g + "mlp.gate_proj.weight", (inner, h), (p + "mlp_input",))
+        add(p + "mlp/up", g + "mlp.up_proj.weight", (inner, h), (p + "mlp_input",))
+        add(p + "mlp/down", g + "mlp.down_proj.weight", (h, inner), (p + "mlp_product",))
+        for branch, norm in (("attention_conv", "attention_norm"), ("mlp_conv", "mlp_norm")):
+            add(p + branch + "/base_kernel", g + branch + ".base_kernel", (2, conv, h))
+            add(p + branch + "/kernel_projection", g + branch + ".kernel_projection.weight",
+                (coefficients, h), (p + norm,))
+
+
 def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
-                dspark: GGUFFile | None = None, resource_overrides=None):
+                dspark: GGUFFile | None = None, dflash2: SafetensorsSource | None = None,
+                resource_overrides=None):
     """Inkling 2's text component, every parameter's source the GGUF, with `vision` its vision
-    tower from the mmproj and with `dspark` its drafter from the drafter GGUF."""
+    tower from the mmproj, with `dspark` its drafter from the drafter GGUF and with `dflash2`
+    incoai's DFlash2 drafter from its safetensors directory."""
 
     from .model import Model, Parameter
 
@@ -503,6 +635,8 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
     if dspark is not None:
         records["dspark"] = {"config": dspark_config(base.config, config, dspark),
                              "target": "text"}
+    if dflash2 is not None:
+        records["dflash2"] = {"config": dflash2_config(dflash2.config, config), "target": "text"}
     model = Model(records, resources=payloads, token_count=count, special_token_ids=special)
 
     def matrix(name, tensor, shape, inputs=(), file=gguf):
@@ -575,7 +709,9 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
     if vision is not None:
         _vision(model, vision, records["vision"]["config"], config)
     if dspark is not None:
-        _dspark(model, dspark, records["dspark"]["config"], config)
+        _dspark(model, dspark, records["dspark"]["config"], config, gguf)
+    if dflash2 is not None:
+        _dflash2(model, dflash2, records["dflash2"]["config"])
     return model
 
 
@@ -634,13 +770,18 @@ def _vision(model, vision: GGUFFile, vc: dict, config: dict) -> None:
           ("vision/projector_hidden",))
 
 
-def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
-    """The drafter's matrices as stored (Q8_0 in the release's GGUF), its vectors FP32, the Markov
-    embedding BF16 as stored and the fusion weights of its feature mixtures FP32."""
+def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict, gguf: GGUFFile) -> None:
+    """llama.cpp's drafter GGUF: the matrices as stored (Q8_0 in Unsloth's), the vectors FP32, the
+    weights of the feature mixes FP32 (llama.cpp's softmax of the release's fusion weights, a row
+    per mix), and the recurrent head's Markov embedding and output BF16 as stored (a source BF16
+    does not hold is refused) with the output's bias FP32. llama.cpp folds the release's head into
+    that output (markov_w2 = unembed hidden_out, its bias unembed hidden_out_bias) over the unpadded
+    vocabulary, the Markov embedding's rows too. The file repeats the one mask row per block slot
+    and the target's embedding norm; both repeats are checked."""
 
     from .model import Parameter
 
-    h, vocab = config["hidden_size"], config["vocab_size"]
+    h, vocab = config["hidden_size"], config["unpadded_vocab_size"]
     heads, kv_heads, d = (drafter["num_attention_heads"], drafter["num_key_value_heads"],
                           drafter["head_dim"])
     width, rank = drafter["intermediate_size"], drafter["markov_rank"]
@@ -650,21 +791,40 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
         model.add(Parameter(name, shape, _matrix(dspark, tensor, shape), inputs=tuple(inputs)))
 
     def vector(name, tensor, shape, stored="fp32"):
-        model.add(Parameter(name, shape, _direct(dspark, tensor, shape), direct_format=stored))
+        read = _exact_bf16 if stored == "bf16" else _direct
+        model.add(Parameter(name, shape, read(dspark, tensor, shape), direct_format=stored))
 
-    vector("dspark/fuse", "dspark_fuse.weight", (layers + 1, taps))
-    vector("dspark/context_norm", "dspark_norm.weight", (h,))
+    def values(tensor, shape):
+        return _direct(dspark, tensor, shape).values(0, int(np.prod(shape))).reshape(shape)
+
+    mixes = [values(f"blk.{b}.ctx_mix.weight", (taps,)) for b in range(layers)]
+    mixes = torch.stack(mixes + [values("markov_ctx_mix.weight", (taps,))])
+    if bool((mixes < 0).any()) or not torch.allclose(mixes.double().sum(1),
+                                                     torch.ones(layers + 1, dtype=torch.float64),
+                                                     rtol=0.0, atol=1e-5):
+        raise ValueError(f"{dspark.path}: the feature mixes' weights are not softmax rows")
+    model.add(Parameter("dspark/mix", (layers + 1, taps), array_source(mixes, "dspark/mix"),
+                        direct_format="fp32"))
+    masks = values("mask_embd.weight", (drafter["block_size"] - 1, h))
+    if not torch.equal(masks, masks[:1].expand_as(masks)):
+        raise ValueError(f"{dspark.path}: the mask rows differ; the release has one")
+    model.add(Parameter("dspark/mask_embedding", (h,), array_source(masks[0].clone(),
+                                                                     "mask_embd.weight"),
+                        direct_format="fp32"))
+    target_norm = _direct(gguf, "token_embd_norm.weight", (h,)).values(0, h)
+    if not torch.equal(values("token_embd_norm.weight", (h,)), target_norm):
+        raise ValueError(f"{dspark.path}: the drafter's embedding norm is not the model's")
+    vector("dspark/context_norm", "markov_ctx_norm.weight", (h,))
     vector("dspark/final_norm", "output_norm.weight", (h,))
-    vector("dspark/mask_embedding", "mask_embd.weight", (h,))
     vector("dspark/markov_embed", "markov_w1.weight", (vocab, rank), stored="bf16")
     vector("dspark/joint", "joint_proj.weight", (3 * rank, 2 * rank + 2 * h))
     vector("dspark/joint_bias", "joint_proj.bias", (3 * rank,))
-    vector("dspark/hidden_out", "dspark_hidden_out.weight", (h, rank))
-    vector("dspark/hidden_out_bias", "dspark_hidden_out.bias", (h,))
+    vector("dspark/markov_out", "markov_w2.weight", (vocab, rank), stored="bf16")
+    vector("dspark/markov_out_bias", "markov_w2.bias", (vocab,))
     for b in range(layers):
         g, p = f"blk.{b}.", f"dspark/layers/{b}/"
         a = p + "attention/"
-        vector(p + "context_norm", g + "dflare_norm.weight", (h,))
+        vector(p + "context_norm", g + "ctx_norm.weight", (h,))
         vector(p + "attention_norm", g + "attn_norm.weight", (h,))
         vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
         matrix(a + "query", g + "attn_q.weight", (heads * d, h), (p + "attention_input",))
@@ -685,15 +845,27 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
 
 def inkling2_gguf(model, recipe, sources):
     """Every matrix keeps its GGUF blocks, the vision tower's its BF16 values or, from a
-    quantized mmproj, its blocks; vectors are FP32 (the drafter's Markov embedding BF16, as
-    stored). A layer's query, gate and relative projections, which read one input, share one
+    quantized mmproj, its blocks; vectors are FP32 (the drafter's Markov embedding and output
+    BF16, as stored). A layer's query, gate and relative projections, which read one input, share one
     parent when the GGUF stores them in one format, as do the drafter's Q, K and V, its context
-    K and V, and its MLP's gate and up rows."""
+    K and V, and its MLP's gate and up rows. The DFlash2 drafter's projections become Q8_G32 rows
+    (grouped absmax) except its convolution and selector projections, which stay BF16 like its
+    norms, bases and codebooks."""
 
     if model.config.get("architectures") != [TEXT_ARCHITECTURE]:
         raise ValueError("the inkling2_gguf recipe requires an Inkling 2 model")
     formats = {}
     for name, parameter in model.parameters.items():
+        if name.startswith("dflash2/"):
+            if parameter.projection and not name.endswith(DFLASH2_BF16):
+                recipe.assign(name, format=DFLASH2_Q8, method=grouped_absmax,
+                              source=parameter.source)
+            elif parameter.projection:
+                recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source,
+                              activation_policy="A16Only")
+            else:
+                recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source)
+            continue
         # A BF16 matrix (the tower's, or a text matrix the GGUF stores in BF16) keeps its words and
         # multiplies BF16 inputs.
         if parameter.projection and parameter.source.read_encoded is None:

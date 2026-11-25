@@ -13,7 +13,7 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Upstream commit | `baef81615` (merged through 22 November 2026; the fork previously tracked `8f029b0ca`, before that `87c35b6d4`) |
+| Upstream commit | `5fe310779` (merged after `baef81615`) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 | Scope | 36 files added, 97 modified relative to the tracked upstream commit; no upstream file deleted |
@@ -55,7 +55,10 @@ tied at the CLI's reporting precision. Measurements cover one GPU model.
   model's 24-over-4 geometry. The selection budget is a call argument
   (`include/ninfer/ops/qsa_budget.h` holds the shared cap and geometry), and the
   split count, merge bound and partial-softmax workspace are derived from that
-  call's budget (`split_count(top_blocks)`), so a narrow window does not pay for
+  call's budget (`split_count(top_blocks)`). Wider calls use upstream's group-6/12
+  tensor-core policy from `dev/qwen4-dense` at `40bbc0218` and index each query
+  with the actual selection stride. The split reduction also serves 18 query heads.
+  A narrow window does not pay for
   the widest accepted one.
 - `src/ops/launcher/rope.cu` launches the interleaved three-axis rotation the
   indexer and the text attention share under QSA.
@@ -267,7 +270,8 @@ tied at the CLI's reporting precision. Measurements cover one GPU model.
   `--qwen38-27b-qsa`, and `resolved_qsa_prefill()`
   (`program/planning/startup.cpp`) resolves it ahead of the legacy
   `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the default
-  because upstream's wide-T QSA kernel is not yet optimised.
+  and uses the complete staged layer. Sparse prefill selects a kernel for the KV format,
+  group and device tier.
 - `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
   `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
   resolved to the fully-resident sentinel) fall through to the shared

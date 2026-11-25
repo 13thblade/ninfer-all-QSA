@@ -4,6 +4,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -68,6 +69,7 @@ int main() {
     outcome.metrics.prefix_cache_hit_tokens     = 300;
     outcome.metrics.speculative_draft_tokens    = 30;
     outcome.metrics.speculative_accepted_tokens = 21;
+    outcome.bad_words = ninfer::BadWordsStats{.rewinds = 2, .dropped_tokens = 5, .rewind_seconds = 0.25};
     metrics.record_done(outcome);
     metrics.record_done(outcome);
     metrics.record_failure();
@@ -108,6 +110,10 @@ int main() {
                           values.at("ninfer:reused_prompt_tokens_total") == 700.0 &&
                           values.at("ninfer:engine_recoveries_total") == 1.0,
                       "ninfer series accumulate reuse, speculation and recoveries");
+    failures += check(values.at("ninfer:bad_words_rewinds_total") == 4.0 &&
+                          values.at("ninfer:bad_words_dropped_tokens_total") == 10.0 &&
+                          values.at("ninfer:bad_words_rewind_seconds_total") == 0.5,
+                      "banned-word rewinds, dropped tokens and their delay accumulate");
     const auto at = [&](const char* series) { return values.at(series); };
     failures += check(at("ninfer:context_selections_total{source=\"root\"}") == 3.0 &&
                           at("ninfer:context_selections_total"
@@ -128,6 +134,38 @@ int main() {
     failures += check(at("ninfer:paced_prefill_steps_total") == 3.0 &&
                           at("ninfer:paced_prefill_deferred_tokens_total") == 4608.0,
                       "paced prefill steps and their deferred tokens are exported");
+
+    failures += check(body.find("ninfer:gpu_") == std::string::npos,
+                      "no GPU reading gives no GPU series");
+
+    std::vector<ninfer::GpuReading> gpus(2);
+    gpus[0].device                     = 0;
+    gpus[0].utilization_percent        = 97;
+    gpus[0].memory_utilization_percent = 61;
+    gpus[0].memory_used_bytes          = 23ull << 30;
+    gpus[0].memory_total_bytes         = 24ull << 30;
+    gpus[0].temperature_celsius        = 71;
+    gpus[0].power_watts                = 341.5;
+    gpus[0].power_limit_watts          = 350.0;
+    gpus[0].sm_clock_mhz               = 1755;
+    gpus[0].memory_clock_mhz           = 9751;
+    gpus[1].device                     = 3;
+    gpus[1].utilization_percent        = 4;
+    const std::string gpu_body = metrics.render(capacity, sample, gpus);
+    const auto gpu_values      = samples(gpu_body);
+    const auto gpu             = [&](const char* series) { return gpu_values.at(series); };
+    failures += check(gpu("ninfer:gpu_utilization_percent{device=\"0\"}") == 97.0 &&
+                          gpu("ninfer:gpu_utilization_percent{device=\"3\"}") == 4.0 &&
+                          gpu("ninfer:gpu_memory_used_bytes{device=\"0\"}") == 24696061952.0 &&
+                          gpu("ninfer:gpu_power_watts{device=\"0\"}") == 341.5 &&
+                          gpu("ninfer:gpu_power_limit_watts{device=\"0\"}") == 350.0 &&
+                          gpu("ninfer:gpu_sm_clock_mhz{device=\"0\"}") == 1755.0 &&
+                          gpu("ninfer:gpu_memory_clock_mhz{device=\"0\"}") == 9751.0 &&
+                          gpu("ninfer:gpu_temperature_celsius{device=\"0\"}") == 71.0,
+                      "GPU readings are exported per CUDA device");
+    failures += check(gpu_values.count("ninfer:gpu_power_watts{device=\"3\"}") == 0 &&
+                          gpu_body.find("# TYPE ninfer:gpu_power_watts gauge") != std::string::npos,
+                      "a field NVML did not read gives no sample, not a zero");
 
     const auto empty = samples(ServeMetrics{}.render(LoadCapacity{}, LoadSample{}));
     failures += check(empty.at("llamacpp:predicted_tokens_seconds") == 0.0 &&

@@ -226,6 +226,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                 std::to_string(static_cast<int>(result.thinking.loop_coverage * 100.0F + 0.5F)) +
                 "% repeated), " + (result.thinking.applied ? "concluded" : "stopped"));
     }
+    if (result.bad_words.rewinds != 0) {
+        print_metric("bad_words rewinds",
+                     std::to_string(result.bad_words.rewinds) + " (" +
+                         std::to_string(result.bad_words.dropped_tokens) + " tokens dropped, " +
+                         format_seconds(result.bad_words.rewind_seconds) + ")");
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));
@@ -380,6 +386,7 @@ int main(int argc, char** argv) {
         request.execution.sampling                = cli.sampling;
         request.execution.post_thinking_sampling  = cli.post_thinking_sampling;
         request.execution.structured_output       = cli.structured_output;
+        request.execution.bad_words               = cli.bad_words;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
         request.execution.thinking.loop           = cli.reasoning_loop;
@@ -411,6 +418,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.kv_cache_automatic       = cli.kv_cache_automatic;
+        engine_options.loop_kv                  = cli.loop_kv;
         engine_options.speculative              = cli.speculative;
         engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;
@@ -431,8 +439,10 @@ int main(int argc, char** argv) {
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.rope_scaling_factor           = cli.rope_scaling_factor;
         engine_options.rope_scaling_original_context = cli.rope_scaling_original_context;
+        // Banned words ride on the structured-output masks.
         engine_options.structured_output =
-            cli.structured_output.kind != ninfer::StructuredOutputKind::None;
+            cli.structured_output.kind != ninfer::StructuredOutputKind::None ||
+            !cli.bad_words.empty();
         engine_options.wddm_evictable_budget    = cli.wddm_evictable_budget;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;

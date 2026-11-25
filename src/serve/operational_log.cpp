@@ -352,6 +352,17 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
             << (outcome.thinking.applied ? "concluded" : "stopped");
     }
+    if (outcome.thinking.answer_now) {
+        out << " | answer now after "
+            << product::format_pretty_count(outcome.thinking.answer_now_thinking_tokens)
+            << " thinking tokens";
+    }
+    if (outcome.bad_words.rewinds != 0) {
+        out << " | bad_words " << product::format_pretty_count(outcome.bad_words.rewinds)
+            << (outcome.bad_words.rewinds == 1 ? " rewind, " : " rewinds, ")
+            << product::format_pretty_count(outcome.bad_words.dropped_tokens) << " dropped, "
+            << product::format_pretty_duration(outcome.bad_words.rewind_seconds);
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

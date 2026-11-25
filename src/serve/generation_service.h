@@ -87,6 +87,7 @@ struct GenerationOutcome {
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
+    ninfer::BadWordsStats bad_words;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
@@ -149,6 +150,8 @@ struct PreparedRequest {
     std::shared_ptr<RequestLifetime> lifetime;
     // Keeps the serving model loaded while the request lives: the router's lease on it.
     std::shared_ptr<void> model_hold;
+    // Keeps the reply in the server's answer-now registry while the request lives.
+    std::shared_ptr<void> answer_now_enrollment;
     // Set by submit_branches. Without `generation`, the memo held every read.
     std::optional<HeldBranches> held_branches;
 };

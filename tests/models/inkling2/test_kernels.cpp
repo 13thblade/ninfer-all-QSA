@@ -6,23 +6,28 @@
 //  - gemm_f32 by the GEMV kernel (1..8 rows, strided) and by cuBLAS; gemm_f32_batch's products
 //    equal to gemm_f32's bit for bit.
 //  - The split rows of a short call (mix and residual over one-warp blocks): the row kernel's bits.
-//  - query_post: Q and the relative feature clipped per head and scaled by the full layers' log
-//    factor below and above its floor; kv_post: the short convolutions over the call's rows and
-//    the history ring (decode rows of several sequences, a verification's consecutive rows, a
+//  - attention_inputs: Q and the relative feature clipped per head and scaled by the full layers'
+//    log factor below and above its floor; K and V: the short convolutions over the call's rows
+//    and the history ring (decode rows of several sequences, a verification's consecutive rows, a
 //    prompt chunk after earlier positions), the dynamic taps, K's clip, V's norm, the cache slots
 //    and the history a decode call keeps; MXFP8 planes (a full visit of an mxfp8 run), decoded on
-//    the host from their codes and exponent bytes, within MXFP8's error of the oracle.
+//    the host from their codes and exponent bytes, within MXFP8's error of the oracle. K and V run
+//    beside the call's Q, whose values equal a launch of Q alone bit for bit.
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
-//    chunks after cached positions and branch rows, with and without the far field on tensor
-//    cores, verification rows in groups with the bits of single rows; BF16 and q8_1 outputs.
+//    chunks after cached positions and branch rows (their near field on tensor cores, in groups of
+//    32 rows with a short last group), with and without the far field on tensor cores, decode and
+//    verification rows on tensor cores (the SIMT kernels on Volta), verification rows in groups
+//    with the bits of single rows; BF16 and q8_1 outputs.
 //  - residual over plain products, 2^-32 fixed-point sums and weighted pair rows, starting a block
 //    or adding to it, keeping the history, with the next depth mix fused; keep_products and
 //    keep_history.
 //  - route: sigmoid scores, the selection bias, ties broken by the lower id, the weights' scales;
-//    the sorted route of up to eight rows against route and gguf::moe_sort_routes.
+//    the sorted route of up to eight rows against route and gguf::moe_sort_routes; the sums both
+//    launches zero.
 //  - situ_rows: the BF16 middles equal to the host's situ() bit for bit, and within BF16 rounding
-//    of FP64; softcap, f32_to_bf16, place_rows, ring_copy, add_fixed.
+//    of FP64; situ_q8: the bytes of gguf::quantize_vector_activation over situ_rows's middles;
+//    softcap, f32_to_bf16, place_rows, ring_copy, add_fixed.
 //  - bf16_expert_rows (UD-Q8_K_XL's BF16 expert banks): [gate; up] rows from each token's input
 //    and down rows from each pair's own, decode and prompt pair counts, against FP64 sums of the
 //    BF16 values; another device's pairs (-1) keep their rows, and a second call gives the same
@@ -49,6 +54,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -455,8 +461,8 @@ void query_case(bool log_scale, const std::vector<int>& positions, float sigma, 
     a.positions       = as<std::int32_t>(d_pos);
     a.q_out           = as<float>(q_out);
     a.r_out           = as<float>(r_out);
-    k::query_post(a, nullptr);
-    sync("query_post");
+    k::attention_inputs(a, k::KvArgs{}, nullptr);
+    sync("attention_inputs (Q)");
     const auto gq = download<float>(q_out, std::size_t(t) * kHeads * kD);
     const auto gr = download<float>(r_out, std::size_t(t) * kHeads * kRel);
     Error eq, er;
@@ -484,7 +490,7 @@ void query_case(bool log_scale, const std::vector<int>& positions, float sigma, 
         }
     }
     report(eq.rel() < 1e-6 && er.rel() < 1e-6,
-           std::string("query_post") + (log_scale ? " with the log factor" : "") + ", sigma " +
+           std::string("Q") + (log_scale ? " with the log factor" : "") + ", sigma " +
                num(sigma) + ", " + std::to_string(clipped) + " clipped heads: q " + num(eq.rel()) +
                ", r " + num(er.rel()));
 }
@@ -607,8 +613,40 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
         a.k_plane = mxfp8_plane(mk, mks, ring);
         a.v_plane = mxfp8_plane(mv, mvs, ring);
     }
-    k::kv_post(a, nullptr);
-    sync("kv_post");
+    // The call's Q in the same launch, then alone: the same bits.
+    const std::int64_t q_stride = 2 * kHeads * kD + kHeads * kRel;
+    const auto qgr = normal(std::size_t(t) * q_stride, 2.0f, rng);
+    const std::vector<float> ones(kHeads * kD, 1.0f);
+    DeviceBuffer d_qgr = upload(qgr), d_ones = upload(ones),
+                 q_both(std::size_t(t) * kHeads * kD * 4),
+                 r_both(std::size_t(t) * kHeads * kRel * 4), q_alone(q_both.bytes),
+                 r_alone(r_both.bytes);
+    k::QueryArgs q;
+    q.qgr             = as<float>(d_qgr);
+    q.stride          = q_stride;
+    q.relative_column = 2 * kHeads * kD;
+    q.tokens          = t;
+    q.heads           = kHeads;
+    q.query_clip      = as<float>(d_ones);
+    q.relative_clip   = as<float>(d_ones);
+    q.qk_clip         = kQkClip;
+    q.rel_clip        = kRelClip;
+    q.log_scale       = true;
+    q.alpha           = 0.1f;
+    q.floor           = 4.0f;
+    q.positions       = rows.rows.positions;
+    q.q_out           = as<float>(q_both);
+    q.r_out           = as<float>(r_both);
+    k::attention_inputs(q, a, nullptr);
+    sync("attention_inputs");
+    q.q_out = as<float>(q_alone);
+    q.r_out = as<float>(r_alone);
+    k::attention_inputs(q, k::KvArgs{}, nullptr);
+    sync("attention_inputs (Q alone)");
+    const bool q_same = download<float>(q_both, std::size_t(t) * kHeads * kD) ==
+                            download<float>(q_alone, std::size_t(t) * kHeads * kD) &&
+                        download<float>(r_both, std::size_t(t) * kHeads * kRel) ==
+                            download<float>(r_alone, std::size_t(t) * kHeads * kRel);
     auto got_k        = download<__half>(kc, std::size_t(sequences) * seq_stride);
     auto got_v        = download<__half>(vc, std::size_t(sequences) * seq_stride);
     const auto kept_k = download<float>(d_kh, std::size_t(sequences) * seq_hist);
@@ -679,10 +717,12 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     }
     // MXFP8 keeps three bits of each value's significand: a relative error near 2^-4 / sqrt(3).
     const double bound = mxfp8 ? 4e-2 : 1e-3;
-    report(ek.rel() < bound && ev.rel() < bound && kept_wrong == 0,
-           "kv_post " + name + (dynamic ? " with dynamic taps" : "") + (mxfp8 ? ", MXFP8 planes" : "") +
-               ", " + std::to_string(clipped) + " clipped heads: K " + num(ek.rel()) + ", V " +
-               num(ev.rel()) + (c.chunk ? "" : ", history values wrong " + std::to_string(kept_wrong)));
+    report(ek.rel() < bound && ev.rel() < bound && kept_wrong == 0 && q_same,
+           "K and V " + name + (dynamic ? " with dynamic taps" : "") +
+               (mxfp8 ? ", MXFP8 planes" : "") + ", " + std::to_string(clipped) +
+               " clipped heads: K " + num(ek.rel()) + ", V " + num(ev.rel()) +
+               (c.chunk ? "" : ", history values wrong " + std::to_string(kept_wrong)) +
+               (q_same ? "; Q beside them as alone" : "; Q beside them differs"));
 }
 
 // ---- Attention ----------------------------------------------------------------------------------
@@ -845,6 +885,139 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
                " (" +
                std::to_string(biased) + " biased, " + std::to_string(unbiased) +
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
+}
+
+// Verification rows of one sequence (two to four consecutive positions, grouped as the executor
+// groups a full visit's rows) against each row alone, as a decode step at its position computes
+// it, at every position of [first, first + count): the same bits, FP32 partials of every active
+// split and BF16 output (splits > 1) or BF16 and q8_1 outputs (one split), so that speculative
+// decoding keeps the text of plain decoding. On an RTX 5090 every grouped row's partials differed
+// while the compiler was free to contract the grouped kernel's products and sums in another order.
+void attention_rows_case(int first, int count, int splits, std::mt19937& rng) {
+    constexpr int kMax = 4;
+    const int slots = first + count + kMax, width = kHeads * kD;
+    const std::int64_t head_stride = std::int64_t(slots) * kD;
+    std::vector<__half> kc(std::size_t(kKv) * head_stride), vc(kc.size());
+    {
+        std::normal_distribution<float> n(0.0f, 1.0f);
+        for (auto& v : kc) { v = __float2half(1.5f * n(rng)); }
+        for (auto& v : vc) { v = __float2half(n(rng)); }
+    }
+    const auto q     = normal(std::size_t(kMax) * width, 0.6f, rng);
+    const auto r     = normal(std::size_t(kMax) * kHeads * kRel, 1.0f, rng);
+    const auto table = normal(std::size_t(kExtent) * kRel, 1.0f, rng);
+    const auto gate  = normal(std::size_t(kMax) * width, 1.0f, rng);
+    const auto sinks = normal(std::size_t(kMax) * kHeads, 2.0f, rng);
+    const std::size_t partial_floats = k::attention_workspace_floats(kMax, kHeads, splits);
+    const std::size_t q8_bytes = std::size_t(kMax) * width + std::size_t(kMax) * (width / 32) * 4;
+    DeviceBuffer dk = upload(kc), dv = upload(vc), dq = upload(q), dr = upload(r),
+                 dt = upload(table), dg = upload(gate), ds = upload(sinks), positions(kMax * 4),
+                 partial(partial_floats * 4), out(std::size_t(kMax) * width * 2), q8(q8_bytes);
+    k::AttentionArgs a;
+    a.rows.positions = as<std::int32_t>(positions);
+    a.q              = as<float>(dq);
+    a.r              = as<float>(dr);
+    a.sinks          = as<float>(ds);
+    a.sink_stride    = kHeads;
+    a.table          = as<float>(dt);
+    a.extent         = kExtent;
+    a.k_cache        = as<__half>(dk);
+    a.v_cache        = as<__half>(dv);
+    a.seq_stride     = std::int64_t(kKv) * head_stride;
+    a.head_stride    = head_stride;
+    a.query_heads    = kHeads;
+    a.kv_heads       = kKv;
+    a.scale          = 1.0f / std::sqrt(float(kD));
+    a.splits         = splits;
+    a.partial        = as<float>(partial);
+    a.gate           = as<float>(dg);
+    a.gate_stride    = width;
+    // A call's values for its rows: the active splits' partials (O, then m and l) and the BF16
+    // output, or the BF16 and q8_1 outputs.
+    struct Got {
+        std::vector<float> o, ml;
+        std::vector<bf16> y;
+        std::vector<std::int8_t> qs;
+        std::vector<half2> qd;
+    };
+    const auto call = [&](k::AttentionArgs b, int row_first) {
+        Got g;
+        const int t = b.rows.tokens;
+        b.rows.positions += row_first;
+        b.q += std::int64_t(row_first) * width;
+        b.r += std::int64_t(row_first) * kHeads * kRel;
+        b.sinks += std::int64_t(row_first) * kHeads;
+        b.gate += std::int64_t(row_first) * width;
+        b.out = as<bf16>(out);
+        k::attention(b, nullptr);
+        sync("attention rows");
+        g.y = download<bf16>(out, std::size_t(t) * width);
+        if (splits > 1) {
+            const auto all = download<float>(partial, partial_floats);
+            const std::size_t n = std::size_t(t) * kHeads * splits;
+            g.o.assign(all.begin(), all.begin() + std::ptrdiff_t(n * kD));
+            g.ml.assign(all.begin() + std::ptrdiff_t(n * kD),
+                        all.begin() + std::ptrdiff_t(n * kD + 2 * n));
+        } else {
+            b.out      = nullptr;
+            b.out_q.qs = as<std::int8_t>(q8);
+            b.out_q.ds = reinterpret_cast<half2*>(as<std::uint8_t>(q8) + std::size_t(t) * width);
+            k::attention(b, nullptr);
+            sync("attention rows q8");
+            g.qs.resize(std::size_t(t) * width);
+            g.qd.resize(std::size_t(t) * (width / 32));
+            check(cudaMemcpy(g.qs.data(), b.out_q.qs, g.qs.size(), cudaMemcpyDeviceToHost),
+                  "q8 qs");
+            check(cudaMemcpy(g.qd.data(), b.out_q.ds, g.qd.size() * 4, cudaMemcpyDeviceToHost),
+                  "q8 ds");
+        }
+        return g;
+    };
+    // Row t of `many` against row 0 of `one`.
+    const auto equal = [&](const Got& many, int t, const Got& one, int keys) {
+        const int active = std::min(splits, std::max(1, (keys + 63) / 64));
+        for (int h = 0; h < kHeads; ++h) {
+            for (int s = 0; s < (splits > 1 ? active : 0); ++s) {
+                const std::size_t i = (std::size_t(t) * kHeads + h) * splits + s;
+                const std::size_t j = std::size_t(h) * splits + s;
+                if (std::memcmp(&many.o[i * kD], &one.o[j * kD], kD * 4) != 0 ||
+                    std::memcmp(&many.ml[2 * i], &one.ml[2 * j], 8) != 0) {
+                    return false;
+                }
+            }
+        }
+        const std::size_t row = std::size_t(t) * width;
+        if (std::memcmp(&many.y[row], one.y.data(), width * sizeof(bf16)) != 0) { return false; }
+        return splits > 1 || (std::memcmp(&many.qs[row], one.qs.data(), width) == 0 &&
+                              std::memcmp(&many.qd[row / 32], one.qd.data(), width / 32 * 4) == 0);
+    };
+    int rows = 0, differ = 0;
+    for (int p = first; p < first + count; ++p) {
+        std::vector<std::int32_t> pos(kMax);
+        for (int t = 0; t < kMax; ++t) { pos[t] = p + t; }
+        positions.copy_from_host(pos.data(), pos.size() * 4);
+        std::vector<Got> alone;
+        for (int t = 0; t < kMax; ++t) {
+            k::AttentionArgs b = a;
+            b.rows.tokens      = 1;
+            alone.push_back(call(b, t));
+        }
+        for (int n = 2; n <= kMax; ++n) {
+            k::AttentionArgs b = a;
+            b.rows.tokens      = n;
+            b.row_group        = n;
+            b.row_groups       = 1;
+            const Got grouped  = call(b, 0);
+            for (int t = 0; t < n; ++t) {
+                ++rows;
+                differ += equal(grouped, t, alone[t], p + t + 1) ? 0 : 1;
+            }
+        }
+    }
+    report(differ == 0, "attention, verification rows of 2-4 positions at " +
+                            std::to_string(first) + ".." + std::to_string(first + count - 1) +
+                            ", splits " + std::to_string(splits) + ": " + std::to_string(differ) +
+                            " of " + std::to_string(rows) + " rows differ from a decode row");
 }
 
 // ---- Residual updates ---------------------------------------------------------------------------
@@ -1035,8 +1208,19 @@ void route_case(int tokens, bool scales, std::mt19937& rng) {
     a.ids           = as<std::int32_t>(ids);
     a.weights       = as<float>(weights);
     a.pair_scale    = as<float>(pair);
+    // The call's fixed-point sums, filled with ones: the launch zeroes them.
+    const std::size_t sum_count = std::size_t(tokens) * kHidden;
+    DeviceBuffer sums(sum_count * 8);
+    check(cudaMemset(sums.p, 0xFF, sums.bytes), "fill the sums");
+    a.zero       = static_cast<unsigned long long*>(sums.p);
+    a.zero_count = std::int64_t(sum_count);
+    const auto zeroed = [&] {
+        const auto v = download<unsigned long long>(sums, sum_count);
+        return std::all_of(v.begin(), v.end(), [](unsigned long long x) { return x == 0; });
+    };
     k::route(a, nullptr);
     sync("route");
+    const bool route_zeroed = zeroed();
     const auto gi = download<std::int32_t>(ids, std::size_t(tokens) * kTopK);
     const auto gw = download<float>(weights, std::size_t(tokens) * kTopK);
     const auto gp = download<float>(pair, std::size_t(tokens) * kTopK);
@@ -1067,10 +1251,11 @@ void route_case(int tokens, bool scales, std::mt19937& rng) {
             wrong += gp[at] != (scales ? gu_scale[x] : 1.0f) ? 1 : 0;
         }
     }
-    report(wrong == 0 && e.rel() < 1e-6 && gi[0] == 3 && gi[1] == 9,
+    report(wrong == 0 && e.rel() < 1e-6 && gi[0] == 3 && gi[1] == 9 && route_zeroed,
            "route " + std::to_string(tokens) + " row(s)" + (scales ? " with expert scales" : "") +
                ": " + std::to_string(wrong) + " wrong, weights " + num(e.rel()) +
-               (near ? ", " + std::to_string(near) + " near ties skipped" : ""));
+               (near ? ", " + std::to_string(near) + " near ties skipped" : "") +
+               (route_zeroed ? ", sums zeroed" : ", sums NOT zeroed"));
     if (tokens > k::kSortedRouteRows) { return; }
 
     // The sorted route: the same choices and weights, and the pairs grouped as
@@ -1093,8 +1278,10 @@ void route_case(int tokens, bool scales, std::mt19937& rng) {
                                   const_cast<std::int32_t*>(view.active_count),
                                   const_cast<std::int32_t*>(view.tile_count),
                                   const_cast<std::int32_t*>(view.tiles), view.tile_capacity};
+    check(cudaMemset(sums.p, 0xFF, sums.bytes), "fill the sums");
     k::route(b, nullptr);
     sync("sorted route");
+    const bool sorted_zeroed = zeroed();
     const auto fetch = [](const std::int32_t* p, std::size_t n) {
         std::vector<std::int32_t> v(n);
         check(cudaMemcpy(v.data(), p, n * 4, cudaMemcpyDeviceToHost), "routing copy");
@@ -1118,9 +1305,11 @@ void route_case(int tokens, bool scales, std::mt19937& rng) {
                       same_bits(download<float>(weights2, pairs), gw) &&
                       same_bits(download<float>(pair2, pairs), gp) && wb == gb && ws == gs &&
                       wc == gc && wa == ga && tiles;
-    report(same, "sorted route " + std::to_string(tokens) + " row(s): choices, weights and the "
-                     "pairs by expert " + (same ? "as route and moe_sort_routes give them"
-                                                : "DIFFER from route and moe_sort_routes"));
+    report(same && sorted_zeroed,
+           "sorted route " + std::to_string(tokens) + " row(s): choices, weights and the pairs by "
+           "expert " + (same ? "as route and moe_sort_routes give them"
+                             : "DIFFER from route and moe_sort_routes") +
+               (sorted_zeroed ? ", sums zeroed" : ", sums NOT zeroed"));
 }
 
 // ---- SiTU and the elementwise kernels -----------------------------------------------------------
@@ -1161,6 +1350,22 @@ void situ_case(std::mt19937& rng) {
     report(differ == 0 && worst <= 1.01, "situ_rows: " + std::to_string(differ) +
                                              " middles differ from the host's, worst error " +
                                              num(worst) + " BF16 steps");
+
+    // situ_q8: the bytes gguf::quantize_vector_activation writes from those middles.
+    const std::size_t act_bytes = gguf::vector_activation_bytes(kWidth, pairs);
+    const std::size_t scales_at = gguf::vector_activation_scales_offset(kWidth, pairs);
+    DeviceBuffer want_q(act_bytes), got_q(act_bytes);
+    check(cudaMemset(want_q.p, 0, act_bytes), "zero the activation");
+    check(cudaMemset(got_q.p, 0, act_bytes), "zero the activation");
+    gguf::quantize_vector_activation(as<bf16>(out), kWidth, pairs, nullptr, want_q.p, nullptr);
+    k::situ_q8(as<float>(d_gu), stride, pairs, kWidth, as<float>(d_s), gate_cap, up_cap,
+               static_cast<std::int8_t*>(got_q.p),
+               reinterpret_cast<half2*>(static_cast<std::byte*>(got_q.p) + scales_at), nullptr);
+    sync("situ_q8");
+    const bool q8_same = download<std::uint8_t>(want_q, act_bytes) ==
+                         download<std::uint8_t>(got_q, act_bytes);
+    report(q8_same, std::string("situ_q8: ") + (q8_same ? "the same bytes as" : "DIFFERS from") +
+                        " quantize_vector_activation over situ_rows");
 }
 
 // BF16 experts: `experts` banks of `rows` x `k` BF16 rows, the pairs of `tokens` tokens (top 8 of
@@ -1563,9 +1768,16 @@ int main() {
         attention_case({"full cache, decode", {{20000}, {0}}, 0, 0, 300}, rng);
         attention_case({"full cache, verification", {{40000, 40001, 40002}, {0, 0, 0}}, 0, 0, 512, 0.0f, false, 3}, rng);
         attention_case({"window ring, verification", {{2000, 2001, 2002}, {0, 0, 0}}, ring, kWindow, 4}, rng);
+        // Every position of a span: 16 splits (partials) and one (the outputs).
+        attention_rows_case(2000, 200, 16, rng);
+        attention_rows_case(1200, 48, 1, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, -30.0f}, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, 12.0f}, rng);
         attention_case({"window ring, chunk after 1100", {iota(1100, 37), {}, true, 1100}, ring, kWindow, 1}, rng);
+        // Prompt chunks of several 32-row groups (the tensor-core near field), the last one short.
+        attention_case({"window ring, chunk after 2000", {iota(2000, 60), {}, true, 2000}, ring, kWindow, 1}, rng);
+        attention_case({"window ring, chunk at 0", {iota(0, 50), {}, true, 0}, ring, kWindow, 1}, rng);
+        attention_case({"full cache, chunk after 900", {iota(900, 100), {}, true, 900}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk after 600", {iota(600, 21), {}, true, 600}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk at 0", {iota(0, 64), {}, true, 0}, 0, 0, 1}, rng);
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
@@ -1574,6 +1786,7 @@ int main() {
         attention_case({"full cache, chunk after 1100", {iota(1100, 37), {}, true, 1100}, 0, 0, 1, 0.0f, true}, rng);
         attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, 0.0f, true}, rng);
         attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, -30.0f, true}, rng);
+        attention_case({"full cache, chunk after 4000", {iota(4000, 130), {}, true, 4000}, 0, 0, 1, 0.0f, true}, rng);
         {
             RowsCase far_branches{{}, {}, true, 1600, 4, {}};
             far_branches.positions = {1600, 1601, 1602, 1603, 1604, 1605, 1606, 1604, 1605};

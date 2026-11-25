@@ -52,6 +52,9 @@ struct VecArgs {
     const std::int8_t* qs; // [columns][k]
     const half2* ds;       // [columns][k / 32]
     VecStore out;
+    // Set by the launch: the launch is a programmatic dependent (core/pdl_arch.cuh), whose blocks
+    // read their first rows' weight into L2 before they wait.
+    bool prefetch = false;
 };
 
 // The vector kernel's MoE form (ggml_bridge_vec.cuh moe_kernel).
@@ -86,9 +89,9 @@ void moe_decode_down_launch(const MoeDecodeDownArgs& args, int chunk, cudaStream
 template <ggml_type type>
 void moe_decode_prep_launch(const MoeDecodePrepArgs& args, cudaStream_t stream);
 
-// Whether slice_dequantize serves the type (every type but IQ1_M).
+// Whether slice_dequantize serves the type (every type but IQ1_M and PTQ1_0).
 template <ggml_type type>
-inline constexpr bool kSliceDequantize = type != GGML_TYPE_IQ1_M;
+inline constexpr bool kSliceDequantize = type != GGML_TYPE_IQ1_M && type != GGML_TYPE_PTQ1_0;
 
 // Rows of a GGUF matrix to dst_t through the vector kernels' slice decoders: one thread a 32-value
 // slice, written as 16-byte stores (ggml_bridge_vec.cuh).
@@ -101,8 +104,27 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
     return (std::size_t(k) * columns + 15) / 16 * 16;
 }
 
+// Products of one block type, K, row size and column count that one launch of the vector kernel
+// takes, each with its own weight rows, activation and store (a layer's products of one input).
+// The launch sets `first`: product j's blocks are [first[j], first[j + 1]).
+inline constexpr int kMaxVecJobs = 4;
+struct VecJobs {
+    VecArgs job[kMaxVecJobs];
+    int count;
+    int first[kMaxVecJobs + 1];
+};
+
+// jobs.count products, or with `fused` one fused [gate; up] product.
 template <ggml_type type>
-void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream);
+void vec_launch(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
+// PTQ1_0's products take their own kernels: a lane a whole block (ggml_bridge_ptq1.cuh), or on sm_80
+// and newer the integer tensor cores (ggml_bridge_ptq1_tc.cuh), which take up to
+// ptq1_vector_columns() columns.
+template <>
+void vec_launch<GGML_TYPE_PTQ1_0>(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
+[[nodiscard]] int ptq1_vector_columns();
+// Whether the lane kernel takes `columns` columns, which read the transposed activation.
+[[nodiscard]] bool ptq1_lane_takes(int columns);
 
 // SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
 // CPU's GGUF expert products compute the same bits.

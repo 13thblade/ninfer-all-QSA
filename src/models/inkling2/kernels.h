@@ -169,7 +169,6 @@ struct QueryArgs {
     float* q_out = nullptr;
     float* r_out = nullptr;
 };
-void query_post(const QueryArgs& args, cudaStream_t stream);
 
 // K and V of each row: their short convolutions over the raw projections (FP32 rows `kv_stride`
 // apart, K at column 0, V at kv_heads * 128), with the dynamic per-head taps of a full-attention
@@ -203,7 +202,10 @@ struct KvArgs {
     // at slot `position`, and k_cache / v_cache are unused.
     KvPlaneView k_plane, v_plane;
 };
-void kv_post(const KvArgs& args, cudaStream_t stream);
+// A layer's attention inputs in one launch: block (t, y) of 128 threads runs Q head y of row t for
+// y < q.heads and K and V head y - q.heads after them. Either part may be absent (q.tokens or
+// kv.rows.tokens 0); when both are given they cover the same rows.
+void attention_inputs(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream);
 
 // The attention of each row's heads (128 values, `query_heads / kv_heads` query heads per key and
 // value head) over the keys it sees: its sequence's earlier positions (and, in a prompt chunk, the
@@ -215,7 +217,8 @@ void kv_post(const KvArgs& args, cudaStream_t stream);
 // of the gate (FP32 rows `gate_stride` apart, [heads][128]; null: no gate), goes out as BF16 rows
 // [T][heads * 128] or their q8_1 form (r may be null when extent is 0).
 // A decode or verification call (rows.chunk false) splits each row's keys over `splits` ranges
-// merged after; a prompt chunk runs its rows eight to a block, every key in one pass.
+// merged after; a prompt chunk runs its rows 32 to a block on tensor cores (eight to a block of the
+// SIMT kernel on Volta), every key in one pass.
 // `uniform` (a DSpark block, rows.chunk false, at most eight rows of one sequence whose keys are
 // already in the cache): every row sees the keys the last row sees, its position and the `window`
 // before it (0: every earlier one), the block's own later rows included; eight rows to a block,
@@ -329,6 +332,10 @@ struct RouteArgs {
     // call's pairs also grouped by expert there as gguf::moe_sort_routes writes them (its fields of
     // gguf::moe_sorted_routes's view of the same workspace), in the same launch.
     RouteSort sorted;
+    // The call's fixed-point expert sums (zero_count values), zeroed by the same launch; null:
+    // none.
+    unsigned long long* zero = nullptr;
+    std::int64_t zero_count  = 0;
 };
 inline constexpr int kSortedRouteRows    = 8;
 inline constexpr int kSortedRouteExperts = 128;
@@ -339,6 +346,11 @@ void route(const RouteArgs& args, cudaStream_t stream);
 // values the CPU's expert products compute (cpu_experts.h).
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream);
+// The same middles as the down product's vector activation, the bytes
+// gguf::quantize_vector_activation writes from situ_rows's output: int8 values qs [pairs][width]
+// and half2 scales ds [pairs][width / 32] (the activation's two planes).
+void situ_q8(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
+             float gate_cap, float up_cap, std::int8_t* qs, half2* ds, cudaStream_t stream);
 
 // BF16 expert products: out[p][r] = sum_j W_e[r][j] x[p / x_div][j] in FP32 for every pair p of
 // an active expert e (the routing's grouping: pairs sorted[bounds[e], bounds[e + 1]), experts
@@ -384,7 +396,7 @@ void ring_copy(const RingCopyArgs& args, cudaStream_t stream);
 // ---- The DSpark drafter (executor.h) -------------------------------------------------------------
 
 // The drafter's feature mixes of rows [begin, end) of a call: mix m of row t is
-//   x = sum_j softmax_j(fuse[m]) taps[j][t]   (taps FP32 [T][hidden] each, j < tap_count)
+//   x = sum_j mix[m][j] taps[j][t]   (taps FP32 [T][hidden] each, j < tap_count)
 // RMS-normed with norm[m] (eps). Mixes below `context_count` go out as BF16 rows (out, mix m at
 // m * T * hidden) or q8_1 rows (out_q, mix m q8_stride bytes on); mix `context_count` (the
 // recurrent head's context) goes out FP32 into the row's slot (its position % slots) of its
@@ -395,7 +407,7 @@ struct SparkMixArgs {
     Rows rows;
     const float* taps[kMaxSparkTaps] = {};
     int tap_count = 0;
-    const float* fuse = nullptr; // [context_count + 1][tap_count]
+    const float* mix = nullptr; // [context_count + 1][tap_count], each row a softmax
     const float* norm[kMaxSparkMixes] = {};
     int context_count = 0, hidden = 0, begin = 0, end = 0, ring_begin = 0;
     float eps = 1e-6f;
@@ -412,7 +424,7 @@ void spark_mix(const SparkMixArgs& args, cudaStream_t stream);
 // logical position (NeoX halves, theta^(-2i/128) for pair (i, i + 64)). Queries (`heads` of them,
 // FP32 rows `stride` apart from `column`) are rotated in place; keys (`heads` KV heads at `column`)
 // and the values after them (at column + heads * 128, not normed) go as F16 into cache slot
-// `position % ring` (ring 0: position) of the row's sequence, laid out as kv_post's caches.
+// `position % ring` (ring 0: position) of the row's sequence, laid out as attention_inputs' caches.
 struct SparkRotateArgs {
     Rows rows;
     float* x = nullptr;
@@ -434,20 +446,25 @@ void add_rows(float* h, const float* y, std::int64_t y_stride, int hidden, int r
 // out[t][c] = bf16(silu(gu[t][c]) * gu[t][width + c]) for FP32 [gate; up] rows (2 width each).
 void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStream_t stream);
 
-// The recurrent head's head products (prepared once): W [rows][k] FP32 rows into M BF16 [rows][256]
-// and c FP32 [rows]: m[v][r] = bf16(p[v][r]) and c[v] = p[v][256] for products p FP32 [n][257].
-void spark_table(const float* p, int n, __nv_bfloat16* m, float* c, cudaStream_t stream);
-// out[r][k] = hidden_out[k][r] for r < rank, out[rank][k] = bias[k]: the head's inputs.
-void spark_head_inputs(const float* hidden_out, const float* bias, int hidden, int rank, float* out,
-                       cudaStream_t stream);
+// The candidates a draft row's recurrent head scores: the 16,384 largest of each row's head products
+// by their BF16 truncation (the top 16 bits of the FP32 order), of the products equal to the 16,384th
+// the lowest ids; spark_step picks drafts only among them. Rows `stride` floats apart from `base`,
+// `vocab` products each; ids and values [rows][16,384], the ids above the 16,384th product in id order,
+// then the taken ties in id order. `workspace` holds spark_candidates_bytes(rows).
+inline constexpr int kSparkCandidates = 16384;
+[[nodiscard]] std::size_t spark_candidates_bytes(int rows);
+void spark_candidates(const float* base, std::int64_t stride, int vocab, int rows,
+                      std::int32_t* ids, float* values, void* workspace, cudaStream_t stream);
 
 // One step of the recurrent head (rank 256) over draft row `row` of a block:
 //   joint  = W [state; embed[prev]; hidden[row]; context] + bias     (W FP32 [768][512 + 2 hidden])
-//   logits = cap tanh((base[row] + c + M tanh(joint[512:768])) / cap)    over `vocab`
-//   prev   = the first maximum; confidence[row - 1] = its probability; drafts[row - 1] = prev
+//   logits = cap tanh((base[row][v] + c[v] + M[v] tanh(joint[512:768])) / cap)
+//            over the row's candidates v (spark_candidates of the block's rows 1..)
+//   prev   = the first maximum (the lowest id among equal logits); confidence[row - 1] = its
+//            probability over the candidates; drafts[row - 1] = prev
 //   state  = tanh(joint[256:512]) + sigmoid(joint[0:256]) (state - tanh(joint[256:512]))
 // The context is the ring row of the position before the block's first (rows.positions[0] - 1) of
-// rows.sequences[0]. `joint`, `logits` and `partials` are scratch (spark_step_floats).
+// rows.sequences[0]. `joint` and `logits` are scratch (spark_step_floats).
 struct SparkStepArgs {
     const float* weight = nullptr;
     const float* bias   = nullptr;
@@ -458,11 +475,12 @@ struct SparkStepArgs {
     int slots = 0;
     const std::int32_t* positions = nullptr;
     const std::int32_t* sequences = nullptr;
-    const float* base = nullptr; // [block][vocab_stride] FP32 head products of `hidden`
-    std::int64_t vocab_stride = 0;
-    const __nv_bfloat16* m = nullptr;
-    const float* c = nullptr;
-    int vocab = 0, hidden_size = 0, row = 0;
+    // [rows - 1][kSparkCandidates]: spark_candidates of the block's rows 1.. (row r at r - 1)
+    const std::int32_t* candidate_ids = nullptr;
+    const float* candidate_values     = nullptr;
+    const __nv_bfloat16* m = nullptr; // [vocab][256], the head's output with the head folded in
+    const float* c = nullptr;         // [vocab], its bias
+    int hidden_size = 0, row = 0;
     float cap = 30.0f;
     float* state = nullptr;          // [256]
     std::int32_t* prev = nullptr;    // [1]
@@ -470,9 +488,8 @@ struct SparkStepArgs {
     float* confidence = nullptr;     // [block - 1]
     float* joint = nullptr;
     float* logits = nullptr;
-    float* partials = nullptr;
 };
-[[nodiscard]] std::size_t spark_step_floats(int vocab);
+[[nodiscard]] std::size_t spark_step_floats();
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the

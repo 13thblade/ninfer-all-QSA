@@ -94,7 +94,10 @@ prebuilt FFmpeg tree may have no PNG decoder), they pass the NVFP4 TMA descripto
 memory, since MSVC cannot pass them by value, and WDDM charges pinned host memory against the
 card's memory. Host experts pin only what the GPU's shared memory segment can still lock (DXGI's
 budget, about half the RAM) less 4 GiB, and the automatic host tier of the context cache only what
-is left of it; experts past that are read from the artifact's files (`--expert-host-mib`). Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
+is left of it; experts past that are read from the artifact's files. `--expert-host-mib N` replaces
+that budget: the block pins up to `N` MiB until the host refuses a part, and a later startup pin
+may then fail. Under WSL2 host experts read the same budget through `/dev/dxg`; it does not depend
+on the memory WSL2 is given, and without it they pin until the host refuses a part. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
 some of this process's memory out, which slows generation until it comes back. WDDM may queue a
@@ -108,11 +111,15 @@ service copies a decode or verification call's experts with a kernel that reads 
 (`NINFER_MISS_COPY_KERNEL=0` forces the copy engine, `1` the kernel on any driver). Native Qwen
 MoE, Gemma MoE, Flint, DeepSeek-V4.1-Flash and Inkling 2 with host or disk experts deliver the
 missing experts while a replayed graph waits for them on the device, so on Windows and under WSL2
-they run their passes eagerly, without CUDA Graphs, and wait for the misses on the host. This
-repository has no Windows or WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test` and
-`ninfer_qwen4_exp_expert_misses_test` run both forms on Linux and only the kernel under WDDM,
-where they have not run yet, and the eager passes of the other families have not run there
-either. A process started
+they run their passes eagerly, without CUDA Graphs, and wait for the misses on the host. The
+decision falls before the startup memory checks, so Gemma MoE, Flint, DeepSeek-V4.1-Flash and
+Inkling 2 then keep 64 MiB free for the kernels CUDA loads at their first launch instead of the
+320 MiB they keep for the graphs; experts on the GPU keep their graphs and that reserve. This
+repository has no Windows or WSL2 host:
+`ninfer_qwen4_exp_hybrid_experts_test` and `ninfer_qwen4_exp_expert_misses_test` run both forms on
+Linux and only the kernel under WDDM, where they have not run yet. Inkling 2's eager passes ran
+under Windows 11 in a [field report](performance/field-reports.md#rtx-3070-ti-windows-11); those
+of the other families have not run there. A process started
 by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE
 terminals) inherits I/O priority Low, and Windows throttles its reads; the Engine raises such a
 priority to normal before it reads the artifact and logs that it did, or warns when Windows refuses

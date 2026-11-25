@@ -26,6 +26,7 @@ enum class TensorParallelPartials : std::uint8_t;
 enum class NgramResidency : std::uint8_t;
 enum class NgramIo : std::uint8_t;
 enum class PrefillTail : std::uint8_t;
+enum class LoopKvCache : std::uint8_t;
 
 // ninfer/kv_cache_storage.h
 enum class KvCacheStorage : std::uint8_t;
@@ -71,6 +72,7 @@ enum class OutputChannel : std::uint8_t;
 struct StopString;
 struct StopPolicy;
 enum class ReasoningLoopAction : std::uint8_t;
+class AnswerNowSignal;
 struct ThinkingControlOptions;
 enum class StructuredOutputKind : std::uint8_t;
 struct StructuredOutputOptions;
@@ -125,6 +127,7 @@ struct GenerationTimings;
 struct GenerationEngineTiming;
 struct SpeculativeStats;
 struct ThinkingBudgetStats;
+struct BadWordsStats;
 enum class PrefixReusePath : std::uint8_t;
 enum class MaterializationStopReason : std::uint8_t;
 enum class MaterializationSearchPhase : std::uint8_t;

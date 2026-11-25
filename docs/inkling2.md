@@ -17,7 +17,8 @@ tokenization, the chat template, output parsing and the serving protocols.
 
 - **The model.** 24 stored layers of width 2304 run as 48 visits: the prelude (layers 0-5), the
   core (layers 6-17) three times with the same weights, then the coda (layers 18-23). Every visit
-  has its own keys, values and convolution history. Attention has no rotation: 24 query heads over
+  has its own keys, values and convolution history (`--loop-kv` shares the core's keys and values
+  between its passes, [shared loop KV](#shared-loop-kv)). Attention has no rotation: 24 query heads over
   8 key/value heads of width 128, a 16-wide relative feature per query head that scores a learned
   table of 1,024 distances, a sink logit per query and head, Q and K clipped to an L2 norm, V
   RMS-normed, causal 4-tap convolutions over K, V and both residual updates (dynamic per-head taps
@@ -37,9 +38,16 @@ tokenization, the chat template, output parsing and the serving protocols.
   output projections in 4 layers, Q8_0 gates), the token table Q4_K and the head Q6_K. The router,
   convolutions, distance tables, mixing queries, controllers, norms and expert scales are FP32;
   MiniPlus stores its sink and dynamic-tap projections in Q8_0, which the converter decodes to FP32
-  exactly.
+  exactly; it decodes such a vector from any other ggml block format as well (some GGUFs store
+  Q4_K).
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
-  products the routed experts only. A GGUF's BF16 matrices keep their words: UD-Q8_K_XL stores
+  products the routed experts only; a layer's query, gate, relative, key and value products of one
+  format share vector launches ([GGUF products](gguf.md#products)). The NVFP4 experts' matrix
+  kernel stages its tiles through `cp.async` where the card's
+  [device profile](device-profiles.md#what-is-calibrated) takes it: a 20,430-token prompt
+  prefilled at 3.07-3.08k instead of 2.96-2.97k tokens/s on an RTX 3090, 4.61-4.62k instead of
+  4.31-4.33k on an RTX PRO 4500 Blackwell and 6.81-6.82k instead of 6.43k on an RTX 4090. A GGUF's
+  BF16 matrices keep their words: UD-Q8_K_XL stores
   attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
   BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
   FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the
@@ -48,19 +56,56 @@ tokenization, the chat template, output parsing and the serving protocols.
   and residual update over one-warp blocks of 128 channels instead of one block per row. Each warp
   keeps its sums, and every reader adds them in the order the one-block kernel adds its warps', so
   the values are the same bits. A controller's nine products run in two launches, and the route
-  kernel also groups the pairs by expert for the expert kernels. These kernels took decode on an
-  RTX 3090 from 88.9 to 111.4 tok/s with the same tokens ([measurements](#measurements)).
+  kernel also groups the pairs by expert for the expert kernels and zeroes the sums the vector
+  expert products add into. A layer's query and key/value epilogues share one launch, and SiTU
+  writes the down products' q8_1 input itself, the bytes the quantizer would write. These kernels
+  took decode on an RTX 3090 from 88.9 to 111.4 tok/s with the same tokens
+  ([measurements](#measurements)); the shared launches then added 1.9% without drafts on an RTX
+  PRO 4500 Blackwell (126.6 to 129.0 tok/s) and 2.2% on an RTX 4090 (139.4-139.9 to 142.8-142.9
+  tok/s), and 1.1-1.4% with DSpark, again with the same tokens.
+- **Expert read-ahead.** With the experts on the GPU, a decode call of one row guesses each
+  visit's experts one visit early: on a side stream, the next visit's router scores the current
+  visit's MoE input, and the next visit reads its likeliest experts' rows into L2 while its
+  attention runs. A card reads as many experts as a quarter of its L2 holds (at most 16, none
+  below two): four on an RTX 4090, five on an RTX 5090; an RTX 3090's 6 MiB holds none. The reads
+  change no value. Greedy decode without drafts went from 144.6 to 147.3-147.6 tok/s on an RTX 4090
+  and from 207.5 to 217.5 on an RTX 5090, with the same tokens. Calls of several rows (DSpark's
+  verifications, concurrent requests) read none: two guesses a row or fewer slowed DSpark decode on
+  the RTX 4090 from 175.6-178.4 to 171.4-171.9 tok/s.
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it, and the short kernels release it once they are
+  resident ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode without drafts went from 199.4 to 216.0 tok/s on an RTX 5090 with the same tokens.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
-  chunks decoded to F16), FP32 scores, softmax and sums. The SIMT kernel starts each row from that
-  state and reads the nearer keys with their relative bias. A full visit's decode and verification
-  rows split their keys into about 32 blocks a multiprocessor (at most 512, each at least 64 keys),
-  the same split for every row of every call; a verification call's rows of one sequence go up to
-  four to a block, which reads each key tile once for them, and each row reads the tiles of its own
-  split, so a verification row computes what a decode step computes. On an RTX 3090 a
-  120,103-token prompt prefills at 1.52k tok/s instead of 501 and then decodes at 67.1 tok/s
-  instead of 46.8 ([measurements](#long-contexts)).
+  chunks decoded to F16), FP32 scores, softmax and sums. A block holds two groups, one block a
+  multiprocessor: the groups share each tile's loads and decoding, and each computes only the keys
+  of its own far field, so a row's bits do not depend on the other group; on Volta a call with
+  fewer such blocks than multiprocessors (a 256-row scoring call) runs one group a block, two
+  blocks a multiprocessor. A plane's next tile waits in registers as its stored bits and is decoded
+  as it enters shared memory, so its loads overlap the current tile's products. Every visit's
+  prompt chunk then reads the nearer keys on tensor cores too (a full visit's rows starting from
+  that state, a sliding-window visit's over its window), 32 rows to a block: each query enters the
+  products as an F16 value and its remainder times 2^12, and the relative bias comes from products
+  of the rows' relative features and the table rows of the distances a 32-key tile spans, split the
+  same way (a sum of FP32 products for each score where a chunk's positions are not consecutive, as
+  with branches), with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and
+  verification rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys
+  and values decoded from their stored format straight into the products' operands, and each query
+  and probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
+  bits), with FP32 scores, softmax and sums. A row's keys split into about two blocks a
+  multiprocessor (at most 512, each at least 64 keys), the same split for every row of every call;
+  a verification call's rows of one sequence go up to four to a block, two to each set of four
+  warps, which read each key tile once for them, and each row reads the tiles of its own split.
+  Every product and sum the kernel rounds is an explicit operation, so the compiler cannot fuse a
+  block's second row differently from a decode row: a verification row computes the bits a decode
+  step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernels for decode
+  rows (about 32 blocks a multiprocessor) and for the near field of prompt chunks. On an RTX 3090 a
+  114,754-token prompt prefills at 2.13k tok/s instead of 1.44k with the near field on the SIMT
+  kernel and the far field one block a multiprocessor, and at 2.30k instead of 2.20k on another RTX
+  3090 with two groups to a far-field block; after 114,754 tokens decode runs at 86.1 tok/s instead
+  of 68.6 with the SIMT decode kernel ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -87,17 +132,29 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
   non-causal blocks over the anchor and mask rows, then a recurrent Markov head of rank 256 that
-  corrects the target head's logits draft by draft. Without `--spec`, an artifact that carries the
-  drafter drafts with it while the Engine serves one request at a time: 3 drafts a round, the
-  round's width adapting from 1 to 3 by how far the drafts survive and how long the rounds take
-  (`--adaptive-mtp`), each proposal ending after its first draft at or below probability 0.5
-  (`--draft-min-p`); the request decodes plainly while its timed rounds commit tokens slower than
-  plain steps do, trying the other mode every 64 steps ([Adaptive MTP](serving.md#adaptive-mtp)).
-  The target keeps a draft only while it equals the token it draws itself, so
-  the output is plain decoding's. Context lookup (`--lookup-ngram`, 1 to 7 drafts, 3 by default)
-  also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained for this model
-  (`--spec dspine --draft-model PATH`; none is published), which taps the visits' states; with a
-  random drafter of this geometry the text equals plain decoding's, greedy and sampled.
+  corrects the target head's logits draft by draft through an output table that llama.cpp's
+  converter folded with the release's BF16 head. The head scores only each row's 16,384 candidates,
+  its largest head logits by their BF16 truncation (the lowest ids among those equal to the
+  16,384th), as vLLM's top-k Markov sampling does when a drafter's config asks for it; a draft is
+  the best candidate and its probability is taken over the candidates. Without `--spec`, an artifact
+  that carries the drafter drafts with it while the Engine serves one request at a time: 3 drafts a
+  round, the round's width adapting from 1 to 3 by how far the drafts survive and how long the
+  rounds take (`--adaptive-mtp`), each proposal ending after its first draft at or below probability
+  0.5 (`--draft-min-p`); the request decodes plainly while its timed rounds commit tokens slower
+  than plain steps do, trying the other mode every 64 steps
+  ([Adaptive MTP](serving.md#adaptive-mtp)). The target keeps a draft only while it equals the token
+  it draws itself, so the output is plain decoding's. Context lookup (`--lookup-ngram`, 1 to 7
+  drafts, 3 by default) also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained
+  for this model (`--spec dspine --draft-model PATH`; none is published), which taps the visits'
+  states; with a random drafter of this geometry the text equals plain decoding's, greedy and
+  sampled. incoai's [DFlash2 drafter](maintainer/dflash.md#inkling-2) (an artifact's optional
+  `dflash2` component, `--spec dflash2`, 7 drafts unless `--draft-tokens` sets 1 to 6) drafts
+  the same way for one request, with `--adaptive-mtp` and `--draft-min-p` too: five
+  sliding-window layers over the anchor and 7 masks, from the same taps, then the target's head
+  and a conditional selector over each row's 16 best tokens. It sees the last 2,048 positions
+  only. Its drafts survive further than DSpark's in greedy answers that draw on those, and it
+  loses to DSpark at temperature 1 and on answers that copy older text, so the default stays
+  DSpark; the published artifacts carry it ([measurements](#dflash2)).
 - **Images.** The release's vision tower (the artifact's `vision` component, `--vision`): a ViT
   with a class row, learned position rows resized to each image and 2D-rotated heads, then 2 x 2
   patch merging and a two-layer projector, up to 4,096 positions an image (fewer with
@@ -141,14 +198,20 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
 ```
 
-The conversion writes one 16,494,910,976-byte (15.4 GiB) `.ninfer` file of 1,185 objects: the text
-model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0). With Unsloth's
-`mmproj-BF16.gguf` as the `vision` source the tower keeps BF16 matrices and the file has
-16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each quantization in two layouts, the
-root file's `inkling2` (48 unrolled blocks in its metadata) and llama.cpp's `inkling2_loop` (24
-blocks, `Mainline_Support/*.gguf_file`). Both convert to the same artifact: from UD-IQ4_XS the two
-payloads are equal byte for byte, and the headers differ only in the recorded source path and the
-random artifact id.
+The conversion writes one 16,595,277,824-byte (15.5 GiB) `.ninfer` file of 1,185 objects: the text
+model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
+the GGUF stores it, and its Markov output table BF16; a drafter GGUF with table values that BF16
+does not hold is refused). With Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps
+BF16 matrices and the file is 295,895,040 bytes larger. Unsloth's repository holds each
+quantization in two layouts: llama.cpp's `inkling2_loop` (24 blocks), the root files since
+2026-11-23, and the earlier `inkling2` (48 unrolled blocks in its metadata), now
+`Old_Support/*.gguf_file`. Both convert to the same artifact: from UD-IQ4_XS the two payloads are
+equal byte for byte, and the headers differ only in the recorded source path and the random artifact
+id. The drafter is llama.cpp's mainline layout, Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`:
+per-block feature mixtures, context norms and the Markov output folded with the head. The earlier
+drafter layout (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, with `dspark_fuse` and the unfolded output)
+is refused, and the Engine refuses an artifact converted from it; convert again or download the
+current artifact (`--spec none` runs such an artifact without the drafter).
 
 IsValorum's APEX-I MiniPlus V2.1 converts the same way with its own Q8_0 mmproj and Unsloth's
 drafter, which its repository does not carry:
@@ -166,16 +229,42 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --out models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer --device cpu
 ```
 
-It writes 13,740,465,920 bytes (12.8 GiB) of 1,173 objects. Each conversion took about two minutes
-on a rented A40's container.
+It writes 13,840,832,768 bytes (12.9 GiB) of 1,173 objects. Each conversion took 21 or 22 seconds
+on a rented RTX 3090 host's container.
 
 Unsloth's UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL convert like UD-IQ4_XS (`--source gguf=` names the
-file) to 8,785,600,768, 10,080,361,216 and 14,392,937,728 bytes, in about 30 seconds each on a
+file) to 8,885,967,616, 10,180,728,064 and 14,493,304,576 bytes, in 17 to 21 seconds each on a
 rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
 do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
-UD-Q8_K_XL converts the same way to 23,685,230,592 bytes in 55 seconds on a rented RTX A6000 host;
+UD-Q8_K_XL converts the same way to 23,785,597,440 bytes in 27 seconds on the same host;
 its BF16 matrices, expert banks included, are copied word for word.
+
+incoai's DFlash2 drafter converts beside the others from the release's folder
+(`config.json` and `model.safetensors`, BF16):
+
+```bash
+hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors \
+  --local-dir models/inkling2/dflash2
+
+python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
+  --source gguf=models/inkling2/Inkling-2-Mini-UD-IQ4_XS.gguf \
+  --source vision=models/inkling2/mmproj-Inkling-2-Mini-Q8_0.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
+  --source dflash2=models/inkling2/dflash2 \
+  --components text,vision,dspark,dflash2 --name Inkling-2-Mini-UD-IQ4_XS \
+  --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
+```
+
+It writes 17,230,821,888 bytes of 1,266 objects, 635,544,064 bytes and 81 objects more than
+without the drafter (its projections are quantized to Q8_G32 rows on the CPU), in 25 seconds on a
+rented RTX 3090 host with a Threadripper 3960X and 185 on one with an EPYC 7R32 share. Every other
+object keeps its bytes: the six published artifacts, converted this way with the drafter on
+November 24 in 18 to 29 seconds each, equal the files without it object for object apart from the
+81 new ones (45 BF16, 36 Q8_G32). They are 9,521,507,584 bytes (UD-IQ1_M), 10,816,268,032
+(UD-Q2_K_XL), 14,476,376,832 (APEX-I MiniPlus V2.1), 15,128,844,544 (UD-Q3_K_XL), 17,230,821,888
+(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL). The converter checks the release's geometry, taps and
+selector settings and refuses a tensor stored other than BF16.
 
 ## Running
 
@@ -196,11 +285,11 @@ ninfer-serve models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling
   --max-context 32768 --expert-residency host
 ```
 
-With its experts on the GPU the model keeps 14.6 GiB of weights (15.0 GiB with the DSpark drafter)
-and 1.2 GiB of workspace, and a sequence's F16 keys and values take 32 KiB per token of context
-(its 8 full-attention visits) beside 224 MiB of sliding-window rings and convolution histories. One
-sequence of 12,288 tokens plans 16.5 GiB of the GPU, 17.0 GiB with the drafter. With
-`--expert-residency host` the GPU keeps 1.6 GiB of weights (1.95 GiB with the drafter), two
+With its experts on the GPU the model keeps 14.6 GiB of weights (15.1 GiB with the DSpark drafter)
+and 1.2 GiB of workspace, and a sequence of 12,288 tokens takes 418 MiB of MXFP8 keys and values
+(16.5 KiB a token in its 8 full-attention visits), sliding-window rings and convolution histories.
+One such sequence plans 16.3 GiB of the GPU, 16.9 GiB with the drafter. With
+`--expert-residency host` the GPU keeps 1.57 GiB of weights (2.04 GiB with the drafter), two
 whole-layer banks of 1,337 MiB and a cache of as many experts as fit, and the host pins 13.1 GiB
 for the routed experts; `disk` reads them from the artifact through the OS page cache.
 
@@ -257,6 +346,78 @@ tok/s in all five. On this text `rk8v4` raised the NLL less than MXFP8 in a smal
 `int8` no more than MXFP8 in the same 16.5 KiB; MXFP8 stays the default because the release
 trained with it.
 
+### Shared loop KV
+
+`--loop-kv` chooses which keys and values the three passes of the looped core keep. `per-pass`, the
+default, keeps every visit's own, the model's arithmetic. `last-full` keeps only the last pass's for
+the core's two full-attention layers, 11 and 17: in a call (a prompt chunk, a decode step, a
+verification) the first two passes write their rows at the call's positions into the last pass's
+cache and attend over it, so they read the last pass's keys and values for every position before
+the call and their own for the call's, and the last pass then writes its rows over theirs. Four of
+the eight full-attention visits keep a cache, so a token takes half the bytes in every
+`--kv-dtype` (8.25 KiB in MXFP8). `last-all` shares the core's ten sliding-window layers' rings the
+same way; this is transformers' `recurrent_kv_cache_mode="last_loop"`
+([PR 51161](https://github.com/huggingface/transformers/pull/51161)). The rings do not grow with the
+context, so `last-all` saves a fixed 165 MiB a sequence more. The convolution histories stay every
+visit's own in both modes. A sequence's image (the context cache's host and disk tiers, the prefix
+cache file, slot files) holds the caches the mode keeps, and an image saved in one mode does not load
+in another.
+
+Both modes change the model, and it is the transformers mode that changes it most. The first two
+passes read keys and values only the last pass computes, and what they read depends on how the
+tokens are split into calls: a decoded token reads the last pass's rows of every position before
+it, a token in a prompt chunk its own pass's rows of the chunk's earlier tokens. So the perplexity
+depends on the scoring calls (`ninfer-perplexity` scores in calls of 256 tokens; for the one-token
+column a change to the scorer, not part of the build, scored each token in its own call after a
+context prefilled in prompt chunks, as decoding reads), and a reply differs between `--spec none` and DSpark, whose verifications are calls of
+several tokens.
+
+| `--loop-kv` | KV of one sequence of 131,072 tokens | Sequences of 131,072 tokens that start | Mean NLL, 9,718 tokens | The same, one token a call | Mean NLL, 67,977 tokens | Mean NLL, 49,478 tokens, 16,384-token windows |
+|---|---:|---:|---:|---:|---:|---:|
+| `per-pass` (default) | 3,066 MiB | 2 | 1.858381 | 1.860160 | 1.784949 | 1.739055 |
+| `last-full` | 2,008 MiB | 5 | 1.874149 (+0.85%) | 1.880513 (+1.09%) | 1.797734 (+0.72%) | 1.754859 (+0.91%) |
+| `last-all` | 1,843 MiB | 5 | 1.899762 (+2.23%) | 1.997081 (+7.36%) | 1.824870 (+2.24%) | 1.785669 (+2.68%) |
+
+UD-IQ4_XS on an RTX 4090 (450 W, PCIe 4.0 x16), MXFP8 KV, experts on the GPU, a CUDA 13.4.3 build
+for `75;80;86;89;120a`, November 24, 2026. The KV column is the startup's KV line (the
+full-attention caches, the rings, the histories and the checkpoints); the sequences column is the
+most `ninfer-serve --max-context 131072 --max-concurrency N` starts with on that card (DSpark's
+drafter loaded, its default). The NLL columns score the first 40,000 bytes, all 277,332 bytes and
+the first 200,000 bytes of WikiText `00.txt`, the first two in 4,096-token windows at a 2,048-token
+stride; `per-pass` equals the build before the option bit for bit. With `last-full` the other
+formats rise alike on the 40,000 bytes: F16 1.860018 to 1.872789 (+0.69%), `int8` 1.859395 to
+1.872493 (+0.70%), `rk8v4` 1.859445 to 1.876169 (+0.90%), `rk4v4` 1.859137 to 1.873246 (+0.76%).
+
+For memory alone a smaller format costs less: `rk4v4` keeps 8.75 KiB a token, about what
+`last-full` keeps in MXFP8, for +0.04% against +0.85%; 4 sequences of 131,072 tokens start with it
+on the RTX 4090. `last-full` over `rk4v4` halves that again, 4.4 KiB a token: 7 sequences start
+(1,511 MiB of KV for one), at +0.76%. Two sequences of the model's whole 262,144-token context start
+with either shared mode in MXFP8 and not with `per-pass`.
+
+Speed stays: the modes run the same kernels over fewer caches. One server per mode
+(`--max-context 131072`), greedy replies of 256 tokens after prompts of 42, 7,703, 24,828 and
+86,848 tokens, two rounds of one run each: with `--spec none` the shared modes prefilled within
+-0.2% to +2.1% of `per-pass` (7.04k, 6.55k and 5.05k tok/s at the three long prompts) and decoded
+within -3.1% to +1.0% (`per-pass` 127.6 tok/s after 24,828 tokens, `last-all` 123.6 there, the
+largest change, -2.4% in the other round). The replies depart from `per-pass`'s after 40 to 114
+characters with `last-full` and 9 to 125 with `last-all` (of 690 to 1,139 characters of reasoning
+and answer), and with DSpark from their own `--spec none` replies after 60 to 718 and 39 to 306;
+they stay on topic, and `per-pass` gives the same reply with DSpark and without. Recall: with the
+four codes of `tools/longctx_recall_probe.py`'s prompt (thinking off, greedy), every mode names all
+four at 32,409, 64,523 and 126,185 tokens, and gives the same answer again from the context cache
+after another request has taken the sequence.
+
+Two other shares were measured by copying rows between the per-pass caches before each call (on
+the 40,000 bytes unless named), and not built. The earlier passes reading the middle pass's rows instead
+of the last pass's raised the NLL more, to 1.876032 (1.800353 and 1.757383 on the longer texts),
+and the first pass's to 1.897353. The first two passes keeping their own rows of the 1,024
+positions before a call, beside the last pass's older ones, brought `last-full` to 1.864526
+(+0.33%; 1.873125 and 1.871936 with 64 and 256 positions), 1.864576 one token a call (+0.24%),
+1.789919 on the 67,977 tokens (+0.28%) and 1.750070 in the 16,384-token windows (+0.63%): the
+longer the context, the less the near rows recover, and each earlier visit would need a second
+ring in every image, checkpoint and rewind, for a cost on the 40,000 bytes still six to eight
+times `rk4v4`'s.
+
 ## Measurements
 
 `ninfer_bench` against `llama-bench` from Unsloth's llama.cpp prebuilt
@@ -312,7 +473,9 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer-al
   (`--max-concurrency 4`, no drafts) decode 238.5 tok/s together on the split against 209.4 on
   one card (1.14x), each request's text equal to its text alone. With one request and an
   8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
-  18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
+  18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt. A
+  [field report](performance/field-reports.md#tesla-t10-two-cards) runs two Tesla T10s without peer
+  access the same way, with prompts up to 261,760 tokens.
 
 ### Long contexts
 
@@ -353,22 +516,259 @@ After 120,103 tokens the request decodes plainly most of the time: 70.4 against 
 of plain decoding cost 0.5% and 1.1%; the ungated runs spread by 0.5, 1.0 and 0.7 tok/s at the
 three lengths. The text equals `--spec none`'s in every run.
 
+The decode and verification attention on tensor cores, November 23, 2026: `ninfer-serve
+--max-context 131072`, MXFP8 KV, one greedy request of 256 tokens after each of three fixed
+prompts, one run each, with DSpark gated as above; the build before it (release 2026-11-22.6 on
+the RTX 3090, master 3f82067 built alike on the RTX 5090) against the build with it. The server's
+own decode rates, in tok/s:
+
+| Card | Prompt tokens | `--spec none`, before | `--spec none` | DSpark, before | DSpark |
+|---|---:|---:|---:|---:|---:|
+| RTX 3090 (370 W, PCIe 4.0 x16) | 35 | 105.9 | 110.8 | 105.5 | 109.5 |
+| | 32,070 | 90.8 | 99.9 | 100.6 | 121.7 |
+| | 114,754 | 68.6 | 86.1 | 71.3 | 97.7 |
+| RTX 5090 (600 W, PCIe 3.0 x16) | 35 | 168.1 | 179.7 | 186.4 | 192.9 |
+| | 32,070 | 152.9 | 164.1 | 205.1 | 243.1 |
+| | 114,754 | 129.7 | 144.3 | 165.6 | 190.4 |
+
+Prompt chunks keep their kernels, and prefill stayed within 1% (after 114,754 tokens 1.31k against
+1.32k tok/s on the RTX 3090, whose host also ran other tenants' jobs at a load average of about
+50). DSpark's text equals `--spec none`'s in both builds after every prompt on both cards, and so
+does the CLI's after 32,070 tokens with each KV format (`mxfp8`, `bf16`, `int8`, `rk8v4`, `rk4v4`)
+on the RTX 5090; the text itself changed with the kernel's rounding. With `--spec none` after
+32,070 tokens the CLI on the RTX 3090 decoded at 99.7 tok/s against 90.6 with `int8`, 101.6
+against 90.7 with `rk8v4`, 101.5 against 90.5 with `rk4v4` and 95.6 against 90.1 with `bf16`.
+
+The kernel alone, in µs, against the SIMT kernel at the split each uses: random caches at the
+model's 8 KV heads and 24 query heads, 114,754 keys (the F16 window ring: 1,024 keys, 16 splits):
+
+| GPU | Splits | MXFP8 decode | MXFP8, four verification rows | F16 decode | F16 window ring |
+|---|---|---:|---:|---:|---:|
+| Quadro RTX 6000 | 288 → 18 | 1,083.5 → 572.6 | 3,054 → 1,326 | 1,003 → 916 | 25.1 → 20.3 |
+| RTX 3090 | 328 → 20 | 625 → 294 | 1,861 → 689 | 605 → 545 | 21.9 → 12.0 |
+| RTX 4090 | 512 → 32 | 324.8 → 271.0 | 873 → 332 | 556.5 → 507.7 | 15.5 → 9.4 |
+| RTX 5090 | 512 → 42 | 207.0 → 158.1 | 458 → 236 | 329.7 → 290.5 | 14.4 → 10.3 |
+
+These are the kernel's first form, whose products and sums the compiler could fuse; with every
+rounding explicit it took 293.4, 689.4, 544.9 and 12.6 µs on the RTX 3090 and 158.5, 240.0, 289.8
+and 10.2 µs on the RTX 5090. Against an FP64 oracle both kernels' outputs have the same error (relative RMS 1.705e-3 with
+MXFP8 after 114,754 keys, mostly the BF16 output's rounding). On a Tesla V100, whose tensor-core
+products are emulated, the tensor-core kernel took 1,914 µs against the SIMT kernel's 1,235
+(MXFP8) and 1,624 against 841 (F16), so Volta keeps the SIMT kernel.
+
+The near field of prompt chunks on tensor cores, November 23, 2026: the CLI (`--greedy
+--max-context 131072 --max-new 4 --spec none`, MXFP8 KV, experts on the GPU, CUDA 13.4, build
+`75;80;86;89;120a`) after two fixed prompts, master db39615 against the same tree with the kernel,
+the two builds alternating. The CLI's prefill rate, in tok/s:
+
+| Card | Prompt tokens | Prefill, before | Prefill |
+|---|---:|---:|---:|
+| RTX 3090 (350 W, PCIe 4.0 x16) | 32,070 | 1.98k, 1.96k | 2.76k, 2.75k |
+| | 114,754 | 1.44k | 1.83k |
+| RTX PRO 4500 Blackwell (200 W, PCIe 4.0 x16) | 32,070 | 3.17k, 3.16k | 3.97k, 3.95k |
+| | 114,754 | 2.43k | 2.88k |
+
+Both builds give the same first tokens after both prompts on both cards. On the RTX 3090 the
+114,754-token prefill spends 62.8 s in GPU kernels: the far field 29.2 s (46.5%), the near field
+6.0 s (9.6%). The mean NLL over the first 200,000 bytes of WikiText `00.txt` (49,478 tokens,
+16,384-token windows at an 8,192-token stride) is 1.739533 against 1.739363 on the RTX 3090
+(+0.010%) and 1.739307 against 1.739413 on the RTX PRO 4500 (-0.006%); `ninfer-perplexity` scored
+them in 68.1 s against 84.5 s and in 46.8 s against 54.3 s.
+
+The far field at two blocks a multiprocessor with a plane's next tile held as its stored bits,
+November 23, 2026: the same CLI runs, master 4e1561d against the same tree with both changes, the
+two builds alternating. The CLI's prefill rate, in tok/s:
+
+| Card | Prompt tokens | Prefill, before | Prefill |
+|---|---:|---:|---:|
+| RTX 3090 (350 W, PCIe 4.0 x16) | 32,070 | 2.73k, 2.73k | 2.87k, 2.87k |
+| | 114,754 | 1.83k | 2.13k |
+| RTX PRO 4500 Blackwell (200 W, PCIe 4.0 x16) | 32,070 | 3.98k, 3.95k | 4.15k, 4.14k |
+| | 114,754 | 2.88k | 3.31k |
+
+Both builds give the same first tokens, and the mean NLL above is 1.739533 with both on the RTX
+3090: the changes move no bits. On the RTX 3090 the far field of the 114,754-token prefill took
+29.2 s of GPU time before, 24.9 s with the staged bits alone and 19.9 s with both (36.9% of 53.8
+s); with F16 keys and values (`--kv-dtype bf16`) it takes 16.7 s at one block a multiprocessor and
+15.1 s at two. With the staged bits alone the CLI prefilled at 2.78k tok/s (32,070 tokens) and
+1.95k (114,754) on the RTX 3090, 4.06k and 3.06k on the RTX PRO 4500. F16 products for MXFP8's
+codes times their power-of-two scale, exact against the FP32 path for every pair of codes and every
+exponent, moved the far field from 19.9 to 19.2 s on the RTX 3090 and the RTX PRO 4500's prefill
+from 4.18k, 4.16k to 4.16k, 4.14k and from 3.34k to 3.29k, so the decode keeps its FP32 products.
+
+Turing and Volta, November 23, 2026: the release image of master 5342f9f (`cuda13.4`, and
+`cuda12.9` on the V100) on Vast.ai cards at their default power limits, experts on the GPU, MXFP8
+KV; the CLI's prefill of the 32,070-token prompt as above and `ninfer-perplexity` over the same
+49,478 WikiText tokens:
+
+| Card | Prefill, 32,070 tokens (tok/s) | Mean NLL |
+|---|---:|---:|
+| RTX 3090 (420 W, PCIe 3.0 x16) | 3.24k | 1.739533 |
+| Quadro RTX 6000 (250 W, PCIe 3.0 x16) | 1.51k | 1.739427 |
+| Tesla V100-SXM2-32GB (300 W) | 1.02k | 1.739296 |
+
+The Quadro RTX 6000 runs both fields on tensor cores (the far field at one block a
+multiprocessor); the V100 keeps the SIMT kernels for the near field. The RTX 3090's NLL equals its
+value above. A 600-token greedy reply (`--max-context 4096`) decoded at 75.2 tok/s with DSpark and
+68.7 without drafts on the Quadro RTX 6000, 85.2 and 67.3 on the V100, and 144.4 and 120.5 on the
+RTX 3090.
+
+The far field at two groups of 32 rows a block, November 24, 2026: release 2026-11-24.2 (master
+6e1937e) against the Native release build of master 03ac425f26 with the change, on rented cards at
+their default power limits, experts on the GPU, the two builds alternating, one run each. The CLI
+(`--greedy --max-new 32`, DSpark) after the 114,754- and 32,070-token prompts above, and on the RTX
+4090 after a 195,073-token prompt; the RTX 4090 ran Unsloth's UD-Q4_K_XL converted by master's
+converter, the other cards the published UD-IQ4_XS artifact. The CLI's prefill rate, in tok/s:
+
+| Card | KV | Prompt tokens | Prefill, before | Prefill |
+|---|---|---:|---:|---:|
+| RTX 4090 (450 W, CUDA 13.4) | `rk8v4` | 195,073 | 4.17k, 4.12k | 4.54k, 4.53k |
+| | `mxfp8` | 195,073 | 4.05k | 4.51k |
+| | `rk4v4` | 195,073 | 4.09k | 4.49k |
+| | `int8` | 114,754 | 5.01k | 5.37k |
+| | `bf16` | 114,754 | 5.04k | 5.23k |
+| | `mxfp8` | 32,070 | 6.52k | 6.68k |
+| | `rk8v4` | 32,070 | 6.56k | 6.70k |
+| RTX 3090 (350 W, CUDA 13.4) | `mxfp8` | 114,754 | 2.20k | 2.30k |
+| | `rk8v4` | 114,754 | 2.21k | 2.30k |
+| | `mxfp8` | 32,070 | 2.97k | 3.03k |
+| RTX 5090 (575 W, CUDA 13.4) | `mxfp8` | 114,754 | 6.86k | 7.13k |
+| | `rk8v4` | 114,754 | 6.89k | 7.11k |
+| | `mxfp8` | 32,070 | 8.86k | 9.00k |
+| A100-SXM4-40GB (400 W, CUDA 13.4) | `mxfp8` | 114,754 | 2.27k | 2.45k |
+| | `rk8v4` | 114,754 | 2.28k | 2.45k |
+| | `mxfp8` | 32,070 | 2.82k | 2.89k |
+| Quadro RTX 6000 (250 W, CUDA 13.4) | `mxfp8` | 114,754 | 1.19k | 1.40k |
+| | `rk8v4` | 114,754 | 1.18k | 1.39k |
+| | `mxfp8` | 32,070 | 1.50k | 1.58k |
+| Tesla V100-SXM2-32GB (300 W, CUDA 12.9) | `mxfp8` | 114,754 | 453 | 533 |
+| | `rk8v4` | 114,754 | 467 | 532 |
+| | `mxfp8` | 32,070 | 1.02k | 1.11k |
+
+Both builds wrote the same text after every prompt, and each card's mean NLL over the first 200,000
+bytes of WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) and over
+one 110,592-token window of the 114,754-token prompt's text is the same with both. `ninfer-perplexity`
+scored them at these rates, in tok/s:
+
+| Card | 16,384-token windows, before | 16,384-token windows | 110,592-token window, before | 110,592-token window |
+|---|---:|---:|---:|---:|
+| RTX 4090 (UD-Q4_K_XL) | 1,608.7 | 1,615.6 | 2,049.0 | 2,079.0 |
+| RTX 3090 | 791.5 | 793.8 | 1,124.6 | 1,137.8 |
+| RTX 5090 | 2,079.7 | 2,087.9 | 2,553.6 | 2,612.7 |
+| A100-SXM4-40GB | 779.0 | 789.1 | 1,095.9 | 1,177.8 |
+| Quadro RTX 6000 | 447.8 | 448.9 | 737.4 | 744.9 |
+| Tesla V100-SXM2-32GB | 348.6 | 349.6 | 275.3 | 277.6 |
+
+Other tenants' jobs loaded the RTX 3090's host (load average 58 at the start) and the V100's (2 to
+78). The RTX 4090's prompts ran with each KV format the family stores. On the V100 two groups in
+every block scored at 346.0 tok/s (three runs, against 348.6 three times) and 269.0 and 268.0
+(against 275.3 and 275.4): a 256-row call has 32 such blocks for 80 multiprocessors. Its scoring
+rates above are the build that runs one group a block there, which wrote the same NLL, prefilled the
+two prompts at 536 and 1.11k tok/s and wrote the same texts.
+
+### The mainline drafter
+
+Since November 24 the published artifacts carry the drafter in llama.cpp's mainline layout,
+Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`: its feature mixtures stored as softmax rows and
+its Markov output folded with the release's BF16 head, where the earlier file left that fold to the
+Engine, which used the target's quantized head (Q6_K in UD-IQ4_XS). Every other object of the six
+artifacts keeps its bytes. Against release 2026-11-23.11 with the earlier UD-IQ4_XS artifact on one
+RTX 3090 (350 W, PCIe 4.0 x16, a CUDA 13.4.3 build), the CLI's 384 tokens a request, DSpark by
+default, the two builds alternating, one run each, in tok/s:
+
+| Request | `--spec none` | Earlier drafter | Mainline drafter | Drafts accepted, earlier / mainline |
+|---|---:|---:|---:|---:|
+| essay, greedy | 119.1 | 128.8 | 127.9 | 155 of 354 / 155 of 350 |
+| Python task, greedy | 119.9 | 172.5 | 175.3 | 245 of 358 / 245 of 358 |
+| question about a 5,542-token document, greedy | 114.2 | 141.5 | 143.8 | 224 of 392 / 224 of 390 |
+| essay, seed 1 | 118.1 | 122.3 | 124.2 | 120 of 265 / 117 of 248 |
+| essay, seed 2 | 119.1 | 125.8 | 123.6 | 144 of 311 / 136 of 288 |
+| Python task, seed 2 | 118.0 | 159.4 | 160.3 | 229 of 385 / 230 of 381 |
+
+Every DSpark run's text equals its `--spec none` twin's in both builds. With 7 drafts a round over
+256 greedy essay tokens the earlier drafter had 137 of 804 drafts accepted (74.8 tok/s), the
+mainline one 138 of 797 (75.8 tok/s). The GPU keeps 15.1 GiB of weights with the drafter instead
+of 15.0 and plans 16.9 GiB for a 12,288-token sequence in both builds: the folded table is now a
+weight rather than workspace the Engine filled at startup. DSpark figures in this section dated
+before November 24 come from the earlier drafter.
+
+### DFlash2
+
+incoai's DFlash2 drafter in the UD-IQ4_XS artifact ([converting](#converting)) against DSpark on one
+RTX 3090 (350 W, PCIe 4.0 x16, an EPYC 7R32 host), a CUDA 13.4.3 build, `ninfer-serve
+--max-context 40960`, experts on the GPU, MXFP8 KV, 384 tokens a request (the GSM8K question stops
+at 94), reasoning first, one run each, in tok/s:
+
+| Request | `--spec none` | DSpark (default) | DFlash2, 3, floor 0.5 | DFlash2, 7, floor 0.5 | DFlash2, 7 adapting, floor 0.5 |
+|---|---:|---:|---:|---:|---:|
+| essay, greedy | 115.1 | 129.9 | 143.0 | 138.2 | 131.9 |
+| Python task, greedy | 114.6 | 159.3 | 150.9 | 165.1 | 165.7 |
+| GSM8K question, greedy | 118.4 | 176.1 | 199.1 | 196.3 | 200.2 |
+| summary of a 5,753-token document, greedy | 108.8 | 158.8 | 98.7 | 84.3 | 107.9 |
+| summary of a 27,145-token document, greedy | 104.2 | 132.2 | 118.4 | 118.8 | 115.4 |
+| essay, seed 1 | 113.0 | 117.5 | 101.2 | 101.9 | 107.3 |
+| essay, seed 2 | 114.1 | 119.3 | 104.7 | 109.3 | 104.7 |
+| Python task, seed 2 | 116.7 | 137.7 | 138.0 | 120.5 | 133.6 |
+
+Every run's text equals `--spec none`'s. DFlash2 is faster than DSpark on the short greedy
+requests: by 1.5-10.1% on the essay, -5.3 to +4.0% on the Python task and 11.5-13.7% on the GSM8K
+question. It is slower on both documents (0.53-0.68 times DSpark on the 5,753-token one, 0.87-0.90
+on the 27,145-token one) and at temperature 1 (0.86-0.92 times on the essays; 0.88-1.00 on the
+Python task). Its window is the reason for the documents: with 7 drafts and no floor the CLI's
+rounds accepted 4.12 tokens on a 1,593-token slice of the document (DSpark 3.32) and 2.06 on the
+whole document (DSpark 3.14), where the summary draws on text more than 2,048 positions back, which
+DSpark's full-attention layers see. Essays after 3,111 and 6,045 tokens of unrelated text kept 2.50
+and 2.51 (DSpark 1.97 and 2.03), so the ring's wrap costs nothing by itself. At temperature 1 the
+target keeps a draft only while it equals its own draw, so acceptance follows the target's
+probability of the draft, and DFlash2's 7-draft rounds (about 31 ms against 9 for a plain step)
+lose more than they gain. 7 drafts without a floor decoded the greedy essay at 106.6 tok/s and the
+5,753-token document at 60.3.
+
+The first pass of the same matrix, beside a one-core compile on the host, gave the same order; the
+adapting settings moved by up to 17% between passes (DSpark on the 27,145-token document 112.6
+then 132.2, from 165 then 216 accepted drafts), as the controller and the timing gate react to
+round times; the fixed settings moved by 7% at most. The drafter adds 0.6 GiB of weights (15.2 GiB
+against DSpark's 15.1) and plans 147 MiB for its ring of 2,048 positions and workspace; the server
+started with 5.19 GiB free against 5.22 with DSpark.
+
+The six published artifacts carry the drafter. Release `2026-11-24.7` on another RTX 3090 (350 W,
+PCIe 4.0 x16, a Threadripper 3960X host), the CLI's 384-token greedy essay at `--max-context
+12288`, November 24, one run each, in tok/s (tokens a round in parentheses):
+
+| Artifact | `--spec none` | DSpark (default) | DFlash2, 7, floor 0.5 |
+|---|---:|---:|---:|
+| UD-IQ1_M | 135.2 | 136.5 (1.87) | 148.2 (2.55) |
+| UD-Q2_K_XL | 131.2 | 147.3 (1.98) | 158.8 (2.80) |
+| APEX-I MiniPlus V2.1 | 132.6 | 135.8 (1.62) | 141.5 (2.39) |
+| UD-Q3_K_XL | 123.7 | 140.6 (1.89) | 134.5 (2.90) |
+| UD-IQ4_XS | 119.0 | 130.7 (1.99) | 134.8 (2.82) |
+| UD-Q8_K_XL, host experts | 71.3 | 87.4 (2.08) | 95.4 (3.01) |
+
+Every run's text, reasoning included, equals `--spec none`'s. On UD-Q3_K_XL DFlash2 is 4.3% slower
+than DSpark despite its longer rounds. UD-IQ4_XS's Python task gave 120.2, 176.6 (2.80) and 178.0
+(4.26); its essay at temperature 1.0 (seed 1) 118.8 plain and 116.7 (2.17) with DFlash2; DFlash2
+with host and disk experts 127.9 and 126.1 with the device run's text. At this context the ring and
+workspace take 107 MiB. Release `2026-11-24.6` runs the new UD-IQ4_XS file with DSpark (129.9 tok/s)
+and with `--spec none` (119.7), with the same text.
+
 ### APEX-I MiniPlus
 
-IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB with its Q8_0 tower and the DSpark drafter) on a rented
+IsValorum's APEX-I MiniPlus V2.1 (12.9 GiB with its Q8_0 tower and the DSpark drafter) on a rented
 A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
 
 - **Speed.** `ninfer_bench`, three repetitions: prefill of 2,048 tokens 2,776 tok/s, of 10,000
-  tokens 2,128; decode of 128 tokens 104.3 tok/s, 90.2 after 10,000. The CLI's 384-token greedy
-  essay, one run each: 103.1 tok/s with `--spec none`, 115.6 with DSpark (1.69 tokens a round),
-  with the same text. UD-IQ4_XS on another A40 host ([below](#across-cards)) gave 2,432, 1,897,
-  85.3 and 75.5, and 84.4 and 97.3 on the essay; this was not an A/B on one host.
+  tokens 2,128; decode of 128 tokens 104.3 tok/s, 90.2 after 10,000. UD-IQ4_XS on another A40
+  host ([below](#across-cards)) gave 2,432, 1,897, 85.3 and 75.5; this was not an A/B on one host.
+  The CLI's 384-token greedy essay on a third A40 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build,
+  November 24, the mainline drafter), one run each: 103.0 tok/s with `--spec none`, 110.2 with
+  DSpark (1.66 tokens a round), 94.1 with host experts and 93.9 with disk experts, all with the
+  same text; UD-IQ4_XS there 89.7 and 107.0 (2.06).
 - **Quality.** Perplexity on the first 40,000 bytes of WikiText (`--kv-dtype bf16`, 9,718 scored
   tokens): a mean NLL of 1.870942 (perplexity 6.494411) against UD-IQ4_XS's 1.859871 (6.422907),
   +0.60%.
-- **Memory.** With every expert on the GPU: 12.1 GiB of weights, 12.8 GiB with the tower and the
-  drafter. One sequence plans 13.8 GiB of the GPU at 8,192 tokens and 14.5 GiB at 32,768 without
-  the drafter, 14.7 and 15.5 GiB with the tower and the drafter; no 16 GB card has run it.
+- **Memory.** With every expert on the GPU: 12.1 GiB of weights, 12.5 GiB with the drafter. One
+  sequence plans 13.8 GiB of the GPU at 8,192 tokens and 14.5 GiB at 32,768 without the drafter,
+  14.7 and 15.5 GiB with the tower and the drafter; no 16 GB card has run it.
   `--expert-residency host` pins 10.9 GiB of host memory for the routed experts and keeps 1.16 GiB
   of weights and two 1,002 MiB layer banks on the GPU; `host` and `disk` (the A40's cache held
   every expert) gave the device run's 384 greedy tokens byte for byte.
@@ -377,35 +777,38 @@ A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
 
 ### Smaller quantizations
 
-Unsloth's UD-IQ1_M (8.2 GiB), UD-Q2_K_XL (9.4 GiB) and UD-Q3_K_XL (13.4 GiB), each with the Q8_0
+Unsloth's UD-IQ1_M (8.3 GiB), UD-Q2_K_XL (9.5 GiB) and UD-Q3_K_XL (13.5 GiB), each with the Q8_0
 tower and the DSpark drafter, on a rented RTX 3090 (350 W, PCIe 4.0 x16, CUDA 12.8), November 21,
-2026, one run each:
+2026, one run each; the essay columns on another RTX 3090 (350 W, PCIe 4.0 x16, a CUDA 13.4.3
+build) on November 24 with the mainline drafter:
 
 | Quantization | Unsloth's KLD to UD-Q8_K_XL | Mean NLL, 40 KB WikiText | Essay, `--spec none` | Essay, DSpark | GPU plan: 8K, `--spec none` / 32K, tower and DSpark |
 |---|---:|---:|---:|---:|---:|
-| UD-IQ1_M | 0.0867 | 1.929600 (+3.75%) | 124.3 tok/s | 128.9 (1.67 a round) | 9.2 / 10.9 GiB |
-| UD-Q2_K_XL | 0.0595 | 1.901978 (+2.26%) | 121.3 | 130.3 (1.92) | 10.4 / 12.1 GiB |
-| UD-Q3_K_XL | 0.0174 | 1.861615 (+0.09%) | 113.5 | 126.1 (2.03) | 14.4 / 16.1 GiB |
+| UD-IQ1_M | 0.0867 | 1.929600 (+3.75%) | 135.4 tok/s | 139.2 (1.84 a round) | 9.2 / 10.9 GiB |
+| UD-Q2_K_XL | 0.0595 | 1.901978 (+2.26%) | 131.3 | 144.5 (1.98) | 10.4 / 12.1 GiB |
+| UD-Q3_K_XL | 0.0174 | 1.861615 (+0.09%) | 122.9 | 140.8 (1.95) | 14.4 / 16.1 GiB |
 
 The NLL differences are against UD-IQ4_XS's 1.859871 (`--kv-dtype bf16`, 9,718 scored tokens).
 With `--expert-residency host` (6.3, 7.5 and 11.4 GiB pinned) or `disk` each gave the device
-run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark; the 3090's cache held
-every expert. Each names the mailbox's 24 and the sun on the right in the image prompt of
-examples/cli/messages/image_natural.json. No card under 24 GB has run them.
+run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark, on both dates; the
+3090's cache held every expert. Each names the mailbox's 24 and the sun on the right in the image
+prompt of examples/cli/messages/image_natural.json. No card under 24 GB has run them.
 
 ### UD-Q8_K_XL
 
-Unsloth's UD-Q8_K_XL (22.1 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
+Unsloth's UD-Q8_K_XL (22.2 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
 token table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. On a rented RTX
 A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21, 2026, one run each:
 
-- **Memory.** 21.3 GiB of weights, 22.0 GiB with the tower and the drafter; one sequence plans
+- **Memory.** 21.3 GiB of weights, 22.1 GiB with the tower and the drafter; one sequence plans
   22.9 GiB of the GPU at 8,192 tokens with `--spec none` and 24.7 GiB at 32,768 with the tower and
   the drafter. `--expert-residency host` pins 18.3 GiB of host memory and keeps 3.07 GiB of weights
   and two 1,944 MiB layer banks on the GPU.
-- **Speed.** The 384-token greedy essay decodes at 67.3 tok/s with `--spec none`, 72.9 with DSpark
-  (1.76 tokens a round), 63.8 with host experts and 63.5 with disk experts (the A6000's cache held
-  every expert). A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s.
+- **Speed.** A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s. On another
+  RTX A6000 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build, November 24, the mainline drafter) the
+  384-token greedy essay decodes at 71.3 tok/s with `--spec none`, 90.2 with DSpark and the tower
+  (2.08 tokens a round), 68.2 with host experts and 67.8 with disk experts (the A6000's cache held
+  every expert), all with the same text; UD-IQ4_XS there 105.8 and 124.7 (2.06).
 - **Quality.** A mean NLL of 1.857855 on the 40 KB WikiText slice (`--kv-dtype bf16`, 9,718
   scored tokens), against UD-IQ4_XS's 1.859871 (-0.11%). Host, disk and DSpark runs give the
   device run's 384 greedy tokens byte for byte; the image prompt gives the mailbox's 24 and the sun
@@ -488,7 +891,7 @@ under 0.9% on the 3090, and the tables hold the second runs. llama.cpp on the 30
 
 #### Experts in host memory
 
-The model's 15.0 GiB of weights do not fit on the cards of 8, 12 and 16 GB. On these NInfer-all kept
+The model's 15.1 GiB of weights do not fit on the cards of 8, 12 and 16 GB. On these NInfer-all kept
 the routed experts in pinned host memory (`--expert-residency host`) beside the device cache it
 sizes itself, and llama-bench ran with `--fit-target 1024 --fit-ctx 10240`: llama.cpp fits the model
 to the card itself, with llama-server's default margin of 1024 MiB, and keeps on the CPU what does
@@ -556,9 +959,11 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   oracles at Inkling 2 Mini's shapes: the depth mixes, the controllers, the attention's clips,
   convolutions, relative bias and sinks, the residual updates, routing and SiTU; the split rows,
   the batched controller products and the sorted route against their one-block forms bit for bit;
-  the CPU's expert products against the GPU's. `ninfer_inkling2_dspark_kernels_test` qualifies the
-  drafter's kernels (its uniform-block attention over window rings and full caches, its mixes,
-  rotations, the recurrent head's steps, ties to the lower id).
+  verification rows of two to four positions against decode rows bit for bit (FP32 partials of
+  every split and the outputs) at every position of two spans, 200 positions with 16 splits and 48
+  with one; the CPU's expert products against the GPU's. `ninfer_inkling2_dspark_kernels_test`
+  qualifies the drafter's kernels (its uniform-block attention over window rings and full caches,
+  its mixes, rotations, the recurrent head's steps, ties to the lower id).
   `ninfer_inkling2_vision_kernels_test` qualifies the tower's kernels.
 - **Against an FP64 forward.** `tools/reference/inkling2.py` runs the model in FP64 over the GGUF's
   exactly decoded blocks. On 1,150 WikiText tokens (past the 1,024-position window) NInfer-all
@@ -574,6 +979,15 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   from one card's after about 150 tokens; 64/64 and 32/96 experts give the same text, with and
   without DSpark, and the same perplexity. On the first 40 KiB of WikiText (`--kv-dtype bf16`)
   the split scores a mean NLL of 1.866484 against one card's 1.866193 (+0.016%).
+- **Shared loop KV.** `ninfer_inkling2_loop_kv_real_test` (`NINFER_INKLING_ARTIFACT`; with
+  `NINFER_INKLING_EXPERTS=host` or `disk` its experts there) runs `last-full` in every KV format
+  and `last-all` in MXFP8 against the per-pass executor, whose state goes out as an image before
+  each call and comes back with the earlier passes' caches of the shared layers replaced by the last
+  pass's, so the call reads what the shared mode reads through the same kernels. A first prompt
+  chunk, a second chunk far enough in for the far field, a decode step, a verification of four
+  rows kept up to its second and a decode step after it give the same logits bit for bit; an image
+  holds four of the eight full-attention visits' rows a position (`last-all` also 20 of the 40
+  rings), and a sequence loaded from one decodes as the sequence it came from.
 - **The vision tower.** `ninfer_inkling2_vision_real_test` (`NINFER_INKLING_VISION_ARTIFACT`,
   `NINFER_INKLING_VISION_IMAGE` and `NINFER_INKLING_VISION_DIR`, with the rows of
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a
@@ -588,7 +1002,9 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   (greedy) both towers name the mailbox's 24 and the sun on the right; the Q8_0 tower's text
   departs from the BF16 tower's 324 characters into the reasoning.
 - **DSpark.** With 7 drafts a round over 256 greedy tokens of the essay prompt, NInfer-all's drafter
-  had 133 drafts accepted of 832, llama.cpp's implementation 133 of 850.
+  had 138 drafts accepted of 797 on November 24 ([the mainline drafter](#the-mainline-drafter)); on
+  November 21, with the earlier drafter file, NInfer-all's had 133 of 832 and llama.cpp's
+  implementation 133 of 850.
 
 ## Expert residency
 

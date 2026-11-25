@@ -38,6 +38,10 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   (`<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>...</tool_call>`) returned as
   OpenAI tool calls, each value read by its declared parameter type. A forced `tool_choice` ends
   the generation prompt with `<tool_call>NAME`, so the model continues with the arguments.
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it
+  ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode on an RTX 5090 went from 334.9 to 358.0 tok/s with the same tokens.
 - **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
   first scored position, runs its last block only up to the key/value store: that block's attention
   output and experts feed only the head. The stored rows are those of the whole block, so caches and
@@ -144,7 +148,12 @@ by H / 16, which leaves every score as it was. Rotation lowered `rk4v4`'s mean N
 `rk8v4` stores its int8 keys as they are. Values are never rotated. The sliding blocks' rings of 768
 positions and a DSpine drafter's caches stay F16: a ring does not grow with the context.
 
-Decode reads the planes in its key-tile loader. A prompt chunk stores its rows into the planes and
+Decode reads the planes in its key-tile loader, which holds the next tile in registers as its stored
+codes and scales and decodes it as it enters shared memory, so the loads overlap the current tile's
+work. On an RTX PRO 4500 Blackwell (200 W, CUDA 13.4) after a 29,108-token prompt, 256 greedy
+tokens decoded at 188.5 and 188.1 tok/s with `int8` against 182.5 and 182.3 when each tile waited
+for its decoded words, and at 188.0 and 187.7 with `rk4v4` against 183.2 and 182.8, with the same
+text (November 23, 2026). A prompt chunk stores its rows into the planes and
 attends over the sequence's rows decoded back to F16 up to the chunk's end, in one staging buffer
 that every full block reuses: 2 KiB per context position (256 MiB at 131,072 tokens), growing with
 the prompts beside an elastic expert cache and counted in the startup line's workspace. The codes
