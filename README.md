@@ -14,7 +14,7 @@
 
 旧版 indexer 张量仍提供，但不再推荐，该张量仅经过16~64k上下文、约43.6M数据集训练，在工具调用等需要精确schema的场景下会有较高频率出错的问题。旧版QSA indexer张量提供者原仓库在：https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-开箱即用的模型文件在：www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-13thblade
+开箱即用的模型文件可在 [ModelScope](https://www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-Ninfer) 下载。
 已嫁接好新版张量，kuraneko1/higa2515仓库的旧版模型不建议直接使用，无论v1或v2版本，由于训练尚不充分，在工具调用等需精确复述的场景下出错概率较高。
 
 用户可自行对照版本差异。
@@ -83,7 +83,7 @@ QSA indexer tensors trained on 16k–1M contexts over a ~352M-token dataset are 
 
 The older indexer tensors remain available but are no longer recommended; they were trained only on 16k–64k contexts over a ~43.6M-token dataset and fail relatively often in scenarios that need a precise schema, such as tool calls. The upstream repository of the old QSA indexer tensors: https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp
 
-Ready-to-use model files are available at: www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-13thblade
+Ready-to-use model files are available from [ModelScope](https://www.modelscope.cn/models/thirteenthblade/Qwen3.8-27B-QSA-Ninfer).
 These files already have the new tensors grafted in. The old models in the kuraneko1/higa2515 repositories are not recommended for direct use, in either v1 or v2: because their training is not yet sufficient, they have a high error rate in scenarios that need faithful reproduction, such as tool calls.
 
 Users can compare the two versions themselves.
