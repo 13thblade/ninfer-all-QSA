@@ -65,14 +65,9 @@ width the median was 1400 tok/s.
   model's 24-over-4 geometry. The selection budget is a call argument
   (`include/ninfer/ops/qsa_budget.h` holds the shared cap and geometry), and the
   split count, merge bound and partial-softmax workspace are derived from that
-  call's budget (`split_count(top_blocks)`). Wider calls use upstream's group-6/12
-  tensor-core policy from `dev/qwen4-dense` at `40bbc0218` and index each query
-  with the actual selection stride. The split reduction also serves 18 query heads.
-  The FP64 oracle covers 24 queries with distinct 1024-block selections.
-  Tensor-core and SIMT reductions can produce different greedy continuations.
-  In a single 4162-token sparse-prefill request on an RTX 3090 Ti with BF16
-  KV and three MTP drafts, the same build ran at 1560 vs 1310 prefill tok/s
-  and accepted 33.7% vs 40.5% of drafts (tensor cores vs SIMT).
+  call's budget (`split_count(top_blocks)`). QSA-27B runs the six-head group on SIMT.
+  Flash-Next's twelve-head group follows the upstream master tensor-core dispatch
+  for wide calls. The FP64 oracle tests both groups with distinct 1024-block selections.
 - `src/ops/launcher/rope.cu` launches the interleaved three-axis rotation the
   indexer and the text attention share under QSA.
 
@@ -283,8 +278,7 @@ width the median was 1400 tok/s.
   `--qwen38-27b-qsa`, and `resolved_qsa_prefill()`
   (`program/planning/startup.cpp`) resolves it ahead of the legacy
   `NINFER_QSA_DENSE_PREFILL=0` spelling. Dense prefill stays the default
-  and uses the complete staged layer. Sparse prefill selects a kernel for the KV format,
-  group and device tier.
+  and uses the complete staged layer.
 - `src/serve/serve_options.cpp` selects `ContextCacheMode::Qsa` only when
   `--qwen38-27b-qsa` runs with a **positive** `--kv-resident`; `all` and `0` (both
   resolved to the fully-resident sentinel) fall through to the shared

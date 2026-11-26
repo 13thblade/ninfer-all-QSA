@@ -428,32 +428,24 @@ int main() {
         // A tensor-parallel share of one KV head: an unsplit and a split call.
         failures += run(storage, 2047, 9, 9106u, 1);
         failures += run(storage, 6001, 8, 9107u, 1);
-        // QSA-27B has four KV heads with six query heads each.
-        failures += run(storage, 2047, 9, 9130u, 4, 6);
-        failures += run(storage, 6001, 8, 9131u, 4, 6);
-        failures += run(storage, 0, 12, 9132u, 4, 6);
-        failures += run(storage, 6001, 24, 9133u, 4, 6);
     }
-    // A share of three, two or one KV head merges 18, 12 or 6 query heads.
-    for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
-        for (const int kv_heads : {3, 2, 1}) {
-            failures += run(storage, 2047, 9, 9110u + kv_heads, kv_heads, 6);
-            failures += run(storage, 6001, 8, 9120u + kv_heads, kv_heads, 6);
-        }
-    }
-    // Short tails and one-head slices with rotated values.
+    // QSA-27B's geometry: 24 queries over 4 KV heads, six per head, and a tensor-parallel share of
+    // one KV head and its six queries. Three storages cover the BF16, INT8 and rotated-value paths.
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Nvfp4Group16,
           KvCacheStorage::RotatedE8RootKeyInt4Value}) {
         failures += run(storage, 0, 1, 9200u, 4, 6);
         failures += run(storage, 5, 4, 9201u, 4, 6);
+        failures += run(storage, 2047, 9, 9202u, 4, 6);
         failures += run(storage, 4096, 3, 9203u, 4, 6);
+        failures += run(storage, 6001, 8, 9204u, 4, 6);
         failures += run(storage, 2047, 9, 9205u, 1, 6);
         failures += run(storage, 6001, 8, 9206u, 1, 6);
     }
-    // The four-head wide route uses a 1024-block stride for each query. At this
-    // frontier each column selects a distinct subset from more than 1024 complete blocks.
+    // Each wide query selects a different 1024-block subset. Exercise the selected-row stride
+    // for both the six-head SIMT path and the twelve-head tensor-core path on eligible devices.
     failures += run(KvCacheStorage::BFloat16, 6001, 24, 9250u, 4, 6, 1024);
+    failures += run(KvCacheStorage::BFloat16, 6001, 24, 9251u, kKvHeads, 12, 1024);
     // A raised budget: the split grid and merge cover every split up to the compile-time cap, and
     // a short context fits the budget outright.
     failures += run(KvCacheStorage::BFloat16, 5, 4, 9110u, 4, 6, 1024);

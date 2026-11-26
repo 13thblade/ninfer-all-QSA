@@ -24,7 +24,7 @@ namespace ninfer::ops {
  * consecutive positions `first_position` .., read from a device I32 word so that a call captured
  * in a graph replays at whatever position the word holds; `selected` I32 [top_blocks, tokens] and
  * `counts` I32 [tokens] are the indexer's blocks; `cache` is the sequence's paged KV layer of K
- * heads of 256 (every head, or a share of whole KV heads with their G query heads each)
+ * heads of 256 (every head, or one: a tensor-parallel share of a KV head and its G query heads)
  * holding every selected and tail position, its block table covering every position the caller
  * reaches, in any storage kv_cache_append writes (BF16, native FP16, the INT8 family, FP8 rows,
  * NVFP4, K8V4), in pages of 64 positions or, for a streamed layer, its device pool of 4-position
@@ -35,8 +35,8 @@ namespace ninfer::ops {
  * and its decoded values as stored, NVFP4 and K8V4 values rotated as well with the transform
  * applied back to the result. The kernel stages a quantized cache's decoded rows in FP16; native
  * FP16 rows are read directly without a BF16 staging cast or Hadamard transform, with FP32
- * accumulation. Wider calls can use tensor cores according to group, device tier and KV storage.
- * The output is compared after its BF16 store. Up to eight queries keep partial
+ * accumulation; the output is compared after its BF16 store. Above eight queries, the twelve-head
+ * group can use tensor cores according to device tier and KV format. Up to eight queries keep partial
  * softmaxes in FP32 workspace, whose split count follows `top_blocks`; no state.
  */
 [[nodiscard]] std::size_t sparse_softmax_attention_workspace_bytes(
