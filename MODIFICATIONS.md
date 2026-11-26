@@ -13,7 +13,7 @@ authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Upstream commit | `5fe310779` (merged after `baef81615`) |
+| Upstream commit | `9ba127602` (merged after `5fe310779`) |
 | Fork repository | https://github.com/13thblade/ninfer-all-QSA |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 | Scope | 36 files added, 97 modified relative to the tracked upstream commit; no upstream file deleted |
@@ -519,6 +519,16 @@ the sampling structures produced a clean binary: all six suites, gateA
 cold -0.015738 / resumed -0.013672) and longrun (14/14 at `prefill=33`) match
 the pre-merge numbers. No source change was needed; the merge is exactly the
 two parents' tree.
+
+### Upstream merge of 26 November 2026
+
+Merge `f4ae417a5` brings in the 10 commits from `5fe310779` through
+`9ba127602`. Inkling 2 gains MXFP8 expert banks with host and disk residency.
+Its DFlash2 drafter can verify a whole draft block when the draft count is
+omitted. Git automatically merged changes to `README.md`,
+`docs/weight-conversion.md` and `tests/test_cli_options.cpp`.
+The fork continues to use SIMT for QSA-27B's six-head sparse attention and
+the wide W4A16 schedules for fused prefill.
 
 ## Selected files
 
